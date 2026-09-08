@@ -16,6 +16,7 @@ license = "MIT"
 repository = "https://github.com/Aaryan1524/ReccursiveCommits"
 
 [workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

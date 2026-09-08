@@ -75,18 +75,20 @@ impl Store {
         registration.validate()?;
         ensure_policy_owner(registration.id, policy)?;
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO repositories (
+        transaction
+            .execute(
+                "INSERT INTO repositories (
                 id, checkout_path, canonical_remote, managed_path, created_at_unix_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                registration.id.to_string(),
-                registration.checkout_path,
-                registration.canonical_remote,
-                registration.managed_path,
-                registration.created_at_unix_ms,
-            ],
-        )?;
+                params![
+                    registration.id.to_string(),
+                    registration.checkout_path,
+                    registration.canonical_remote,
+                    registration.managed_path,
+                    registration.created_at_unix_ms,
+                ],
+            )
+            .map_err(map_write_error)?;
         insert_policy(&transaction, policy, registration.created_at_unix_ms)?;
         transaction.execute(
             "UPDATE repositories SET active_policy_revision = ?2 WHERE id = ?1",
@@ -109,10 +111,12 @@ impl Store {
         }
         let transaction = self.connection.transaction()?;
         insert_policy(&transaction, policy, created_at_unix_ms)?;
-        let changed = transaction.execute(
-            "UPDATE repositories SET active_policy_revision = ?2 WHERE id = ?1",
-            params![policy.repository_id.to_string(), policy.revision.get()],
-        )?;
+        let changed = transaction
+            .execute(
+                "UPDATE repositories SET active_policy_revision = ?2 WHERE id = ?1",
+                params![policy.repository_id.to_string(), policy.revision.get()],
+            )
+            .map_err(map_write_error)?;
         if changed != 1 {
             return Err(StoreError::InvalidData(format!(
                 "repository {} does not exist",
@@ -174,20 +178,22 @@ fn insert_policy(
     policy: &RepositoryPolicy,
     created_at_unix_ms: i64,
 ) -> Result<(), StoreError> {
-    connection.execute(
-        "INSERT INTO repository_policies (
+    connection
+        .execute(
+            "INSERT INTO repository_policies (
             repository_id, revision, publication_mode, target_ref,
             development_target_ref, created_at_unix_ms
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            policy.repository_id.to_string(),
-            policy.revision.get(),
-            publication_mode_name(policy.publication_mode),
-            policy.target.as_str(),
-            policy.development_target.as_ref().map(TargetRef::as_str),
-            created_at_unix_ms,
-        ],
-    )?;
+            params![
+                policy.repository_id.to_string(),
+                policy.revision.get(),
+                publication_mode_name(policy.publication_mode),
+                policy.target.as_str(),
+                policy.development_target.as_ref().map(TargetRef::as_str),
+                created_at_unix_ms,
+            ],
+        )
+        .map_err(map_write_error)?;
     Ok(())
 }
 
@@ -287,6 +293,14 @@ impl TryFrom<RawStoredRepository> for StoredRepository {
 
 fn policy_data_error(error: PolicyError) -> StoreError {
     StoreError::InvalidData(error.to_string())
+}
+
+fn map_write_error(error: rusqlite::Error) -> StoreError {
+    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+        StoreError::Conflict(error.to_string())
+    } else {
+        StoreError::Sqlite(error)
+    }
 }
 
 #[cfg(test)]

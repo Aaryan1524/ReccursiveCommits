@@ -34,3 +34,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace --all-targets --locked
+      - run: cargo build --workspace --locked
+      - run: ./tests/scenarios/phase1_cli_smoke.sh

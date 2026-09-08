@@ -8,14 +8,16 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use reccursive_protocol::{
-    ApiError, ApiErrorCode, AuthToken, Command, ProtocolValidationError, RequestEnvelope,
-    RequestId, ResponseData, ResponseEnvelope, TransportError,
+    ApiError, ApiErrorCode, AuthToken, Command, EnrollRepositoryRequest, ProtocolValidationError,
+    RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData,
+    ResponseEnvelope, Revision, TransportError,
     transport::{read_message, write_message},
 };
-use reccursive_store::{Store, StoreError};
+use reccursive_store::{RepositoryRegistration, Store, StoreError, StoredRepository};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -47,6 +49,7 @@ impl ServicePaths {
 pub struct LocalService {
     owner: ServiceOwner,
     store: Arc<Mutex<Store>>,
+    managed_root: Arc<PathBuf>,
 }
 
 impl LocalService {
@@ -54,9 +57,11 @@ impl LocalService {
     pub fn bind(paths: ServicePaths) -> Result<Self, ServiceError> {
         let owner = ServiceOwner::acquire(paths)?;
         let store = Store::open(&owner.paths.database)?;
+        let managed_root = owner.paths.state_dir.join("repositories");
         Ok(Self {
             owner,
             store: Arc::new(Mutex::new(store)),
+            managed_root: Arc::new(managed_root),
         })
     }
 
@@ -66,8 +71,9 @@ impl LocalService {
             let stream = connection?;
             let auth_token = self.owner.auth_token.clone();
             let store = Arc::clone(&self.store);
+            let managed_root = Arc::clone(&self.managed_root);
             thread::spawn(move || {
-                let _ = handle_connection(stream, &auth_token, &store);
+                let _ = handle_connection(stream, &auth_token, &store, &managed_root);
             });
         }
         Ok(())
@@ -80,8 +86,9 @@ impl LocalService {
             let (stream, _) = self.owner.listener.accept()?;
             let auth_token = self.owner.auth_token.clone();
             let store = Arc::clone(&self.store);
+            let managed_root = Arc::clone(&self.managed_root);
             workers.push(thread::spawn(move || {
-                handle_connection(stream, &auth_token, &store)
+                handle_connection(stream, &auth_token, &store, &managed_root)
             }));
         }
         for worker in workers {
@@ -206,6 +213,7 @@ fn handle_connection(
     mut stream: UnixStream,
     expected_auth_token: &AuthToken,
     store: &Mutex<Store>,
+    managed_root: &Path,
 ) -> Result<(), ServiceError> {
     let request = match read_message::<RequestEnvelope>(&mut stream) {
         Ok(request) => request,
@@ -220,9 +228,14 @@ fn handle_connection(
     };
 
     let response = if let Err(error) = request.validate() {
+        let code = if matches!(error, ProtocolValidationError::UnsupportedVersion { .. }) {
+            ApiErrorCode::UnsupportedVersion
+        } else {
+            ApiErrorCode::InvalidRequest
+        };
         ResponseEnvelope::failure(
             request.request_id,
-            ApiError::new(ApiErrorCode::UnsupportedVersion, error.to_string(), false),
+            ApiError::new(code, error.to_string(), false),
         )
     } else if request.auth_token != *expected_auth_token {
         ResponseEnvelope::failure(
@@ -234,28 +247,164 @@ fn handle_connection(
             ),
         )
     } else {
-        match request.command {
-            Command::Ping => match store.lock() {
-                Ok(store) => ResponseEnvelope::success(
-                    request.request_id,
-                    ResponseData::Pong {
-                        service_version: env!("CARGO_PKG_VERSION").to_owned(),
-                        schema_version: store.schema_version()?,
-                    },
-                ),
-                Err(_) => ResponseEnvelope::failure(
-                    request.request_id,
-                    ApiError::new(
-                        ApiErrorCode::Internal,
-                        "service state lock is unavailable",
-                        true,
-                    ),
-                ),
-            },
+        match dispatch(request.command, store, managed_root) {
+            Ok(data) => ResponseEnvelope::success(request.request_id, data),
+            Err(error) => ResponseEnvelope::failure(request.request_id, error),
         }
     };
     write_message(&mut stream, &response)?;
     Ok(())
+}
+
+fn dispatch(
+    command: Command,
+    store: &Mutex<Store>,
+    managed_root: &Path,
+) -> Result<ResponseData, ApiError> {
+    match command {
+        Command::Ping => {
+            let store = lock_store(store)?;
+            Ok(ResponseData::Pong {
+                service_version: env!("CARGO_PKG_VERSION").to_owned(),
+                schema_version: store.schema_version().map_err(store_api_error)?,
+            })
+        }
+        Command::Status => {
+            let store = lock_store(store)?;
+            Ok(ResponseData::Status {
+                service_version: env!("CARGO_PKG_VERSION").to_owned(),
+                schema_version: store.schema_version().map_err(store_api_error)?,
+                repository_count: store.repositories().map_err(store_api_error)?.len(),
+            })
+        }
+        Command::ListRepositories => {
+            let store = lock_store(store)?;
+            let repositories = store
+                .repositories()
+                .map_err(store_api_error)?
+                .into_iter()
+                .map(repository_view)
+                .collect();
+            Ok(ResponseData::Repositories { repositories })
+        }
+        Command::EnrollRepository(request) => enroll_repository(request, store, managed_root),
+    }
+}
+
+fn enroll_repository(
+    request: EnrollRepositoryRequest,
+    store: &Mutex<Store>,
+    managed_root: &Path,
+) -> Result<ResponseData, ApiError> {
+    let checkout = Path::new(&request.checkout_path);
+    if !checkout.is_absolute() || !checkout.is_dir() {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            "checkout_path must be an existing absolute directory",
+            false,
+        ));
+    }
+
+    let repository_id = RepositoryId::new();
+    let managed_path = managed_root
+        .join(format!("{repository_id}.git"))
+        .to_string_lossy()
+        .into_owned();
+    let created_at_unix_ms = current_unix_ms()?;
+    let registration = RepositoryRegistration::new(
+        repository_id,
+        request.checkout_path,
+        request.canonical_remote,
+        managed_path,
+        created_at_unix_ms,
+    )
+    .map_err(store_api_error)?;
+    let policy = RepositoryPolicy::new(
+        repository_id,
+        Revision::FIRST,
+        request.publication_mode,
+        request.target,
+        request.development_target,
+    )
+    .map_err(|error| ApiError::new(ApiErrorCode::InvalidRequest, error.to_string(), false))?;
+    let mut store = lock_store(store)?;
+    store
+        .enroll_repository(&registration, &policy)
+        .map_err(store_api_error)?;
+    Ok(ResponseData::RepositoryEnrolled {
+        repository: repository_view(StoredRepository {
+            registration,
+            active_policy: policy,
+        }),
+    })
+}
+
+fn repository_view(stored: StoredRepository) -> RepositoryView {
+    RepositoryView {
+        id: stored.registration.id,
+        checkout_path: stored.registration.checkout_path,
+        canonical_remote: stored.registration.canonical_remote,
+        managed_path: stored.registration.managed_path,
+        policy_revision: stored.active_policy.revision,
+        publication_mode: stored.active_policy.publication_mode,
+        target: stored.active_policy.target,
+        development_target: stored.active_policy.development_target,
+    }
+}
+
+fn lock_store(store: &Mutex<Store>) -> Result<std::sync::MutexGuard<'_, Store>, ApiError> {
+    store.lock().map_err(|_| {
+        ApiError::new(
+            ApiErrorCode::Internal,
+            "service state lock is unavailable",
+            true,
+        )
+    })
+}
+
+fn current_unix_ms() -> Result<i64, ApiError> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+        ApiError::new(
+            ApiErrorCode::Internal,
+            "system clock is before the Unix epoch",
+            false,
+        )
+    })?;
+    i64::try_from(duration.as_millis()).map_err(|_| {
+        ApiError::new(
+            ApiErrorCode::Internal,
+            "system clock exceeds the supported timestamp range",
+            false,
+        )
+    })
+}
+
+fn store_api_error(error: StoreError) -> ApiError {
+    match error {
+        StoreError::Conflict(_) => ApiError::new(
+            ApiErrorCode::Conflict,
+            "repository or policy conflicts with an existing profile",
+            false,
+        ),
+        StoreError::InvalidData(message) => {
+            ApiError::new(ApiErrorCode::InvalidRequest, message, false)
+        }
+        StoreError::PolicyRepositoryMismatch { .. } => ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            "repository and policy identifiers do not match",
+            false,
+        ),
+        StoreError::FutureSchema { .. } => ApiError::new(
+            ApiErrorCode::Internal,
+            "database was created by a newer application version",
+            false,
+        ),
+        _ => ApiError::new(
+            ApiErrorCode::TemporarilyUnavailable,
+            "local state is temporarily unavailable",
+            true,
+        ),
+    }
 }
 
 /// Service startup, ownership, transport, and storage failures.

@@ -4,7 +4,9 @@ pub mod transport;
 
 use std::fmt;
 
-pub use reccursive_core::RequestId;
+pub use reccursive_core::{
+    PublicationMode, RepositoryId, RepositoryPolicy, RequestId, Revision, TargetRef,
+};
 use serde::{Deserialize, Serialize};
 pub use transport::{LocalClient, TransportError};
 
@@ -68,7 +70,10 @@ impl RequestEnvelope {
                 supported: API_VERSION,
             });
         }
-        Ok(())
+        match &self.command {
+            Command::EnrollRepository(request) => request.validate(),
+            Command::Ping | Command::ListRepositories | Command::Status => Ok(()),
+        }
     }
 }
 
@@ -77,6 +82,69 @@ impl RequestEnvelope {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum Command {
     Ping,
+    EnrollRepository(EnrollRepositoryRequest),
+    ListRepositories,
+    Status,
+}
+
+/// Validated inputs needed to create a draft repository profile and first policy.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EnrollRepositoryRequest {
+    pub checkout_path: String,
+    pub canonical_remote: String,
+    pub publication_mode: PublicationMode,
+    pub target: TargetRef,
+    pub development_target: Option<TargetRef>,
+}
+
+impl EnrollRepositoryRequest {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.checkout_path.trim().is_empty() {
+            return Err(ProtocolValidationError::EmptyField("checkout_path"));
+        }
+        if self.canonical_remote.trim().is_empty() {
+            return Err(ProtocolValidationError::EmptyField("canonical_remote"));
+        }
+        if remote_contains_credentials(&self.canonical_remote) {
+            return Err(ProtocolValidationError::CredentialBearingRemote);
+        }
+        match self.publication_mode {
+            PublicationMode::ScheduledCreation if self.development_target.is_some() => {
+                Err(ProtocolValidationError::UnexpectedDevelopmentTarget)
+            }
+            PublicationMode::ImmediateAvailability if self.development_target.is_none() => {
+                Err(ProtocolValidationError::MissingDevelopmentTarget)
+            }
+            _ if self.development_target.as_ref() == Some(&self.target) => {
+                Err(ProtocolValidationError::TargetsMustDiffer)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+fn remote_contains_credentials(remote: &str) -> bool {
+    let Some((scheme, remainder)) = remote.split_once("://") else {
+        return false;
+    };
+    let authority = remainder.split('/').next().unwrap_or_default();
+    let Some((userinfo, _host)) = authority.rsplit_once('@') else {
+        return false;
+    };
+    matches!(scheme, "http" | "https") || userinfo.contains(':')
+}
+
+/// Repository representation safe for local API clients.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryView {
+    pub id: RepositoryId,
+    pub checkout_path: String,
+    pub canonical_remote: String,
+    pub managed_path: String,
+    pub policy_revision: Revision,
+    pub publication_mode: PublicationMode,
+    pub target: TargetRef,
+    pub development_target: Option<TargetRef>,
 }
 
 /// Correlated daemon response.
@@ -114,6 +182,17 @@ pub enum ResponseData {
     Pong {
         service_version: String,
         schema_version: u32,
+    },
+    RepositoryEnrolled {
+        repository: RepositoryView,
+    },
+    Repositories {
+        repositories: Vec<RepositoryView>,
+    },
+    Status {
+        service_version: String,
+        schema_version: u32,
+        repository_count: usize,
     },
 }
 
@@ -154,6 +233,16 @@ pub enum ProtocolValidationError {
     InvalidAuthToken,
     #[error("API version {received} is unsupported; this service supports version {supported}")]
     UnsupportedVersion { received: u16, supported: u16 },
+    #[error("{0} must not be empty")]
+    EmptyField(&'static str),
+    #[error("remote URL must not contain embedded credentials; use a credential helper or SSH")]
+    CredentialBearingRemote,
+    #[error("scheduled-creation mode must not define a development target")]
+    UnexpectedDevelopmentTarget,
+    #[error("immediate-availability mode requires a development target")]
+    MissingDevelopmentTarget,
+    #[error("development and target branches must differ")]
+    TargetsMustDiffer,
 }
 
 #[cfg(test)]
@@ -182,6 +271,34 @@ mod tests {
                 received: API_VERSION + 1,
                 supported: API_VERSION,
             })
+        );
+    }
+
+    #[test]
+    fn enrollment_rejects_credentials_and_invalid_mode_targets() {
+        let target = TargetRef::new("refs/heads/main").unwrap();
+        let credentials = EnrollRepositoryRequest {
+            checkout_path: "/tmp/repo".into(),
+            canonical_remote: "https://user:secret@example.invalid/repo.git".into(),
+            publication_mode: PublicationMode::ScheduledCreation,
+            target: target.clone(),
+            development_target: None,
+        };
+        assert_eq!(
+            credentials.validate(),
+            Err(ProtocolValidationError::CredentialBearingRemote)
+        );
+
+        let missing_development = EnrollRepositoryRequest {
+            checkout_path: "/tmp/repo".into(),
+            canonical_remote: "git@example.invalid:repo.git".into(),
+            publication_mode: PublicationMode::ImmediateAvailability,
+            target,
+            development_target: None,
+        };
+        assert_eq!(
+            missing_development.validate(),
+            Err(ProtocolValidationError::MissingDevelopmentTarget)
         );
     }
 }

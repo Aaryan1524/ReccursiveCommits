@@ -140,6 +140,8 @@ pub enum StoreError {
     },
     #[error("stored value is invalid: {0}")]
     InvalidData(String),
+    #[error("stored record conflicts with existing state: {0}")]
+    Conflict(String),
     #[error("backup destination already exists: {}", path.display())]
     BackupDestinationExists { path: PathBuf },
     #[error("restore destination already exists: {}", path.display())]

@@ -1,5 +1,9 @@
 //! Background service boundary.
 
+mod service;
+
+pub use service::{LocalService, ServiceError, ServicePaths};
+
 /// Stable service identifier used by launchers and diagnostics.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
 

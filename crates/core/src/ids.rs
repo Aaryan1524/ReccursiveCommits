@@ -95,6 +95,7 @@ typed_id!(FeatureId, "feature", "feature");
 typed_id!(TaskId, "task", "task");
 typed_id!(ReleaseUnitId, "release unit", "unit");
 typed_id!(PackageId, "package", "package");
+typed_id!(RequestId, "request", "request");
 
 #[cfg(test)]
 mod tests {

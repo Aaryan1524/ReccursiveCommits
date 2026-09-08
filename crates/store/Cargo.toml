@@ -1,0 +1,15 @@
+[package]
+name = "reccursive-store"
+description = "Durable local persistence for ReccursiveCommits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+reccursive-core = { path = "../core" }
+
+[lints]
+workspace = true
+

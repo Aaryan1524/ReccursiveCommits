@@ -1,0 +1,19 @@
+[package]
+name = "reccursive-cli"
+description = "Command-line client for ReccursiveCommits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "reccursive"
+path = "src/main.rs"
+
+[dependencies]
+reccursive-protocol = { path = "../protocol" }
+
+[lints]
+workspace = true
+

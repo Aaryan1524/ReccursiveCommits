@@ -9,7 +9,13 @@ repository.workspace = true
 
 [dependencies]
 reccursive-core = { path = "../core" }
+rusqlite.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.0"
 
 [lints]
 workspace = true
-

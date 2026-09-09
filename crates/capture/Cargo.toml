@@ -1,0 +1,19 @@
+[package]
+name = "reccursive-capture"
+description = "Owned workspace and immutable capture operations for ReccursiveCommits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+reccursive-core = { path = "../core" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[lints]
+workspace = true

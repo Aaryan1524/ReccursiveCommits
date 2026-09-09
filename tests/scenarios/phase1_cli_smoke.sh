@@ -99,6 +99,21 @@ plan_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" \
 grep -q '"type":"plan_imported"' <<<"$plan_json" || \
   fail "plan import did not return the expected JSON payload"
 
+printf 'Local prerequisite\n' >>"$fixture_root/repository/README.md"
+source_head_before="$(git -C "$fixture_root/repository" rev-parse HEAD)"
+source_status_before="$(git -C "$fixture_root/repository" status --porcelain=v1)"
+workspace_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" \
+  --json workspace create feature_00000000-0000-4000-8000-000000000001 \
+  --include README.md)"
+grep -q '"type":"workspace_created"' <<<"$workspace_json" || \
+  fail "workspace creation did not return the expected JSON payload"
+grep -q '"path":"README.md","state":"present"' <<<"$workspace_json" || \
+  fail "workspace did not record the explicit prerequisite"
+[[ "$(git -C "$fixture_root/repository" rev-parse HEAD)" == "$source_head_before" ]] || \
+  fail "workspace creation moved the source checkout HEAD"
+[[ "$(git -C "$fixture_root/repository" status --porcelain=v1)" == "$source_status_before" ]] || \
+  fail "workspace creation changed the source checkout"
+
 list_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" \
   --json repository list)"
 grep -q '"type":"repositories"' <<<"$list_json" || \
@@ -128,6 +143,10 @@ history_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" --jso
   plan history feature_00000000-0000-4000-8000-000000000001)"
 grep -q '"type":"plan_history"' <<<"$history_json" || \
   fail "plan history did not return the expected JSON payload"
+workspace_after_restart="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" \
+  --json workspace show feature_00000000-0000-4000-8000-000000000001 --revision 1)"
+grep -q '"type":"workspace"' <<<"$workspace_after_restart" || \
+  fail "workspace ownership did not survive daemon restart"
 
 logs_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" --json logs --limit 20)"
 grep -q '"type":"events"' <<<"$logs_json" || \
@@ -141,4 +160,4 @@ grep -q '"reason_code":"conflict"' <<<"$logs_json" || \
 grep -q '"request_id":"request_' <<<"$logs_json" || \
   fail "diagnostic events were not correlated by request ID"
 
-printf 'PASS foundation CLI, durable plan import, diagnostics, conflict handling, and restart persistence\n'
+printf 'PASS foundation CLI, plan import, isolated workspace ownership, diagnostics, and restart persistence\n'

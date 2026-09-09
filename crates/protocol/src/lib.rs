@@ -74,6 +74,7 @@ impl RequestEnvelope {
         }
         match &self.command {
             Command::EnrollRepository(request) => request.validate(),
+            Command::CreateWorkspace(request) => request.validate(),
             Command::ImportPlan { plan } => plan
                 .validate()
                 .map_err(|error| ProtocolValidationError::InvalidPlan(error.to_string())),
@@ -85,6 +86,7 @@ impl RequestEnvelope {
             | Command::ListEvents { .. }
             | Command::GetPlan { .. }
             | Command::PlanHistory { .. }
+            | Command::GetWorkspace { .. }
             | Command::Status => Ok(()),
         }
     }
@@ -110,7 +112,41 @@ pub enum Command {
     PlanHistory {
         feature_id: FeatureId,
     },
+    CreateWorkspace(CreateWorkspaceRequest),
+    GetWorkspace {
+        feature_id: FeatureId,
+        revision: Revision,
+    },
     Status,
+}
+
+/// Explicit request for a daemon-owned workspace.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateWorkspaceRequest {
+    pub feature_id: FeatureId,
+    pub revision: Option<Revision>,
+    #[serde(default)]
+    pub prerequisites: Vec<String>,
+}
+
+impl CreateWorkspaceRequest {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.prerequisites.len() > 1_000 {
+            return Err(ProtocolValidationError::InvalidPrerequisite(
+                "at most 1000 prerequisite paths may be selected".into(),
+            ));
+        }
+        if self
+            .prerequisites
+            .iter()
+            .any(|path| path.is_empty() || path.len() > 4_096)
+        {
+            return Err(ProtocolValidationError::InvalidPrerequisite(
+                "prerequisite paths must contain 1-4096 bytes".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Validated inputs needed to create a draft repository profile and first policy.
@@ -209,6 +245,25 @@ pub struct PlanView {
     pub created_at_unix_ms: i64,
 }
 
+/// Explicit uncommitted prerequisite included in an owned workspace.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspacePrerequisiteView {
+    pub path: String,
+    pub state: String,
+}
+
+/// Daemon-owned workspace safe for local clients.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceView {
+    pub feature_id: FeatureId,
+    pub revision: Revision,
+    pub repository_id: RepositoryId,
+    pub path: String,
+    pub base_commit: String,
+    pub prerequisites: Vec<WorkspacePrerequisiteView>,
+    pub created_at_unix_ms: i64,
+}
+
 /// Correlated daemon response.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResponseEnvelope {
@@ -262,6 +317,12 @@ pub enum ResponseData {
     },
     PlanHistory {
         plans: Vec<PlanView>,
+    },
+    WorkspaceCreated {
+        workspace: WorkspaceView,
+    },
+    Workspace {
+        workspace: WorkspaceView,
     },
     Status {
         service_version: String,
@@ -322,6 +383,8 @@ pub enum ProtocolValidationError {
     InvalidEventLimit,
     #[error("invalid feature plan: {0}")]
     InvalidPlan(String),
+    #[error("invalid prerequisite selection: {0}")]
+    InvalidPrerequisite(String),
 }
 
 #[cfg(test)]

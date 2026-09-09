@@ -3,16 +3,17 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 1;
+pub const STORAGE_SCHEMA_VERSION: u32 = 2;
 
 struct Migration {
     version: u32,
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: r#"
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: r#"
         CREATE TABLE repositories (
             id TEXT PRIMARY KEY,
             checkout_path TEXT NOT NULL CHECK (length(checkout_path) > 0),
@@ -126,8 +127,35 @@ const MIGRATIONS: &[Migration] = &[Migration {
         CREATE INDEX idx_features_repository ON features(repository_id);
         CREATE INDEX idx_tasks_feature ON tasks(feature_id, feature_revision);
         CREATE INDEX idx_packages_repository ON packages(repository_id);
-    "#,
-}];
+        "#,
+    },
+    Migration {
+        version: 2,
+        sql: r#"
+        CREATE TABLE events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT NOT NULL UNIQUE,
+            occurred_at_unix_ms INTEGER NOT NULL CHECK (occurred_at_unix_ms >= 0),
+            request_id TEXT,
+            attempt_id TEXT,
+            repository_id TEXT,
+            entity_type TEXT,
+            entity_id TEXT,
+            entity_revision INTEGER CHECK (entity_revision > 0),
+            kind TEXT NOT NULL CHECK (length(trim(kind)) > 0),
+            severity TEXT NOT NULL CHECK (severity IN ('debug', 'info', 'warning', 'error')),
+            reason_code TEXT,
+            message TEXT NOT NULL CHECK (length(trim(message)) > 0),
+            details_json TEXT NOT NULL CHECK (json_valid(details_json)),
+            FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX idx_events_request ON events(request_id, sequence DESC);
+        CREATE INDEX idx_events_repository ON events(repository_id, sequence DESC);
+        CREATE INDEX idx_events_kind ON events(kind, sequence DESC);
+        "#,
+    },
+];
 
 pub(crate) fn apply(connection: &mut Connection) -> Result<(), StoreError> {
     let current = reject_future_schema(connection)?;
@@ -197,5 +225,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table_count, 0);
+    }
+
+    #[test]
+    fn version_one_databases_upgrade_without_losing_existing_tables() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply_one(&mut connection, MIGRATIONS[0].version, MIGRATIONS[0].sql).unwrap();
+        assert_eq!(reject_future_schema(&connection).unwrap(), 1);
+
+        apply(&mut connection).unwrap();
+
+        assert_eq!(
+            reject_future_schema(&connection).unwrap(),
+            STORAGE_SCHEMA_VERSION
+        );
+        let tables: u32 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('repositories', 'events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 2);
     }
 }

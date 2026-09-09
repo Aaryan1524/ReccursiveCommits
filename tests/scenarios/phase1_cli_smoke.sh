@@ -90,4 +90,16 @@ status_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" --json
 grep -q '"repository_count":1' <<<"$status_json" || \
   fail "repository state did not survive daemon restart"
 
-printf 'PASS Phase 1 CLI enrollment, conflict handling, and restart persistence\n'
+logs_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" --json logs --limit 20)"
+grep -q '"type":"events"' <<<"$logs_json" || \
+  fail "logs did not return the expected JSON payload"
+grep -q '"kind":"api.request_succeeded"' <<<"$logs_json" || \
+  fail "successful API calls were not recorded"
+grep -q '"kind":"api.request_failed"' <<<"$logs_json" || \
+  fail "failed API calls were not recorded"
+grep -q '"reason_code":"conflict"' <<<"$logs_json" || \
+  fail "failed API calls did not retain a stable reason code"
+grep -q '"request_id":"request_' <<<"$logs_json" || \
+  fail "diagnostic events were not correlated by request ID"
+
+printf 'PASS Phase 1 CLI enrollment, diagnostics, conflict handling, and restart persistence\n'

@@ -8,8 +8,8 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use reccursive_protocol::{
-    ApiError, ApiErrorCode, Command, EnrollRepositoryRequest, LocalClient, PublicationMode,
-    RepositoryView, ResponseData, TargetRef,
+    ApiError, ApiErrorCode, Command, EnrollRepositoryRequest, EventSeverityView, EventView,
+    LocalClient, PublicationMode, RepositoryView, ResponseData, TargetRef,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -52,6 +52,12 @@ enum TopLevelCommand {
     Status,
     /// Check local prerequisites and service connectivity.
     Doctor,
+    /// Show recent sanitized daemon events.
+    Logs {
+        /// Maximum number of newest events to return.
+        #[arg(long, default_value_t = 50, value_parser = parse_event_limit)]
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -188,6 +194,10 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             let data = send(&paths, Command::Status)?;
             output_data(data, cli.json, stdout)
         }
+        TopLevelCommand::Logs { limit } => {
+            let data = send(&paths, Command::ListEvents { limit })?;
+            output_data(data, cli.json, stdout)
+        }
         TopLevelCommand::Repository { command } => match command {
             RepositoryCommand::List => {
                 let data = send(&paths, Command::ListRepositories)?;
@@ -205,6 +215,17 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 output_data(data, cli.json, stdout)
             }
         },
+    }
+}
+
+fn parse_event_limit(value: &str) -> Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be an integer between 1 and 1000".to_owned())?;
+    if (1..=1_000).contains(&limit) {
+        Ok(limit)
+    } else {
+        Err("limit must be between 1 and 1000".to_owned())
     }
 }
 
@@ -373,8 +394,33 @@ fn output_data(
             )
         }
         ResponseData::Repositories { repositories } => output_repositories(out, &repositories),
+        ResponseData::Events { events } => output_events(out, &events),
     }
     .map_err(output_error)
+}
+
+fn output_events(out: &mut impl Write, events: &[EventView]) -> io::Result<()> {
+    if events.is_empty() {
+        return writeln!(out, "No diagnostic events have been recorded.");
+    }
+    for event in events {
+        let severity = match event.severity {
+            EventSeverityView::Debug => "DEBUG",
+            EventSeverityView::Info => "INFO",
+            EventSeverityView::Warning => "WARN",
+            EventSeverityView::Error => "ERROR",
+        };
+        let request_id = event
+            .request_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        writeln!(
+            out,
+            "#{:<6} {:<5} {:<24} {}  {}",
+            event.sequence, severity, event.kind, request_id, event.message
+        )?;
+    }
+    Ok(())
 }
 
 fn output_repositories(out: &mut impl Write, repositories: &[RepositoryView]) -> io::Result<()> {
@@ -515,6 +561,15 @@ mod tests {
             branch_ref("refs/heads/release").unwrap().as_str(),
             "refs/heads/release"
         );
+    }
+
+    #[test]
+    fn log_limits_are_bounded_at_parse_time() {
+        assert_eq!(parse_event_limit("1"), Ok(1));
+        assert_eq!(parse_event_limit("1000"), Ok(1_000));
+        assert!(parse_event_limit("0").is_err());
+        assert!(parse_event_limit("1001").is_err());
+        assert!(parse_event_limit("many").is_err());
     }
 
     #[test]

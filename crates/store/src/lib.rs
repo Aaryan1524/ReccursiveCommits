@@ -1,6 +1,8 @@
 //! Durable local persistence boundary.
 
+mod events;
 mod migrations;
+mod redaction;
 mod repository;
 
 use std::{
@@ -9,7 +11,9 @@ use std::{
     time::Duration,
 };
 
+pub use events::{DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, StoredEvent};
 pub use migrations::STORAGE_SCHEMA_VERSION;
+pub use redaction::{redact_json, redact_text};
 pub use repository::{RepositoryRegistration, StoredRepository};
 use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
@@ -125,6 +129,8 @@ impl Store {
 pub enum StoreError {
     #[error("SQLite operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("stored JSON is invalid: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
     #[error(

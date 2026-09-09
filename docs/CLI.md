@@ -16,10 +16,16 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state doctor
 cargo run -p reccursive-cli -- --state-dir /path/to/state repository add /path/to/repo
 cargo run -p reccursive-cli -- --state-dir /path/to/state repository list
 cargo run -p reccursive-cli -- --state-dir /path/to/state status
+cargo run -p reccursive-cli -- --state-dir /path/to/state logs --limit 50
 ```
 
 Pass `--json` for a stable JSON envelope with no prompts or spinners. The
 `RECCURSIVE_STATE_DIR` environment variable can replace `--state-dir`.
+
+`logs` returns the newest structured daemon events first. Every authenticated API
+request is correlated by request ID, stored with a stable event kind and severity,
+and scrubbed for common credential formats before persistence. The installation
+retains a bounded event history rather than growing the database indefinitely.
 
 ## Exit codes
 

@@ -12,12 +12,16 @@ use std::{
 };
 
 use reccursive_protocol::{
-    ApiError, ApiErrorCode, AuthToken, Command, EnrollRepositoryRequest, ProtocolValidationError,
-    RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData,
-    ResponseEnvelope, Revision, TransportError,
+    ApiError, ApiErrorCode, AuthToken, Command, EnrollRepositoryRequest, EventSeverityView,
+    EventView, ProtocolValidationError, RepositoryId, RepositoryPolicy, RepositoryView,
+    RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision, TransportError,
     transport::{read_message, write_message},
 };
-use reccursive_store::{RepositoryRegistration, Store, StoreError, StoredRepository};
+use reccursive_store::{
+    DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, RepositoryRegistration, Store,
+    StoreError, StoredEvent, StoredRepository,
+};
+use serde_json::json;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -247,9 +251,15 @@ fn handle_connection(
             ),
         )
     } else {
-        match dispatch(request.command, store, managed_root) {
-            Ok(data) => ResponseEnvelope::success(request.request_id, data),
-            Err(error) => ResponseEnvelope::failure(request.request_id, error),
+        let request_id = request.request_id;
+        let command_name = command_name(&request.command);
+        let result = dispatch(request.command, store, managed_root);
+        match record_api_event(store, request_id, command_name, &result) {
+            Ok(()) => match result {
+                Ok(data) => ResponseEnvelope::success(request_id, data),
+                Err(error) => ResponseEnvelope::failure(request_id, error),
+            },
+            Err(error) => ResponseEnvelope::failure(request_id, error),
         }
     };
     write_message(&mut stream, &response)?;
@@ -287,7 +297,81 @@ fn dispatch(
                 .collect();
             Ok(ResponseData::Repositories { repositories })
         }
+        Command::ListEvents { limit } => {
+            let store = lock_store(store)?;
+            let events = store
+                .events(limit)
+                .map_err(store_api_error)?
+                .into_iter()
+                .map(event_view)
+                .collect();
+            Ok(ResponseData::Events { events })
+        }
         Command::EnrollRepository(request) => enroll_repository(request, store, managed_root),
+    }
+}
+
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Ping => "ping",
+        Command::EnrollRepository(_) => "repository.add",
+        Command::ListRepositories => "repository.list",
+        Command::ListEvents { .. } => "logs",
+        Command::Status => "status",
+    }
+}
+
+fn record_api_event(
+    store: &Mutex<Store>,
+    request_id: RequestId,
+    command: &'static str,
+    result: &Result<ResponseData, ApiError>,
+) -> Result<(), ApiError> {
+    let repository_id = match result {
+        Ok(ResponseData::RepositoryEnrolled { repository }) => Some(repository.id),
+        _ => None,
+    };
+    let (kind, severity, reason_code, outcome) = match result {
+        Ok(_) => (
+            "api.request_succeeded",
+            EventSeverity::Info,
+            None,
+            "succeeded",
+        ),
+        Err(error) => (
+            "api.request_failed",
+            EventSeverity::Error,
+            Some(api_error_code(error.code).to_owned()),
+            "failed",
+        ),
+    };
+    let event = NewEvent::new(
+        current_unix_ms()?,
+        EventContext {
+            request_id: Some(request_id),
+            repository_id,
+            ..EventContext::default()
+        },
+        kind,
+        severity,
+        reason_code,
+        format!("{command} request {outcome}"),
+        json!({ "command": command, "outcome": outcome }),
+    )
+    .map_err(store_api_error)?;
+    lock_store(store)?
+        .record_event(&event, DEFAULT_EVENT_RETENTION)
+        .map_err(store_api_error)
+}
+
+const fn api_error_code(code: ApiErrorCode) -> &'static str {
+    match code {
+        ApiErrorCode::InvalidRequest => "invalid_request",
+        ApiErrorCode::UnsupportedVersion => "unsupported_version",
+        ApiErrorCode::Unauthorized => "unauthorized",
+        ApiErrorCode::Conflict => "conflict",
+        ApiErrorCode::TemporarilyUnavailable => "temporarily_unavailable",
+        ApiErrorCode::Internal => "internal",
     }
 }
 
@@ -349,6 +433,30 @@ fn repository_view(stored: StoredRepository) -> RepositoryView {
         publication_mode: stored.active_policy.publication_mode,
         target: stored.active_policy.target,
         development_target: stored.active_policy.development_target,
+    }
+}
+
+fn event_view(event: StoredEvent) -> EventView {
+    EventView {
+        sequence: event.sequence,
+        id: event.id,
+        occurred_at_unix_ms: event.occurred_at_unix_ms,
+        request_id: event.context.request_id,
+        attempt_id: event.context.attempt_id,
+        repository_id: event.context.repository_id,
+        entity_type: event.context.entity_type,
+        entity_id: event.context.entity_id,
+        entity_revision: event.context.entity_revision,
+        kind: event.kind,
+        severity: match event.severity {
+            EventSeverity::Debug => EventSeverityView::Debug,
+            EventSeverity::Info => EventSeverityView::Info,
+            EventSeverity::Warning => EventSeverityView::Warning,
+            EventSeverity::Error => EventSeverityView::Error,
+        },
+        reason_code: event.reason_code,
+        message: event.message,
+        details: event.details,
     }
 }
 
@@ -491,6 +599,33 @@ mod tests {
                 ..
             })
         ));
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn authenticated_requests_are_available_as_correlated_events() {
+        let directory = tempdir().unwrap();
+        let paths = ServicePaths::new(directory.path());
+        let service = LocalService::bind(paths.clone()).unwrap();
+        let worker = thread::spawn(move || service.serve_connections(2));
+        let client = LocalClient::from_token_file(&paths.auth_token).unwrap();
+
+        let ping = client.send(&paths.socket, Command::Ping).unwrap();
+        let ping_request_id = ping.request_id;
+        let logs = client
+            .send(&paths.socket, Command::ListEvents { limit: 10 })
+            .unwrap();
+
+        let events = match logs.result.unwrap() {
+            ResponseData::Events { events } => events,
+            data => panic!("expected events, received {data:?}"),
+        };
+        let event = events
+            .iter()
+            .find(|event| event.request_id == Some(ping_request_id))
+            .expect("ping event should be correlated by request ID");
+        assert_eq!(event.kind, "api.request_succeeded");
+        assert_eq!(event.details["command"], "ping");
         worker.join().unwrap().unwrap();
     }
 

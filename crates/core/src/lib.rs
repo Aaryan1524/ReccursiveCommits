@@ -7,7 +7,10 @@ mod revision;
 mod task;
 
 pub use graph::{GraphError, TaskDefinition, TaskDefinitionError, TaskGraph};
-pub use ids::{FeatureId, IdParseError, PackageId, ReleaseUnitId, RepositoryId, RequestId, TaskId};
+pub use ids::{
+    AttemptId, EventId, FeatureId, IdParseError, PackageId, ReleaseUnitId, RepositoryId, RequestId,
+    TaskId,
+};
 pub use policy::{
     PackageError, PackageRevision, PolicyError, PolicyRef, PublicationMode, RepositoryPolicy,
     TargetMilestone, TargetRef,

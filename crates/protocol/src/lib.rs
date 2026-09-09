@@ -5,8 +5,9 @@ pub mod transport;
 use std::fmt;
 
 pub use reccursive_core::{
-    AttemptId, EventId, PublicationMode, RepositoryId, RepositoryPolicy, RequestId, Revision,
-    TargetRef,
+    AcceptanceCheck, AttemptId, EventId, FeatureId, FeaturePlan, PLAN_SCHEMA_VERSION, PlanPhase,
+    PlanTask, PublicationMode, RepositoryId, RepositoryPolicy, RequestId, Revision, TargetRef,
+    TaskId,
 };
 use serde::{Deserialize, Serialize};
 pub use transport::{LocalClient, TransportError};
@@ -73,12 +74,17 @@ impl RequestEnvelope {
         }
         match &self.command {
             Command::EnrollRepository(request) => request.validate(),
+            Command::ImportPlan { plan } => plan
+                .validate()
+                .map_err(|error| ProtocolValidationError::InvalidPlan(error.to_string())),
             Command::ListEvents { limit } if !(1..=1_000).contains(limit) => {
                 Err(ProtocolValidationError::InvalidEventLimit)
             }
             Command::Ping
             | Command::ListRepositories
             | Command::ListEvents { .. }
+            | Command::GetPlan { .. }
+            | Command::PlanHistory { .. }
             | Command::Status => Ok(()),
         }
     }
@@ -91,7 +97,19 @@ pub enum Command {
     Ping,
     EnrollRepository(EnrollRepositoryRequest),
     ListRepositories,
-    ListEvents { limit: usize },
+    ListEvents {
+        limit: usize,
+    },
+    ImportPlan {
+        plan: FeaturePlan,
+    },
+    GetPlan {
+        feature_id: FeatureId,
+        revision: Option<Revision>,
+    },
+    PlanHistory {
+        feature_id: FeatureId,
+    },
     Status,
 }
 
@@ -184,6 +202,13 @@ pub struct EventView {
     pub details: serde_json::Value,
 }
 
+/// One immutable plan revision returned by the daemon.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanView {
+    pub plan: FeaturePlan,
+    pub created_at_unix_ms: i64,
+}
+
 /// Correlated daemon response.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResponseEnvelope {
@@ -229,6 +254,15 @@ pub enum ResponseData {
     Events {
         events: Vec<EventView>,
     },
+    PlanImported {
+        plan: PlanView,
+    },
+    Plan {
+        plan: PlanView,
+    },
+    PlanHistory {
+        plans: Vec<PlanView>,
+    },
     Status {
         service_version: String,
         schema_version: u32,
@@ -260,6 +294,7 @@ impl ApiError {
 #[serde(rename_all = "snake_case")]
 pub enum ApiErrorCode {
     InvalidRequest,
+    NotFound,
     UnsupportedVersion,
     Unauthorized,
     Conflict,
@@ -267,7 +302,7 @@ pub enum ApiErrorCode {
     Internal,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ProtocolValidationError {
     #[error("authentication token must be 32-256 non-whitespace characters")]
     InvalidAuthToken,
@@ -285,6 +320,8 @@ pub enum ProtocolValidationError {
     TargetsMustDiffer,
     #[error("event limit must be between 1 and 1000")]
     InvalidEventLimit,
+    #[error("invalid feature plan: {0}")]
+    InvalidPlan(String),
 }
 
 #[cfg(test)]

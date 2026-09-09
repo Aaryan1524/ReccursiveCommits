@@ -9,7 +9,8 @@ use std::{
 use clap::{Parser, Subcommand, ValueEnum};
 use reccursive_protocol::{
     ApiError, ApiErrorCode, Command, EnrollRepositoryRequest, EventSeverityView, EventView,
-    LocalClient, PublicationMode, RepositoryView, ResponseData, TargetRef,
+    FeatureId, FeaturePlan, LocalClient, PlanView, PublicationMode, RepositoryView, ResponseData,
+    Revision, TargetRef,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -48,6 +49,11 @@ enum TopLevelCommand {
         #[command(subcommand)]
         command: RepositoryCommand,
     },
+    /// Import and inspect versioned feature plans.
+    Plan {
+        #[command(subcommand)]
+        command: PlanCommand,
+    },
     /// Show service and queue summary.
     Status,
     /// Check local prerequisites and service connectivity.
@@ -58,6 +64,23 @@ enum TopLevelCommand {
         #[arg(long, default_value_t = 50, value_parser = parse_event_limit)]
         limit: usize,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum PlanCommand {
+    /// Validate and append a JSON plan revision.
+    Import {
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Show one plan revision, or the latest revision by default.
+    Show {
+        feature_id: FeatureId,
+        #[arg(long, value_parser = parse_revision)]
+        revision: Option<Revision>,
+    },
+    /// List all stored revisions for a feature.
+    History { feature_id: FeatureId },
 }
 
 #[derive(Debug, Subcommand)]
@@ -198,6 +221,30 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             let data = send(&paths, Command::ListEvents { limit })?;
             output_data(data, cli.json, stdout)
         }
+        TopLevelCommand::Plan { command } => match command {
+            PlanCommand::Import { file } => {
+                let plan = load_plan(&file)?;
+                let data = send(&paths, Command::ImportPlan { plan })?;
+                output_data(data, cli.json, stdout)
+            }
+            PlanCommand::Show {
+                feature_id,
+                revision,
+            } => {
+                let data = send(
+                    &paths,
+                    Command::GetPlan {
+                        feature_id,
+                        revision,
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            PlanCommand::History { feature_id } => {
+                let data = send(&paths, Command::PlanHistory { feature_id })?;
+                output_data(data, cli.json, stdout)
+            }
+        },
         TopLevelCommand::Repository { command } => match command {
             RepositoryCommand::List => {
                 let data = send(&paths, Command::ListRepositories)?;
@@ -216,6 +263,34 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             }
         },
     }
+}
+
+fn load_plan(path: &Path) -> Result<FeaturePlan, CliFailure> {
+    let bytes = fs::read(path).map_err(|error| {
+        CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "plan_unreadable",
+            format!("cannot read {}: {error}", path.display()),
+        )
+    })?;
+    let plan: FeaturePlan = serde_json::from_slice(&bytes).map_err(|error| {
+        CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "invalid_plan",
+            format!("{} is not a valid plan document: {error}", path.display()),
+        )
+    })?;
+    plan.validate().map_err(|error| {
+        CliFailure::new(EXIT_ACTION_REQUIRED, "invalid_plan", error.to_string())
+    })?;
+    Ok(plan)
+}
+
+fn parse_revision(value: &str) -> Result<Revision, String> {
+    let value = value
+        .parse::<u32>()
+        .map_err(|_| "revision must be a positive integer".to_owned())?;
+    Revision::new(value).map_err(|error| error.to_string())
 }
 
 fn parse_event_limit(value: &str) -> Result<usize, String> {
@@ -250,6 +325,7 @@ fn send(paths: &ClientPaths, command: Command) -> Result<ResponseData, CliFailur
 fn api_failure(error: ApiError) -> CliFailure {
     let (exit, code) = match error.code {
         ApiErrorCode::InvalidRequest => (EXIT_ACTION_REQUIRED, "invalid_request"),
+        ApiErrorCode::NotFound => (EXIT_ACTION_REQUIRED, "not_found"),
         ApiErrorCode::UnsupportedVersion | ApiErrorCode::Unauthorized => {
             (EXIT_INCOMPATIBLE, "incompatible_service")
         }
@@ -395,8 +471,53 @@ fn output_data(
         }
         ResponseData::Repositories { repositories } => output_repositories(out, &repositories),
         ResponseData::Events { events } => output_events(out, &events),
+        ResponseData::PlanImported { plan } => {
+            writeln!(
+                out,
+                "Imported {} revision {}",
+                plan.plan.feature_id,
+                plan.plan.revision.get()
+            )
+        }
+        ResponseData::Plan { plan } => output_plan(out, &plan),
+        ResponseData::PlanHistory { plans } => output_plan_history(out, &plans),
     }
     .map_err(output_error)
+}
+
+fn output_plan(out: &mut impl Write, plan: &PlanView) -> io::Result<()> {
+    writeln!(
+        out,
+        "Feature: {}\nRevision: {}\nState: {}\nTarget: {}\nGoal: {}\nPhases: {}\nTasks: {}",
+        plan.plan.feature_id,
+        plan.plan.revision.get(),
+        if plan.plan.sealed { "sealed" } else { "draft" },
+        plan.plan.target.as_str(),
+        plan.plan.goal,
+        plan.plan.phases.len(),
+        plan.plan
+            .phases
+            .iter()
+            .map(|phase| phase.tasks.len())
+            .sum::<usize>()
+    )
+}
+
+fn output_plan_history(out: &mut impl Write, plans: &[PlanView]) -> io::Result<()> {
+    if plans.is_empty() {
+        return writeln!(out, "No revisions found.");
+    }
+    for plan in plans {
+        writeln!(
+            out,
+            "{}  revision {}  {}  {}",
+            plan.plan.feature_id,
+            plan.plan.revision.get(),
+            if plan.plan.sealed { "sealed" } else { "draft" },
+            plan.plan.goal
+        )?;
+    }
+    Ok(())
 }
 
 fn output_events(out: &mut impl Write, events: &[EventView]) -> io::Result<()> {

@@ -67,6 +67,37 @@ enrollment_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" \
   --json repository add "$fixture_root/repository")"
 grep -q '"type":"repository_enrolled"' <<<"$enrollment_json" || \
   fail "repository enrollment did not return the expected JSON payload"
+repository_id="$(sed -E 's/.*"id":"(repo_[^"]+)".*/\1/' <<<"$enrollment_json")"
+[[ "$repository_id" == repo_* ]] || fail "repository enrollment did not return an ID"
+
+cat >"$fixture_root/feature-plan.json" <<JSON
+{
+  "schema_version": 1,
+  "feature_id": "feature_00000000-0000-4000-8000-000000000001",
+  "revision": 1,
+  "repository_id": "$repository_id",
+  "goal": "Exercise durable plan import",
+  "target": "refs/heads/main",
+  "sealed": true,
+  "phases": [{
+    "id": "delivery",
+    "name": "Delivery",
+    "tasks": [{
+      "id": "task_00000000-0000-4000-8000-000000000002",
+      "name": "Import the plan",
+      "dependencies": {},
+      "acceptance_checks": [{
+        "id": "round_trip",
+        "description": "The imported plan survives restart"
+      }]
+    }]
+  }]
+}
+JSON
+plan_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" \
+  --json plan import "$fixture_root/feature-plan.json")"
+grep -q '"type":"plan_imported"' <<<"$plan_json" || \
+  fail "plan import did not return the expected JSON payload"
 
 list_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" \
   --json repository list)"
@@ -89,6 +120,14 @@ start_daemon
 status_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" --json status)"
 grep -q '"repository_count":1' <<<"$status_json" || \
   fail "repository state did not survive daemon restart"
+stored_plan_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" --json \
+  plan show feature_00000000-0000-4000-8000-000000000001)"
+grep -q '"goal":"Exercise durable plan import"' <<<"$stored_plan_json" || \
+  fail "feature plan did not survive daemon restart"
+history_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" --json \
+  plan history feature_00000000-0000-4000-8000-000000000001)"
+grep -q '"type":"plan_history"' <<<"$history_json" || \
+  fail "plan history did not return the expected JSON payload"
 
 logs_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" --json logs --limit 20)"
 grep -q '"type":"events"' <<<"$logs_json" || \
@@ -102,4 +141,4 @@ grep -q '"reason_code":"conflict"' <<<"$logs_json" || \
 grep -q '"request_id":"request_' <<<"$logs_json" || \
   fail "diagnostic events were not correlated by request ID"
 
-printf 'PASS Phase 1 CLI enrollment, diagnostics, conflict handling, and restart persistence\n'
+printf 'PASS foundation CLI, durable plan import, diagnostics, conflict handling, and restart persistence\n'

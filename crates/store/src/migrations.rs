@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 2;
+pub const STORAGE_SCHEMA_VERSION: u32 = 3;
 
 struct Migration {
     version: u32,
@@ -153,6 +153,25 @@ const MIGRATIONS: &[Migration] = &[
         CREATE INDEX idx_events_request ON events(request_id, sequence DESC);
         CREATE INDEX idx_events_repository ON events(repository_id, sequence DESC);
         CREATE INDEX idx_events_kind ON events(kind, sequence DESC);
+        "#,
+    },
+    Migration {
+        version: 3,
+        sql: r#"
+        CREATE TABLE feature_plans (
+            feature_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision > 0),
+            repository_id TEXT NOT NULL,
+            target_ref TEXT NOT NULL CHECK (target_ref LIKE 'refs/heads/%'),
+            sealed INTEGER NOT NULL CHECK (sealed IN (0, 1)),
+            document_json TEXT NOT NULL CHECK (json_valid(document_json)),
+            created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+            PRIMARY KEY (feature_id, revision),
+            FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_feature_plans_repository
+            ON feature_plans(repository_id, feature_id, revision DESC);
         "#,
     },
 ];

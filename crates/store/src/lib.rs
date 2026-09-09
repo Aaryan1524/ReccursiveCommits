@@ -2,6 +2,7 @@
 
 mod events;
 mod migrations;
+mod plans;
 mod redaction;
 mod repository;
 
@@ -13,6 +14,7 @@ use std::{
 
 pub use events::{DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, StoredEvent};
 pub use migrations::STORAGE_SCHEMA_VERSION;
+pub use plans::StoredPlan;
 pub use redaction::{redact_json, redact_text};
 pub use repository::{RepositoryRegistration, StoredRepository};
 use rusqlite::{Connection, OpenFlags};

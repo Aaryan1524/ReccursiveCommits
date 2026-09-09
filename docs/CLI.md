@@ -17,6 +17,9 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state repository add /path/t
 cargo run -p reccursive-cli -- --state-dir /path/to/state repository list
 cargo run -p reccursive-cli -- --state-dir /path/to/state status
 cargo run -p reccursive-cli -- --state-dir /path/to/state logs --limit 50
+cargo run -p reccursive-cli -- --state-dir /path/to/state plan import feature-plan.json
+cargo run -p reccursive-cli -- --state-dir /path/to/state plan show feature_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state plan history feature_<uuid>
 ```
 
 Pass `--json` for a stable JSON envelope with no prompts or spinners. The
@@ -26,6 +29,12 @@ Pass `--json` for a stable JSON envelope with no prompts or spinners. The
 request is correlated by request ID, stored with a stable event kind and severity,
 and scrubbed for common credential formats before persistence. The installation
 retains a bounded event history rather than growing the database indefinitely.
+
+`plan import` accepts the portable, versioned JSON contract documented in
+[`PLAN_FORMAT.md`](PLAN_FORMAT.md). Imports are append-only: the first revision is
+1 and each later document must use the next revision for the same feature and
+repository. `plan show` reads an exact revision with `--revision` or the newest
+revision by default; `plan history` lists every preserved revision.
 
 ## Exit codes
 

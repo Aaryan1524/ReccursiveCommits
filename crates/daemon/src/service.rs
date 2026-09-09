@@ -13,13 +13,13 @@ use std::{
 
 use reccursive_protocol::{
     ApiError, ApiErrorCode, AuthToken, Command, EnrollRepositoryRequest, EventSeverityView,
-    EventView, ProtocolValidationError, RepositoryId, RepositoryPolicy, RepositoryView,
+    EventView, PlanView, ProtocolValidationError, RepositoryId, RepositoryPolicy, RepositoryView,
     RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision, TransportError,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
     DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, RepositoryRegistration, Store,
-    StoreError, StoredEvent, StoredRepository,
+    StoreError, StoredEvent, StoredPlan, StoredRepository,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -307,6 +307,36 @@ fn dispatch(
                 .collect();
             Ok(ResponseData::Events { events })
         }
+        Command::ImportPlan { plan } => import_plan(plan, store),
+        Command::GetPlan {
+            feature_id,
+            revision,
+        } => {
+            let store = lock_store(store)?;
+            let plan = store
+                .plan(feature_id, revision)
+                .map_err(store_api_error)?
+                .ok_or_else(|| {
+                    ApiError::new(
+                        ApiErrorCode::NotFound,
+                        format!("feature plan {feature_id} was not found"),
+                        false,
+                    )
+                })?;
+            Ok(ResponseData::Plan {
+                plan: plan_view(plan),
+            })
+        }
+        Command::PlanHistory { feature_id } => {
+            let store = lock_store(store)?;
+            let plans = store
+                .plan_history(feature_id)
+                .map_err(store_api_error)?
+                .into_iter()
+                .map(plan_view)
+                .collect();
+            Ok(ResponseData::PlanHistory { plans })
+        }
         Command::EnrollRepository(request) => enroll_repository(request, store, managed_root),
     }
 }
@@ -317,6 +347,9 @@ fn command_name(command: &Command) -> &'static str {
         Command::EnrollRepository(_) => "repository.add",
         Command::ListRepositories => "repository.list",
         Command::ListEvents { .. } => "logs",
+        Command::ImportPlan { .. } => "plan.import",
+        Command::GetPlan { .. } => "plan.show",
+        Command::PlanHistory { .. } => "plan.history",
         Command::Status => "status",
     }
 }
@@ -327,9 +360,20 @@ fn record_api_event(
     command: &'static str,
     result: &Result<ResponseData, ApiError>,
 ) -> Result<(), ApiError> {
-    let repository_id = match result {
-        Ok(ResponseData::RepositoryEnrolled { repository }) => Some(repository.id),
-        _ => None,
+    let (repository_id, entity_type, entity_id, entity_revision) = match result {
+        Ok(ResponseData::RepositoryEnrolled { repository }) => (
+            Some(repository.id),
+            Some("repository".into()),
+            Some(repository.id.to_string()),
+            None,
+        ),
+        Ok(ResponseData::PlanImported { plan }) | Ok(ResponseData::Plan { plan }) => (
+            Some(plan.plan.repository_id),
+            Some("feature_plan".into()),
+            Some(plan.plan.feature_id.to_string()),
+            Some(plan.plan.revision),
+        ),
+        _ => (None, None, None, None),
     };
     let (kind, severity, reason_code, outcome) = match result {
         Ok(_) => (
@@ -350,6 +394,9 @@ fn record_api_event(
         EventContext {
             request_id: Some(request_id),
             repository_id,
+            entity_type,
+            entity_id,
+            entity_revision,
             ..EventContext::default()
         },
         kind,
@@ -367,12 +414,30 @@ fn record_api_event(
 const fn api_error_code(code: ApiErrorCode) -> &'static str {
     match code {
         ApiErrorCode::InvalidRequest => "invalid_request",
+        ApiErrorCode::NotFound => "not_found",
         ApiErrorCode::UnsupportedVersion => "unsupported_version",
         ApiErrorCode::Unauthorized => "unauthorized",
         ApiErrorCode::Conflict => "conflict",
         ApiErrorCode::TemporarilyUnavailable => "temporarily_unavailable",
         ApiErrorCode::Internal => "internal",
     }
+}
+
+fn import_plan(
+    plan: reccursive_protocol::FeaturePlan,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let created_at_unix_ms = current_unix_ms()?;
+    let mut store = lock_store(store)?;
+    store
+        .import_plan(&plan, created_at_unix_ms)
+        .map_err(store_api_error)?;
+    Ok(ResponseData::PlanImported {
+        plan: PlanView {
+            plan,
+            created_at_unix_ms,
+        },
+    })
 }
 
 fn enroll_repository(
@@ -460,6 +525,13 @@ fn event_view(event: StoredEvent) -> EventView {
     }
 }
 
+fn plan_view(stored: StoredPlan) -> PlanView {
+    PlanView {
+        plan: stored.plan,
+        created_at_unix_ms: stored.created_at_unix_ms,
+    }
+}
+
 fn lock_store(store: &Mutex<Store>) -> Result<std::sync::MutexGuard<'_, Store>, ApiError> {
     store.lock().map_err(|_| {
         ApiError::new(
@@ -541,7 +613,11 @@ pub enum ServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reccursive_protocol::{API_VERSION, LocalClient, ResponseData};
+    use reccursive_protocol::{
+        API_VERSION, AcceptanceCheck, FeaturePlan, LocalClient, PLAN_SCHEMA_VERSION, PlanPhase,
+        PlanTask, PublicationMode, ResponseData, TargetRef,
+    };
+    use std::collections::BTreeMap;
     use std::net::Shutdown;
     use tempfile::tempdir;
 
@@ -626,6 +702,81 @@ mod tests {
             .expect("ping event should be correlated by request ID");
         assert_eq!(event.kind, "api.request_succeeded");
         assert_eq!(event.details["command"], "ping");
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn plan_import_round_trips_through_the_service() {
+        let directory = tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let paths = ServicePaths::new(directory.path().join("state"));
+        let service = LocalService::bind(paths.clone()).unwrap();
+        let worker = thread::spawn(move || service.serve_connections(3));
+        let client = LocalClient::from_token_file(&paths.auth_token).unwrap();
+
+        let enrollment = client
+            .send(
+                &paths.socket,
+                Command::EnrollRepository(EnrollRepositoryRequest {
+                    checkout_path: checkout.to_string_lossy().into_owned(),
+                    canonical_remote: "ssh://git@example.invalid/project.git".into(),
+                    publication_mode: PublicationMode::ScheduledCreation,
+                    target: TargetRef::new("refs/heads/main").unwrap(),
+                    development_target: None,
+                }),
+            )
+            .unwrap()
+            .result
+            .unwrap();
+        let repository_id = match enrollment {
+            ResponseData::RepositoryEnrolled { repository } => repository.id,
+            data => panic!("expected enrollment, received {data:?}"),
+        };
+        let plan = FeaturePlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            feature_id: reccursive_protocol::FeatureId::new(),
+            revision: Revision::FIRST,
+            repository_id,
+            goal: "Round-trip an imported plan".into(),
+            target: TargetRef::new("refs/heads/main").unwrap(),
+            sealed: true,
+            phases: vec![PlanPhase {
+                id: "delivery".into(),
+                name: "Delivery".into(),
+                tasks: vec![PlanTask {
+                    id: reccursive_protocol::TaskId::new(),
+                    name: "Import through the daemon".into(),
+                    dependencies: BTreeMap::new(),
+                    acceptance_checks: vec![AcceptanceCheck {
+                        id: "round_trip".into(),
+                        description: "The exact plan returns through the API".into(),
+                    }],
+                }],
+            }],
+        };
+
+        let imported = client
+            .send(&paths.socket, Command::ImportPlan { plan: plan.clone() })
+            .unwrap();
+        assert!(matches!(
+            imported.result,
+            Ok(ResponseData::PlanImported { .. })
+        ));
+        let loaded = client
+            .send(
+                &paths.socket,
+                Command::GetPlan {
+                    feature_id: plan.feature_id,
+                    revision: None,
+                },
+            )
+            .unwrap();
+        let returned = match loaded.result.unwrap() {
+            ResponseData::Plan { plan } => plan.plan,
+            data => panic!("expected plan, received {data:?}"),
+        };
+        assert_eq!(returned, plan);
         worker.join().unwrap().unwrap();
     }
 

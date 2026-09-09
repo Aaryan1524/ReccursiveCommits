@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/cli",
+    "crates/core",
+    "crates/daemon",
+    "crates/protocol",
+    "crates/store",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/Aaryan1524/ReccursiveCommits"
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+regex = "1.12"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.0", features = ["serde", "v4"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+correctness = "deny"

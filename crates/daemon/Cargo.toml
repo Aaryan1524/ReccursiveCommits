@@ -1,0 +1,21 @@
+[package]
+name = "reccursive-daemon"
+description = "Background queue owner and local service for ReccursiveCommits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+reccursive-protocol = { path = "../protocol" }
+reccursive-store = { path = "../store" }
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[lints]
+workspace = true

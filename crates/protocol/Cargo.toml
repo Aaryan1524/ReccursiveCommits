@@ -1,0 +1,17 @@
+[package]
+name = "reccursive-protocol"
+description = "Versioned local API contract for ReccursiveCommits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+reccursive-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

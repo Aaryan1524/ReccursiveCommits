@@ -11,15 +11,19 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use reccursive_capture::{
+    OwnedWorkspace, PrerequisiteState, WorkspaceError, WorkspaceRequest as CaptureWorkspaceRequest,
+};
 use reccursive_protocol::{
-    ApiError, ApiErrorCode, AuthToken, Command, EnrollRepositoryRequest, EventSeverityView,
-    EventView, PlanView, ProtocolValidationError, RepositoryId, RepositoryPolicy, RepositoryView,
-    RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision, TransportError,
+    ApiError, ApiErrorCode, AuthToken, Command, CreateWorkspaceRequest, EnrollRepositoryRequest,
+    EventSeverityView, EventView, PlanView, ProtocolValidationError, RepositoryId,
+    RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope,
+    Revision, TransportError, WorkspacePrerequisiteView, WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
     DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, RepositoryRegistration, Store,
-    StoreError, StoredEvent, StoredPlan, StoredRepository,
+    StoreError, StoredEvent, StoredPlan, StoredRepository, WorkspaceRecord,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -33,6 +37,7 @@ pub struct ServicePaths {
     pub lock: PathBuf,
     pub auth_token: PathBuf,
     pub database: PathBuf,
+    pub workspaces: PathBuf,
 }
 
 impl ServicePaths {
@@ -44,6 +49,7 @@ impl ServicePaths {
             lock: state_dir.join("service.lock"),
             auth_token: state_dir.join("auth.token"),
             database: state_dir.join("state.sqlite"),
+            workspaces: state_dir.join("workspaces"),
             state_dir,
         }
     }
@@ -54,6 +60,7 @@ pub struct LocalService {
     owner: ServiceOwner,
     store: Arc<Mutex<Store>>,
     managed_root: Arc<PathBuf>,
+    workspace_root: Arc<PathBuf>,
 }
 
 impl LocalService {
@@ -61,11 +68,14 @@ impl LocalService {
     pub fn bind(paths: ServicePaths) -> Result<Self, ServiceError> {
         let owner = ServiceOwner::acquire(paths)?;
         let store = Store::open(&owner.paths.database)?;
-        let managed_root = owner.paths.state_dir.join("repositories");
+        let state_root = fs::canonicalize(&owner.paths.state_dir)?;
+        let managed_root = state_root.join("repositories");
+        let workspace_root = state_root.join("workspaces");
         Ok(Self {
             owner,
             store: Arc::new(Mutex::new(store)),
             managed_root: Arc::new(managed_root),
+            workspace_root: Arc::new(workspace_root),
         })
     }
 
@@ -76,8 +86,10 @@ impl LocalService {
             let auth_token = self.owner.auth_token.clone();
             let store = Arc::clone(&self.store);
             let managed_root = Arc::clone(&self.managed_root);
+            let workspace_root = Arc::clone(&self.workspace_root);
             thread::spawn(move || {
-                let _ = handle_connection(stream, &auth_token, &store, &managed_root);
+                let _ =
+                    handle_connection(stream, &auth_token, &store, &managed_root, &workspace_root);
             });
         }
         Ok(())
@@ -91,8 +103,9 @@ impl LocalService {
             let auth_token = self.owner.auth_token.clone();
             let store = Arc::clone(&self.store);
             let managed_root = Arc::clone(&self.managed_root);
+            let workspace_root = Arc::clone(&self.workspace_root);
             workers.push(thread::spawn(move || {
-                handle_connection(stream, &auth_token, &store, &managed_root)
+                handle_connection(stream, &auth_token, &store, &managed_root, &workspace_root)
             }));
         }
         for worker in workers {
@@ -218,6 +231,7 @@ fn handle_connection(
     expected_auth_token: &AuthToken,
     store: &Mutex<Store>,
     managed_root: &Path,
+    workspace_root: &Path,
 ) -> Result<(), ServiceError> {
     let request = match read_message::<RequestEnvelope>(&mut stream) {
         Ok(request) => request,
@@ -253,7 +267,7 @@ fn handle_connection(
     } else {
         let request_id = request.request_id;
         let command_name = command_name(&request.command);
-        let result = dispatch(request.command, store, managed_root);
+        let result = dispatch(request.command, store, managed_root, workspace_root);
         match record_api_event(store, request_id, command_name, &result) {
             Ok(()) => match result {
                 Ok(data) => ResponseEnvelope::success(request_id, data),
@@ -270,6 +284,7 @@ fn dispatch(
     command: Command,
     store: &Mutex<Store>,
     managed_root: &Path,
+    workspace_root: &Path,
 ) -> Result<ResponseData, ApiError> {
     match command {
         Command::Ping => {
@@ -337,6 +352,11 @@ fn dispatch(
                 .collect();
             Ok(ResponseData::PlanHistory { plans })
         }
+        Command::CreateWorkspace(request) => create_workspace(request, store, workspace_root),
+        Command::GetWorkspace {
+            feature_id,
+            revision,
+        } => get_workspace(feature_id, revision, store),
         Command::EnrollRepository(request) => enroll_repository(request, store, managed_root),
     }
 }
@@ -350,6 +370,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::ImportPlan { .. } => "plan.import",
         Command::GetPlan { .. } => "plan.show",
         Command::PlanHistory { .. } => "plan.history",
+        Command::CreateWorkspace(_) => "workspace.create",
+        Command::GetWorkspace { .. } => "workspace.show",
         Command::Status => "status",
     }
 }
@@ -372,6 +394,13 @@ fn record_api_event(
             Some("feature_plan".into()),
             Some(plan.plan.feature_id.to_string()),
             Some(plan.plan.revision),
+        ),
+        Ok(ResponseData::WorkspaceCreated { workspace })
+        | Ok(ResponseData::Workspace { workspace }) => (
+            Some(workspace.repository_id),
+            Some("workspace".into()),
+            Some(workspace.feature_id.to_string()),
+            Some(workspace.revision),
         ),
         _ => (None, None, None, None),
     };
@@ -438,6 +467,158 @@ fn import_plan(
             created_at_unix_ms,
         },
     })
+}
+
+fn create_workspace(
+    request: CreateWorkspaceRequest,
+    store: &Mutex<Store>,
+    workspace_root: &Path,
+) -> Result<ResponseData, ApiError> {
+    let (plan, repository) = {
+        let store = lock_store(store)?;
+        let plan = store
+            .plan(request.feature_id, request.revision)
+            .map_err(store_api_error)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::NotFound,
+                    format!("feature plan {} was not found", request.feature_id),
+                    false,
+                )
+            })?;
+        let repository = store
+            .repository(plan.plan.repository_id)
+            .map_err(store_api_error)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::NotFound,
+                    format!("repository {} was not found", plan.plan.repository_id),
+                    false,
+                )
+            })?;
+        (plan.plan, repository)
+    };
+    if !plan.sealed {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            "owned workspaces require a sealed plan revision",
+            false,
+        ));
+    }
+
+    let owned = OwnedWorkspace::create(CaptureWorkspaceRequest {
+        feature_id: plan.feature_id,
+        revision: plan.revision,
+        source_checkout: Path::new(&repository.registration.checkout_path),
+        workspace_root,
+        base_ref: plan.target.as_str(),
+        prerequisite_paths: &request.prerequisites,
+    })
+    .map_err(workspace_api_error)?;
+    let created_at_unix_ms = current_unix_ms()?;
+    let record = WorkspaceRecord {
+        feature_id: plan.feature_id,
+        revision: plan.revision,
+        path: owned.path.clone(),
+        base_commit: owned.base_commit.clone(),
+        prerequisites: serde_json::to_value(&owned.prerequisites).map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                "workspace prerequisite manifest could not be encoded",
+                false,
+            )
+        })?,
+        created_at_unix_ms,
+    };
+    lock_store(store)?
+        .record_workspace(&record)
+        .map_err(store_api_error)?;
+    Ok(ResponseData::WorkspaceCreated {
+        workspace: workspace_view(record, plan.repository_id)?,
+    })
+}
+
+fn get_workspace(
+    feature_id: reccursive_protocol::FeatureId,
+    revision: Revision,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let store = lock_store(store)?;
+    let plan = store
+        .plan(feature_id, Some(revision))
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotFound,
+                format!(
+                    "feature plan {feature_id} revision {} was not found",
+                    revision.get()
+                ),
+                false,
+            )
+        })?;
+    let record = store
+        .workspace(feature_id, revision)
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotFound,
+                format!(
+                    "workspace for {feature_id} revision {} was not found",
+                    revision.get()
+                ),
+                false,
+            )
+        })?;
+    Ok(ResponseData::Workspace {
+        workspace: workspace_view(record, plan.plan.repository_id)?,
+    })
+}
+
+fn workspace_view(
+    record: WorkspaceRecord,
+    repository_id: RepositoryId,
+) -> Result<WorkspaceView, ApiError> {
+    let prerequisites: Vec<reccursive_capture::Prerequisite> =
+        serde_json::from_value(record.prerequisites).map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                "stored workspace prerequisite manifest is invalid",
+                false,
+            )
+        })?;
+    Ok(WorkspaceView {
+        feature_id: record.feature_id,
+        revision: record.revision,
+        repository_id,
+        path: record.path.to_string_lossy().into_owned(),
+        base_commit: record.base_commit,
+        prerequisites: prerequisites
+            .into_iter()
+            .map(|prerequisite| WorkspacePrerequisiteView {
+                path: prerequisite.path,
+                state: match prerequisite.state {
+                    PrerequisiteState::Present => "present",
+                    PrerequisiteState::Deleted => "deleted",
+                }
+                .into(),
+            })
+            .collect(),
+        created_at_unix_ms: record.created_at_unix_ms,
+    })
+}
+
+fn workspace_api_error(error: WorkspaceError) -> ApiError {
+    let code = match &error {
+        WorkspaceError::AlreadyExists { .. } => ApiErrorCode::Conflict,
+        WorkspaceError::Git { .. } | WorkspaceError::Io(_) => ApiErrorCode::TemporarilyUnavailable,
+        _ => ApiErrorCode::InvalidRequest,
+    };
+    ApiError::new(
+        code,
+        error.to_string(),
+        code == ApiErrorCode::TemporarilyUnavailable,
+    )
 }
 
 fn enroll_repository(

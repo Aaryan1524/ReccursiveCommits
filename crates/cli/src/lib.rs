@@ -8,9 +8,9 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use reccursive_protocol::{
-    ApiError, ApiErrorCode, Command, EnrollRepositoryRequest, EventSeverityView, EventView,
-    FeatureId, FeaturePlan, LocalClient, PlanView, PublicationMode, RepositoryView, ResponseData,
-    Revision, TargetRef,
+    ApiError, ApiErrorCode, Command, CreateWorkspaceRequest, EnrollRepositoryRequest,
+    EventSeverityView, EventView, FeatureId, FeaturePlan, LocalClient, PlanView, PublicationMode,
+    RepositoryView, ResponseData, Revision, TargetRef, WorkspaceView,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -54,6 +54,11 @@ enum TopLevelCommand {
         #[command(subcommand)]
         command: PlanCommand,
     },
+    /// Create and inspect daemon-owned build workspaces.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
     /// Show service and queue summary.
     Status,
     /// Check local prerequisites and service connectivity.
@@ -63,6 +68,25 @@ enum TopLevelCommand {
         /// Maximum number of newest events to return.
         #[arg(long, default_value_t = 50, value_parser = parse_event_limit)]
         limit: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCommand {
+    /// Create an isolated workspace for a sealed plan revision.
+    Create {
+        feature_id: FeatureId,
+        #[arg(long, value_parser = parse_revision)]
+        revision: Option<Revision>,
+        /// Explicit dirty file to copy as a prerequisite; may be repeated.
+        #[arg(long = "include", value_name = "PATH")]
+        prerequisites: Vec<String>,
+    },
+    /// Show the recorded workspace for an exact plan revision.
+    Show {
+        feature_id: FeatureId,
+        #[arg(long, value_parser = parse_revision)]
+        revision: Revision,
     },
 }
 
@@ -242,6 +266,36 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             }
             PlanCommand::History { feature_id } => {
                 let data = send(&paths, Command::PlanHistory { feature_id })?;
+                output_data(data, cli.json, stdout)
+            }
+        },
+        TopLevelCommand::Workspace { command } => match command {
+            WorkspaceCommand::Create {
+                feature_id,
+                revision,
+                prerequisites,
+            } => {
+                let data = send(
+                    &paths,
+                    Command::CreateWorkspace(CreateWorkspaceRequest {
+                        feature_id,
+                        revision,
+                        prerequisites,
+                    }),
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            WorkspaceCommand::Show {
+                feature_id,
+                revision,
+            } => {
+                let data = send(
+                    &paths,
+                    Command::GetWorkspace {
+                        feature_id,
+                        revision,
+                    },
+                )?;
                 output_data(data, cli.json, stdout)
             }
         },
@@ -481,6 +535,10 @@ fn output_data(
         }
         ResponseData::Plan { plan } => output_plan(out, &plan),
         ResponseData::PlanHistory { plans } => output_plan_history(out, &plans),
+        ResponseData::WorkspaceCreated { workspace } => {
+            writeln!(out, "Created owned workspace {}", workspace.path)
+        }
+        ResponseData::Workspace { workspace } => output_workspace(out, &workspace),
     }
     .map_err(output_error)
 }
@@ -518,6 +576,18 @@ fn output_plan_history(out: &mut impl Write, plans: &[PlanView]) -> io::Result<(
         )?;
     }
     Ok(())
+}
+
+fn output_workspace(out: &mut impl Write, workspace: &WorkspaceView) -> io::Result<()> {
+    writeln!(
+        out,
+        "Feature: {}\nRevision: {}\nBase: {}\nPath: {}\nPrerequisites: {}",
+        workspace.feature_id,
+        workspace.revision.get(),
+        workspace.base_commit,
+        workspace.path,
+        workspace.prerequisites.len()
+    )
 }
 
 fn output_events(out: &mut impl Write, events: &[EventView]) -> io::Result<()> {

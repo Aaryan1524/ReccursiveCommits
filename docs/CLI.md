@@ -20,6 +20,9 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state logs --limit 50
 cargo run -p reccursive-cli -- --state-dir /path/to/state plan import feature-plan.json
 cargo run -p reccursive-cli -- --state-dir /path/to/state plan show feature_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state plan history feature_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state workspace create feature_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state workspace create feature_<uuid> --include src/config.rs
+cargo run -p reccursive-cli -- --state-dir /path/to/state workspace show feature_<uuid> --revision 1
 ```
 
 Pass `--json` for a stable JSON envelope with no prompts or spinners. The
@@ -35,6 +38,13 @@ retains a bounded event history rather than growing the database indefinitely.
 1 and each later document must use the next revision for the same feature and
 repository. `plan show` reads an exact revision with `--revision` or the newest
 revision by default; `plan history` lists every preserved revision.
+
+`workspace create` checks out the plan's exact target commit into daemon-owned
+storage. It never switches the user's branch or writes to the user's working tree
+or index. A dirty file is included only when its repository-relative path is named
+with `--include`; unmentioned changes remain solely in the user's checkout.
+Renames, copies, unresolved merges, unsafe paths, clean paths presented as dirty
+prerequisites, and duplicate ownership are rejected rather than guessed.
 
 ## Exit codes
 

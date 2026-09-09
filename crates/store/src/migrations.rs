@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 3;
+pub const STORAGE_SCHEMA_VERSION: u32 = 4;
 
 struct Migration {
     version: u32,
@@ -172,6 +172,22 @@ const MIGRATIONS: &[Migration] = &[
 
         CREATE INDEX idx_feature_plans_repository
             ON feature_plans(repository_id, feature_id, revision DESC);
+        "#,
+    },
+    Migration {
+        version: 4,
+        sql: r#"
+        CREATE TABLE build_workspaces (
+            feature_id TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL CHECK (plan_revision > 0),
+            workspace_path TEXT NOT NULL UNIQUE CHECK (length(workspace_path) > 0),
+            base_commit TEXT NOT NULL CHECK (length(base_commit) = 40),
+            prerequisites_json TEXT NOT NULL CHECK (json_valid(prerequisites_json)),
+            created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+            PRIMARY KEY (feature_id, plan_revision),
+            FOREIGN KEY (feature_id, plan_revision)
+                REFERENCES feature_plans(feature_id, revision) ON DELETE RESTRICT
+        );
         "#,
     },
 ];

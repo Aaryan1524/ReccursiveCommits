@@ -5,6 +5,7 @@ mod migrations;
 mod plans;
 mod redaction;
 mod repository;
+mod workspaces;
 
 use std::{
     fs,
@@ -20,6 +21,7 @@ pub use repository::{RepositoryRegistration, StoredRepository};
 use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
 use uuid::Uuid;
+pub use workspaces::WorkspaceRecord;
 
 /// SQLite owner for queue and repository state.
 pub struct Store {

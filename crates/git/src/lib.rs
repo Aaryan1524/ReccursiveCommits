@@ -436,6 +436,112 @@ pub enum PublicationRecovery {
     },
 }
 
+/// Bounded retry configuration for publication transport failures.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicationRetryPolicy {
+    pub max_attempts: u8,
+    pub initial_delay: Duration,
+    pub max_delay: Duration,
+}
+
+impl Default for PublicationRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_delay: Duration::from_secs(5),
+            max_delay: Duration::from_secs(5 * 60),
+        }
+    }
+}
+
+impl PublicationRetryPolicy {
+    pub fn new(
+        max_attempts: u8,
+        initial_delay: Duration,
+        max_delay: Duration,
+    ) -> Result<Self, RetryPolicyError> {
+        if max_attempts == 0 || initial_delay.is_zero() || max_delay < initial_delay {
+            return Err(RetryPolicyError::Invalid);
+        }
+        Ok(Self {
+            max_attempts,
+            initial_delay,
+            max_delay,
+        })
+    }
+
+    /// Selects the only safe next action after one unsuccessful publication attempt.
+    /// `failed_attempts` includes the attempt that just failed.
+    pub fn decide(
+        &self,
+        failed_attempts: u8,
+        error: &CandidatePublishError,
+    ) -> PublicationResolution {
+        match classify_publication_error(error) {
+            ErrorDisposition::Retryable => {
+                if failed_attempts >= self.max_attempts {
+                    PublicationResolution::Manual {
+                        block: PublicationBlock::RetryExhausted,
+                    }
+                } else {
+                    PublicationResolution::Retry {
+                        after: self.delay_for(failed_attempts),
+                    }
+                }
+            }
+            ErrorDisposition::RecoverRemote => PublicationResolution::RecoverRemote,
+            ErrorDisposition::Rebuild => PublicationResolution::RebuildCandidate,
+            ErrorDisposition::Manual(block) => PublicationResolution::Manual { block },
+        }
+    }
+
+    fn delay_for(&self, failed_attempts: u8) -> Duration {
+        let multiplier = 1_u32
+            .checked_shl(u32::from(failed_attempts.saturating_sub(1)))
+            .unwrap_or(u32::MAX);
+        self.initial_delay
+            .checked_mul(multiplier)
+            .unwrap_or(self.max_delay)
+            .min(self.max_delay)
+    }
+}
+
+/// Invalid bounded-retry configuration.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum RetryPolicyError {
+    #[error("retry policy needs attempts and a nonzero delay no larger than its maximum")]
+    Invalid,
+}
+
+/// A next step which never silently chooses a merge, signing identity, or access workaround.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublicationResolution {
+    Retry { after: Duration },
+    RecoverRemote,
+    RebuildCandidate,
+    Manual { block: PublicationBlock },
+}
+
+/// User-visible categories for non-retryable publication blocks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublicationBlock {
+    Authentication,
+    Signing,
+    BranchRule,
+    Conflict,
+    Configuration,
+    Cancelled,
+    GitFailure,
+    RetryExhausted,
+}
+
+enum ErrorDisposition {
+    Retryable,
+    RecoverRemote,
+    Rebuild,
+    Manual(PublicationBlock),
+}
+
 impl CandidateWorkspace {
     /// Applies the captured delta to the current target without committing it.
     ///
@@ -747,6 +853,95 @@ fn remote_ref(
 
 fn is_object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn classify_publication_error(error: &CandidatePublishError) -> ErrorDisposition {
+    match error {
+        CandidatePublishError::TargetAdvanced { .. } => ErrorDisposition::Rebuild,
+        CandidatePublishError::ConfirmationFailed { .. } => ErrorDisposition::RecoverRemote,
+        CandidatePublishError::InvalidRemote
+        | CandidatePublishError::InvalidTargetRef
+        | CandidatePublishError::LocalCandidateMismatch
+        | CandidatePublishError::TargetMissing { .. } => {
+            ErrorDisposition::Manual(PublicationBlock::Configuration)
+        }
+        CandidatePublishError::Git(error) => classify_git_failure(error),
+    }
+}
+
+fn classify_git_failure(error: &GitError) -> ErrorDisposition {
+    match error {
+        GitError::TimedOut(_) => ErrorDisposition::Retryable,
+        GitError::Cancelled => ErrorDisposition::Manual(PublicationBlock::Cancelled),
+        GitError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::NetworkDown
+                    | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            ErrorDisposition::Retryable
+        }
+        GitError::Failed { message, .. } => {
+            let message = message.to_ascii_lowercase();
+            if [
+                "authentication failed",
+                "could not read username",
+                "permission denied (publickey)",
+                "terminal prompts disabled",
+                "access denied",
+            ]
+            .iter()
+            .any(|marker| message.contains(marker))
+            {
+                ErrorDisposition::Manual(PublicationBlock::Authentication)
+            } else if ["gpg failed", "signing failed", "sign_and_send_pubkey"]
+                .iter()
+                .any(|marker| message.contains(marker))
+            {
+                ErrorDisposition::Manual(PublicationBlock::Signing)
+            } else if [
+                "protected branch",
+                "required status checks",
+                "hook declined",
+                "gh006",
+            ]
+            .iter()
+            .any(|marker| message.contains(marker))
+            {
+                ErrorDisposition::Manual(PublicationBlock::BranchRule)
+            } else if message.contains("conflict") {
+                ErrorDisposition::Manual(PublicationBlock::Conflict)
+            } else if [
+                "could not resolve host",
+                "connection timed out",
+                "connection reset",
+                "network is unreachable",
+                "temporary failure",
+                "remote end hung up",
+                "http 5",
+            ]
+            .iter()
+            .any(|marker| message.contains(marker))
+            {
+                ErrorDisposition::Retryable
+            } else {
+                ErrorDisposition::Manual(PublicationBlock::GitFailure)
+            }
+        }
+        GitError::InvalidInvocation
+        | GitError::ManagedPathExists(_)
+        | GitError::Snapshot(_)
+        | GitError::CandidateSnapshotMismatch { .. }
+        | GitError::NonUtf8Output
+        | GitError::Io(_) => ErrorDisposition::Manual(PublicationBlock::GitFailure),
+    }
 }
 
 fn git_text(
@@ -1267,6 +1462,68 @@ mod tests {
         assert!(matches!(
             candidate.verify(Duration::from_secs(5)),
             Err(CandidateVerificationError::UnmergedPaths { paths }) if paths == ["file.txt"]
+        ));
+    }
+
+    #[test]
+    fn publication_retry_policy_only_retries_classified_transport_failures() {
+        let policy =
+            PublicationRetryPolicy::new(3, Duration::from_secs(5), Duration::from_secs(20))
+                .unwrap();
+        let timeout = CandidatePublishError::Git(GitError::TimedOut(Duration::from_secs(1)));
+        assert_eq!(
+            policy.decide(1, &timeout),
+            PublicationResolution::Retry {
+                after: Duration::from_secs(5)
+            }
+        );
+        assert_eq!(
+            policy.decide(2, &timeout),
+            PublicationResolution::Retry {
+                after: Duration::from_secs(10)
+            }
+        );
+        assert_eq!(
+            policy.decide(3, &timeout),
+            PublicationResolution::Manual {
+                block: PublicationBlock::RetryExhausted
+            }
+        );
+        let authentication = CandidatePublishError::Git(GitError::Failed {
+            status: Some(128),
+            message: "fatal: Authentication failed".into(),
+        });
+        assert_eq!(
+            policy.decide(1, &authentication),
+            PublicationResolution::Manual {
+                block: PublicationBlock::Authentication
+            }
+        );
+        assert_eq!(
+            policy.decide(
+                1,
+                &CandidatePublishError::TargetAdvanced {
+                    target_ref: "refs/heads/main".into(),
+                    expected: "a".repeat(40),
+                    actual: "b".repeat(40),
+                }
+            ),
+            PublicationResolution::RebuildCandidate
+        );
+        assert_eq!(
+            policy.decide(
+                1,
+                &CandidatePublishError::ConfirmationFailed {
+                    target_ref: "refs/heads/main".into(),
+                    expected: "a".repeat(40),
+                    actual: None,
+                }
+            ),
+            PublicationResolution::RecoverRemote
+        );
+        assert!(matches!(
+            PublicationRetryPolicy::new(0, Duration::from_secs(1), Duration::from_secs(1)),
+            Err(RetryPolicyError::Invalid)
         ));
     }
 }

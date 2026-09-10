@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 9;
+pub const STORAGE_SCHEMA_VERSION: u32 = 10;
 
 struct Migration {
     version: u32,
@@ -348,6 +348,71 @@ const MIGRATIONS: &[Migration] = &[
 
         CREATE INDEX idx_snapshot_packages_parent
             ON snapshot_packages(parent_package_id);
+        "#,
+    },
+    Migration {
+        version: 10,
+        sql: r#"
+        -- The plan document stays authoritative and immutable in feature_plans.document_json.
+        -- These tables project it into rows so state and dependencies are answerable in SQL:
+        -- "what depends on task X" and "what state is task X in" cannot be asked of a JSON blob,
+        -- and both release-unit grouping and scheduling are built on those two questions.
+        CREATE TABLE plan_tasks (
+            feature_id TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL CHECK (plan_revision > 0),
+            task_id TEXT NOT NULL,
+            name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+            status TEXT NOT NULL CHECK (status IN (
+                'planned', 'building', 'captured', 'validated', 'queued', 'scheduled',
+                'reconciling', 'verifying', 'commit_prepared', 'push_pending',
+                'remote_confirmed', 'published', 'blocked', 'cancelled', 'superseded'
+            )),
+            reason_json TEXT CHECK (reason_json IS NULL OR json_valid(reason_json)),
+            blocked_from TEXT,
+            updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= 0),
+            PRIMARY KEY (feature_id, plan_revision, task_id),
+            -- A blocked task always keeps the exact state it must resume at.
+            CHECK ((status = 'blocked') = (blocked_from IS NOT NULL)),
+            FOREIGN KEY (feature_id, plan_revision)
+                REFERENCES feature_plans(feature_id, revision) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_plan_tasks_status
+            ON plan_tasks(feature_id, plan_revision, status);
+
+        CREATE TABLE plan_task_dependencies (
+            feature_id TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL CHECK (plan_revision > 0),
+            task_id TEXT NOT NULL,
+            depends_on_task_id TEXT NOT NULL,
+            required_milestone TEXT NOT NULL CHECK (required_milestone IN (
+                'captured', 'development_available', 'target_published'
+            )),
+            PRIMARY KEY (feature_id, plan_revision, task_id, depends_on_task_id),
+            CHECK (task_id <> depends_on_task_id),
+            FOREIGN KEY (feature_id, plan_revision, task_id)
+                REFERENCES plan_tasks(feature_id, plan_revision, task_id) ON DELETE CASCADE,
+            FOREIGN KEY (feature_id, plan_revision, depends_on_task_id)
+                REFERENCES plan_tasks(feature_id, plan_revision, task_id) ON DELETE CASCADE
+        );
+
+        -- Answers "what depends on task X" directly.
+        CREATE INDEX idx_plan_task_dependencies_prerequisite
+            ON plan_task_dependencies(feature_id, plan_revision, depends_on_task_id);
+
+        -- Which tasks a captured package carries. Previously this lived only inside
+        -- manifest_json, so no query could relate a package to the tasks it delivers.
+        CREATE TABLE snapshot_package_tasks (
+            package_id TEXT NOT NULL,
+            package_revision INTEGER NOT NULL CHECK (package_revision > 0),
+            task_id TEXT NOT NULL,
+            PRIMARY KEY (package_id, package_revision, task_id),
+            FOREIGN KEY (package_id, package_revision)
+                REFERENCES snapshot_packages(package_id, revision) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_snapshot_package_tasks_task
+            ON snapshot_package_tasks(task_id);
         "#,
     },
 ];

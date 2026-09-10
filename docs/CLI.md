@@ -25,6 +25,8 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state workspace create featu
 cargo run -p reccursive-cli -- --state-dir /path/to/state workspace show feature_<uuid> --revision 1
 cargo run -p reccursive-cli -- --state-dir /path/to/state package capture feature_<uuid> --revision 1 --task task_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state package show package_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state queue audit
+cargo run -p reccursive-cli -- --state-dir /path/to/state queue export /absolute/path/to/queue-backup
 ```
 
 Pass `--json` for a stable JSON envelope with no prompts or spinners. The
@@ -52,6 +54,16 @@ prerequisites, and duplicate ownership are rejected rather than guessed.
 tasks. The immutable package contains a self-contained Git object bundle plus an
 authenticated manifest with exact base/result trees. `package show` recalculates
 the bundle and manifest hashes before returning metadata; corruption is an error.
+
+`queue audit` reconciles crash evidence with durable state. A fully authenticated
+package that was written before its database row is re-registered, and a complete
+partial directory is promoted atomically. Incomplete, invalid, missing, or unsafe
+entries are retained as recovery issues for inspection; the daemon never deletes
+them during recovery. `queue export` writes a new portable directory containing a
+consistent SQLite backup, only immutable packages that pass verification, and an
+export manifest containing the database SHA-256. It excludes mutable workspaces, local API
+tokens, and publication credentials. Import/restore into another installation is a
+later workflow, so an export itself cannot enable a second publisher.
 
 ## Exit codes
 

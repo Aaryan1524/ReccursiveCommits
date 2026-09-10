@@ -10,8 +10,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reccursive_protocol::{
     ApiError, ApiErrorCode, CapturePackageRequest, Command, CreateWorkspaceRequest,
     EnrollRepositoryRequest, EventSeverityView, EventView, FeatureId, FeaturePlan, LocalClient,
-    PackageId, PackageView, PlanView, PublicationMode, RepositoryView, ResponseData, Revision,
-    TargetRef, TaskId, WorkspaceView,
+    PackageId, PackageView, PlanView, PublicationMode, QueueAuditView, QueueExportView,
+    RepositoryView, ResponseData, Revision, TargetRef, TaskId, WorkspaceView,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -65,6 +65,11 @@ enum TopLevelCommand {
         #[command(subcommand)]
         command: PackageCommand,
     },
+    /// Inspect package recovery state or create a portable queue backup.
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommand,
+    },
     /// Show service and queue summary.
     Status,
     /// Check local prerequisites and service connectivity.
@@ -92,6 +97,17 @@ enum PackageCommand {
         package_id: PackageId,
         #[arg(long, value_parser = parse_revision, default_value = "1")]
         revision: Revision,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum QueueCommand {
+    /// Verify package storage and show unresolved crash-recovery evidence.
+    Audit,
+    /// Export verified queue state and immutable packages to a new directory.
+    Export {
+        #[arg(value_name = "DIRECTORY")]
+        destination: PathBuf,
     },
 }
 
@@ -353,6 +369,21 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 output_data(data, cli.json, stdout)
             }
         },
+        TopLevelCommand::Queue { command } => match command {
+            QueueCommand::Audit => {
+                let data = send(&paths, Command::AuditQueue)?;
+                output_data(data, cli.json, stdout)
+            }
+            QueueCommand::Export { destination } => {
+                let data = send(
+                    &paths,
+                    Command::ExportQueue {
+                        destination: destination.to_string_lossy().into_owned(),
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+        },
         TopLevelCommand::Repository { command } => match command {
             RepositoryCommand::List => {
                 let data = send(&paths, Command::ListRepositories)?;
@@ -597,6 +628,8 @@ fn output_data(
             writeln!(out, "Captured immutable package {}", package.package_id)
         }
         ResponseData::Package { package } => output_package(out, &package),
+        ResponseData::QueueAudit { audit } => output_queue_audit(out, &audit),
+        ResponseData::QueueExported { export } => output_queue_export(out, &export),
     }
     .map_err(output_error)
 }
@@ -659,6 +692,30 @@ fn output_package(out: &mut impl Write, package: &PackageView) -> io::Result<()>
         package.result_tree,
         package.content_hash,
         package.task_ids.len()
+    )
+}
+
+fn output_queue_audit(out: &mut impl Write, audit: &QueueAuditView) -> io::Result<()> {
+    writeln!(
+        out,
+        "Verified packages: {}\nUnresolved recovery issues: {}",
+        audit.verified_package_count,
+        audit.issues.len()
+    )?;
+    for issue in &audit.issues {
+        writeln!(out, "- [{}] {}: {}", issue.kind, issue.path, issue.message)?;
+    }
+    Ok(())
+}
+
+fn output_queue_export(out: &mut impl Write, export: &QueueExportView) -> io::Result<()> {
+    writeln!(
+        out,
+        "Exported {} verified package(s) to {}\nUnresolved recovery issues retained in backup: {}\nDatabase SHA-256: {}",
+        export.verified_package_count,
+        export.destination,
+        export.unresolved_issue_count,
+        export.database_sha256
     )
 }
 

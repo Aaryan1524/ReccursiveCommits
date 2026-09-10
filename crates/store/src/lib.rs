@@ -20,7 +20,7 @@ pub use plans::StoredPlan;
 pub use redaction::{redact_json, redact_text};
 pub use repository::{RepositoryRegistration, StoredRepository};
 use rusqlite::{Connection, OpenFlags};
-pub use snapshots::SnapshotRecord;
+pub use snapshots::{SnapshotRecord, SnapshotRecoveryIssue};
 use thiserror::Error;
 use uuid::Uuid;
 pub use workspaces::WorkspaceRecord;

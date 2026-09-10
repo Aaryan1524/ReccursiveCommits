@@ -1,6 +1,7 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::{ErrorKind, Write},
+    io::{ErrorKind, Read, Write},
     os::unix::{
         fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
@@ -18,16 +19,18 @@ use reccursive_capture::{
 use reccursive_protocol::{
     ApiError, ApiErrorCode, AuthToken, CapturePackageRequest, Command, CreateWorkspaceRequest,
     EnrollRepositoryRequest, EventSeverityView, EventView, PackageView, PlanView,
-    ProtocolValidationError, RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope,
-    RequestId, ResponseData, ResponseEnvelope, Revision, TransportError, WorkspacePrerequisiteView,
-    WorkspaceView,
+    ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView, RepositoryId,
+    RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope,
+    Revision, TransportError, WorkspacePrerequisiteView, WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
     DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, RepositoryRegistration,
-    SnapshotRecord, Store, StoreError, StoredEvent, StoredPlan, StoredRepository, WorkspaceRecord,
+    SnapshotRecord, SnapshotRecoveryIssue, Store, StoreError, StoredEvent, StoredPlan,
+    StoredRepository, WorkspaceRecord,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -72,11 +75,12 @@ impl LocalService {
     /// Acquires exclusive ownership before opening the database or socket.
     pub fn bind(paths: ServicePaths) -> Result<Self, ServiceError> {
         let owner = ServiceOwner::acquire(paths)?;
-        let store = Store::open(&owner.paths.database)?;
+        let mut store = Store::open(&owner.paths.database)?;
         let state_root = fs::canonicalize(&owner.paths.state_dir)?;
         let managed_root = state_root.join("repositories");
         let workspace_root = state_root.join("workspaces");
         let package_root = state_root.join("packages");
+        reconcile_snapshot_storage(&mut store, &package_root)?;
         Ok(Self {
             owner,
             store: Arc::new(Mutex::new(store)),
@@ -392,6 +396,8 @@ fn dispatch(
             package_id,
             revision,
         } => get_package(package_id, revision, store),
+        Command::AuditQueue => audit_queue(store, package_root),
+        Command::ExportQueue { destination } => export_queue(destination, store, package_root),
         Command::EnrollRepository(request) => enroll_repository(request, store, managed_root),
     }
 }
@@ -409,6 +415,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::GetWorkspace { .. } => "workspace.show",
         Command::CapturePackage(_) => "package.capture",
         Command::GetPackage { .. } => "package.show",
+        Command::AuditQueue => "queue.audit",
+        Command::ExportQueue { .. } => "queue.export",
         Command::Status => "status",
     }
 }
@@ -445,6 +453,9 @@ fn record_api_event(
             Some(package.package_id.to_string()),
             Some(package.revision),
         ),
+        Ok(ResponseData::QueueExported { .. }) | Ok(ResponseData::QueueAudit { .. }) => {
+            (None, Some("queue_storage".into()), None, None)
+        }
         _ => (None, None, None, None),
     };
     let (kind, severity, reason_code, outcome) = match result {
@@ -662,6 +673,500 @@ fn workspace_api_error(error: WorkspaceError) -> ApiError {
         error.to_string(),
         code == ApiErrorCode::TemporarilyUnavailable,
     )
+}
+
+/// Reconciles the package directory with durable records after a crash or abrupt shutdown.
+/// A complete authenticated package is recoverable even if the process stopped between its
+/// atomic directory rename and SQLite insert. Incomplete or invalid artifacts are preserved and
+/// recorded for the operator instead of being silently deleted.
+fn reconcile_snapshot_storage(store: &mut Store, package_root: &Path) -> Result<(), StoreError> {
+    ensure_private_directory(package_root)?;
+    let package_root = fs::canonicalize(package_root)?;
+    let now = recovery_unix_ms()?;
+    let mut records: HashMap<_, _> = store
+        .snapshots()?
+        .into_iter()
+        .map(|record| ((record.package_id, record.revision), record))
+        .collect();
+    let mut observed = HashSet::new();
+
+    for parent in fs::read_dir(&package_root)? {
+        let parent = parent?;
+        let parent_path = parent.path();
+        let parent_type = parent.file_type()?;
+        if !parent_type.is_dir() || parent_type.is_symlink() {
+            record_recovery_issue(
+                store,
+                parent_path,
+                "unsafe_package_parent",
+                "package root contains a non-directory or symbolic-link entry",
+                now,
+            )?;
+            continue;
+        }
+        let package_id = match parent.file_name().to_string_lossy().parse() {
+            Ok(value) => value,
+            Err(_) => {
+                record_recovery_issue(
+                    store,
+                    parent_path,
+                    "unrecognized_package_parent",
+                    "package parent name is not a valid package identifier",
+                    now,
+                )?;
+                continue;
+            }
+        };
+
+        for entry in fs::read_dir(&parent_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            let entry_type = entry.file_type()?;
+            if !entry_type.is_dir() || entry_type.is_symlink() {
+                record_recovery_issue(
+                    store,
+                    path,
+                    "unsafe_package_entry",
+                    "package entry is not a real directory",
+                    now,
+                )?;
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(revision) = parse_package_revision(&name, "revision-") {
+                inspect_complete_package(
+                    store,
+                    &mut records,
+                    &mut observed,
+                    package_id,
+                    revision,
+                    path,
+                    now,
+                )?;
+            } else if let Some(revision) =
+                parse_package_revision(&name, ".revision-").filter(|_| name.ends_with(".partial"))
+            {
+                let final_name = format!("revision-{}", revision.get());
+                let final_path = parent_path.join(final_name);
+                match SnapshotPackage::open(path.clone()) {
+                    Ok(package)
+                        if package.manifest.package_id == package_id
+                            && package.manifest.revision == revision
+                            && fs::symlink_metadata(&final_path).is_err() =>
+                    {
+                        fs::rename(&path, &final_path)?;
+                        sync_directory(&parent_path)?;
+                        inspect_complete_package(
+                            store,
+                            &mut records,
+                            &mut observed,
+                            package_id,
+                            revision,
+                            final_path,
+                            now,
+                        )?;
+                    }
+                    Ok(_) => record_recovery_issue(
+                        store,
+                        path,
+                        "incomplete_capture",
+                        "partial package conflicts with its final destination or identity",
+                        now,
+                    )?,
+                    Err(error) => record_recovery_issue(
+                        store,
+                        path,
+                        "incomplete_capture",
+                        &format!("partial package is not yet recoverable: {error}"),
+                        now,
+                    )?,
+                }
+            } else {
+                record_recovery_issue(
+                    store,
+                    path,
+                    "unrecognized_package_entry",
+                    "package directory name is not a supported revision layout",
+                    now,
+                )?;
+            }
+        }
+    }
+
+    for record in records.into_values() {
+        if !observed.contains(&record.path) {
+            record_recovery_issue(
+                store,
+                record.path,
+                "missing_package",
+                "database record has no matching package directory in managed storage",
+                now,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn inspect_complete_package(
+    store: &mut Store,
+    records: &mut HashMap<(reccursive_protocol::PackageId, Revision), SnapshotRecord>,
+    observed: &mut HashSet<PathBuf>,
+    expected_package_id: reccursive_protocol::PackageId,
+    expected_revision: Revision,
+    path: PathBuf,
+    now: i64,
+) -> Result<(), StoreError> {
+    let package = match SnapshotPackage::open(path.clone()) {
+        Ok(package) => package,
+        Err(error) => {
+            records.remove(&(expected_package_id, expected_revision));
+            observed.insert(path.clone());
+            return record_recovery_issue(
+                store,
+                path,
+                "invalid_package",
+                &format!("package verification failed: {error}"),
+                now,
+            );
+        }
+    };
+    if package.manifest.package_id != expected_package_id
+        || package.manifest.revision != expected_revision
+    {
+        records.remove(&(expected_package_id, expected_revision));
+        observed.insert(path.clone());
+        return record_recovery_issue(
+            store,
+            path,
+            "package_identity_mismatch",
+            "package manifest does not match its managed directory",
+            now,
+        );
+    }
+    observed.insert(path.clone());
+    let record = records.remove(&(expected_package_id, expected_revision));
+    let recovered = SnapshotRecord {
+        package_id: package.manifest.package_id,
+        revision: package.manifest.revision,
+        feature_id: package.manifest.feature_id,
+        plan_revision: package.manifest.plan_revision,
+        path: path.clone(),
+        base_tree: package.manifest.base_tree.clone(),
+        result_tree: package.manifest.result_tree.clone(),
+        content_hash: package.manifest.content_hash.clone(),
+        manifest: serde_json::to_value(&package.manifest)?,
+        created_at_unix_ms: now,
+    };
+    match record {
+        Some(record) if snapshot_records_match(&record, &recovered) => {
+            store.clear_snapshot_recovery_issue(&path)?;
+        }
+        Some(_) => record_recovery_issue(
+            store,
+            path,
+            "record_mismatch",
+            "database record disagrees with the authenticated package manifest",
+            now,
+        )?,
+        None => {
+            store.record_snapshot(&recovered)?;
+            store.clear_snapshot_recovery_issue(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_records_match(left: &SnapshotRecord, right: &SnapshotRecord) -> bool {
+    left.package_id == right.package_id
+        && left.revision == right.revision
+        && left.feature_id == right.feature_id
+        && left.plan_revision == right.plan_revision
+        && left.path == right.path
+        && left.base_tree == right.base_tree
+        && left.result_tree == right.result_tree
+        && left.content_hash == right.content_hash
+}
+
+fn parse_package_revision(name: &str, prefix: &str) -> Option<Revision> {
+    let value = name.strip_prefix(prefix)?;
+    let value = value.strip_suffix(".partial").unwrap_or(value);
+    value
+        .parse::<u32>()
+        .ok()
+        .and_then(|value| Revision::new(value).ok())
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), StoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(StoreError::InvalidData(format!(
+            "managed package root is unsafe: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            fs::create_dir(path)?;
+            Ok(())
+        }
+        Err(error) => Err(StoreError::Io(error)),
+    }
+}
+
+fn record_recovery_issue(
+    store: &mut Store,
+    path: PathBuf,
+    kind: &str,
+    message: &str,
+    now: i64,
+) -> Result<(), StoreError> {
+    store.record_snapshot_recovery_issue(&SnapshotRecoveryIssue {
+        path,
+        kind: kind.into(),
+        message: message.into(),
+        first_seen_at_unix_ms: now,
+        last_seen_at_unix_ms: now,
+    })
+}
+
+fn recovery_unix_ms() -> Result<i64, StoreError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StoreError::InvalidData("system clock is before the Unix epoch".into()))?;
+    i64::try_from(duration.as_millis())
+        .map_err(|_| StoreError::InvalidData("system clock is out of range".into()))
+}
+
+fn sync_directory(path: &Path) -> Result<(), StoreError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn audit_queue(store: &Mutex<Store>, package_root: &Path) -> Result<ResponseData, ApiError> {
+    let mut store = lock_store(store)?;
+    reconcile_snapshot_storage(&mut store, package_root).map_err(store_api_error)?;
+    let records = store.snapshots().map_err(store_api_error)?;
+    let verified_package_count = records
+        .iter()
+        .filter(|record| verified_snapshot_record(record, package_root).is_ok())
+        .count();
+    let issues = store
+        .snapshot_recovery_issues()
+        .map_err(store_api_error)?
+        .into_iter()
+        .map(|issue| QueueRecoveryIssueView {
+            path: issue.path.to_string_lossy().into_owned(),
+            kind: issue.kind,
+            message: issue.message,
+            first_seen_at_unix_ms: issue.first_seen_at_unix_ms,
+            last_seen_at_unix_ms: issue.last_seen_at_unix_ms,
+        })
+        .collect();
+    Ok(ResponseData::QueueAudit {
+        audit: QueueAuditView {
+            verified_package_count,
+            issues,
+        },
+    })
+}
+
+fn export_queue(
+    destination: String,
+    store: &Mutex<Store>,
+    package_root: &Path,
+) -> Result<ResponseData, ApiError> {
+    let destination = PathBuf::from(destination);
+    if !destination.is_absolute() {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            "queue export destination must be an absolute directory",
+            false,
+        ));
+    }
+    if fs::symlink_metadata(&destination).is_ok() {
+        return Err(ApiError::new(
+            ApiErrorCode::Conflict,
+            "queue export destination already exists",
+            false,
+        ));
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            "queue export destination must have a parent directory",
+            false,
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|_| {
+        ApiError::new(
+            ApiErrorCode::TemporarilyUnavailable,
+            "queue export parent directory cannot be created",
+            true,
+        )
+    })?;
+    let temporary = parent.join(format!(".reccursive-export-{}.partial", Uuid::new_v4()));
+    fs::create_dir(&temporary).map_err(|_| {
+        ApiError::new(
+            ApiErrorCode::TemporarilyUnavailable,
+            "queue export temporary directory cannot be created",
+            true,
+        )
+    })?;
+
+    let export = (|| {
+        let (records, issues) = {
+            let mut store = lock_store(store)?;
+            reconcile_snapshot_storage(&mut store, package_root).map_err(store_api_error)?;
+            store
+                .create_backup(temporary.join("state.sqlite"))
+                .map_err(store_api_error)?;
+            (
+                store.snapshots().map_err(store_api_error)?,
+                store.snapshot_recovery_issues().map_err(store_api_error)?,
+            )
+        };
+        let verified_records: Vec<_> = records
+            .iter()
+            .filter_map(|record| {
+                verified_snapshot_record(record, package_root)
+                    .ok()
+                    .map(|package| (record, package))
+            })
+            .collect();
+        let mut exported = Vec::new();
+        for (record, package) in &verified_records {
+            let package_parent = temporary
+                .join("packages")
+                .join(record.package_id.to_string());
+            fs::create_dir_all(&package_parent).map_err(|_| {
+                ApiError::new(
+                    ApiErrorCode::TemporarilyUnavailable,
+                    "queue export package directory cannot be created",
+                    true,
+                )
+            })?;
+            let target = package_parent.join(format!("revision-{}", record.revision.get()));
+            package
+                .copy_verified_to(&target)
+                .map_err(snapshot_api_error)?;
+            exported.push(json!({
+                "package_id": record.package_id,
+                "revision": record.revision,
+                "content_hash": record.content_hash,
+                "path": format!("packages/{}/revision-{}", record.package_id, record.revision.get()),
+            }));
+        }
+        let database_sha256 =
+            sha256_file(&temporary.join("state.sqlite")).map_err(snapshot_api_error)?;
+        let manifest = json!({
+            "schema_version": 1,
+            "database": "state.sqlite",
+            "database_sha256": database_sha256,
+            "packages": exported,
+            "unresolved_issue_count": issues.len(),
+        });
+        let mut manifest_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temporary.join("queue-export.json"))
+            .map_err(|_| {
+                ApiError::new(
+                    ApiErrorCode::TemporarilyUnavailable,
+                    "queue export manifest cannot be written",
+                    true,
+                )
+            })?;
+        serde_json::to_writer_pretty(&mut manifest_file, &manifest).map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                "queue export manifest cannot be encoded",
+                false,
+            )
+        })?;
+        manifest_file.write_all(b"\n").map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::TemporarilyUnavailable,
+                "queue export manifest cannot be finalized",
+                true,
+            )
+        })?;
+        manifest_file.sync_all().map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::TemporarilyUnavailable,
+                "queue export manifest cannot be synchronized",
+                true,
+            )
+        })?;
+        sync_directory(&temporary).map_err(store_api_error)?;
+        fs::rename(&temporary, &destination).map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::TemporarilyUnavailable,
+                "queue export cannot be finalized",
+                true,
+            )
+        })?;
+        sync_directory(parent).map_err(store_api_error)?;
+        Ok(ResponseData::QueueExported {
+            export: QueueExportView {
+                destination: destination.to_string_lossy().into_owned(),
+                verified_package_count: verified_records.len(),
+                unresolved_issue_count: issues.len(),
+                database_sha256,
+            },
+        })
+    })();
+    if export.is_err() {
+        let _ = fs::remove_dir_all(&temporary);
+    }
+    export
+}
+
+fn verified_snapshot_record(
+    record: &SnapshotRecord,
+    package_root: &Path,
+) -> Result<SnapshotPackage, SnapshotError> {
+    let root = fs::canonicalize(package_root).map_err(SnapshotError::Io)?;
+    let path = fs::canonicalize(&record.path).map_err(SnapshotError::Io)?;
+    if !path.starts_with(&root) {
+        return Err(SnapshotError::UnsafeRoot { path });
+    }
+    let package = SnapshotPackage::open(path)?;
+    if !snapshot_records_match(
+        record,
+        &SnapshotRecord {
+            package_id: package.manifest.package_id,
+            revision: package.manifest.revision,
+            feature_id: package.manifest.feature_id,
+            plan_revision: package.manifest.plan_revision,
+            path: record.path.clone(),
+            base_tree: package.manifest.base_tree.clone(),
+            result_tree: package.manifest.result_tree.clone(),
+            content_hash: package.manifest.content_hash.clone(),
+            manifest: serde_json::Value::Null,
+            created_at_unix_ms: record.created_at_unix_ms,
+        },
+    ) {
+        return Err(SnapshotError::HashMismatch {
+            component: "database record",
+        });
+    }
+    Ok(package)
+}
+
+fn sha256_file(path: &Path) -> Result<String, SnapshotError> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn capture_package(

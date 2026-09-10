@@ -294,6 +294,16 @@ mod tests {
                 "-C",
                 source.to_str().unwrap(),
                 "config",
+                "user.name",
+                "Fixture",
+            ])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                source.to_str().unwrap(),
+                "config",
                 "user.email",
                 "fixture@example.invalid",
             ])

@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 8;
+pub const STORAGE_SCHEMA_VERSION: u32 = 9;
 
 struct Migration {
     version: u32,
@@ -322,6 +322,32 @@ const MIGRATIONS: &[Migration] = &[
 
         CREATE INDEX idx_release_attempts_package
             ON release_attempts(package_id, package_revision, created_at_unix_ms);
+        "#,
+    },
+    Migration {
+        version: 9,
+        sql: r#"
+        -- The schema-v1 entity tables were designed for a task/package model this build never
+        -- adopted: no code has ever read or written them, and the live tables (feature_plans,
+        -- build_workspaces, snapshot_packages) supersede them. Dropping them rather than reviving
+        -- them keeps one design for release units to be built on. Dropped child-first so no
+        -- foreign key is left dangling.
+        DROP TABLE IF EXISTS package_tasks;
+        DROP TABLE IF EXISTS task_dependencies;
+        DROP TABLE IF EXISTS packages;
+        DROP TABLE IF EXISTS tasks;
+        DROP TABLE IF EXISTS features;
+
+        -- Each package is now the delta for its own tasks, built on the package before it in the
+        -- same workspace. Recording that link as a column rather than only inside manifest_json
+        -- makes unit order answerable in SQL, which release units and scheduling both need.
+        -- No SQL foreign key here: snapshot_packages is keyed on (package_id, revision), so a
+        -- single-column reference would be a foreign key mismatch at insert time. The link is
+        -- validated in the store before the row is written.
+        ALTER TABLE snapshot_packages ADD COLUMN parent_package_id TEXT;
+
+        CREATE INDEX idx_snapshot_packages_parent
+            ON snapshot_packages(parent_package_id);
         "#,
     },
 ];

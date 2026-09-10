@@ -721,6 +721,7 @@ mod tests {
                 base_tree: object_id('b'),
                 result_tree: object_id('c'),
                 content_hash: std::iter::repeat_n('d', 64).collect(),
+                parent_package_id: None,
                 manifest: json!({ "paths": [] }),
                 created_at_unix_ms: 1,
             })

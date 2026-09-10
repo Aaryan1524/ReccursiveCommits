@@ -72,6 +72,34 @@ impl Store {
         Ok(())
     }
 
+    /// Moves an owned workspace's base forward to the commit a capture just produced.
+    ///
+    /// Capture reads its base from the workspace HEAD and advances that HEAD once the package is
+    /// durable. The stored base has to follow, or the next capture is refused as a base mismatch.
+    pub fn advance_workspace_base(
+        &mut self,
+        feature_id: FeatureId,
+        revision: Revision,
+        base_commit: &str,
+    ) -> Result<(), StoreError> {
+        if base_commit.len() != 40 || !base_commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(StoreError::InvalidData(
+                "advanced workspace base must be a full hexadecimal object ID".into(),
+            ));
+        }
+        let changed = self.connection.execute(
+            "UPDATE build_workspaces SET base_commit = ?3
+             WHERE feature_id = ?1 AND plan_revision = ?2",
+            params![feature_id.to_string(), revision.get(), base_commit],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidData(
+                "owned workspace is not stored".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Loads the owned workspace for an exact plan revision.
     pub fn workspace(
         &self,

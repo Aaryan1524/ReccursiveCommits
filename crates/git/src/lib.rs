@@ -1139,6 +1139,7 @@ mod tests {
             workspace: &source,
             package_root: &root.path().join("packages"),
             expected_base_commit: &base,
+            parent_package_id: None,
             validation_policy: ContentValidationPolicy::default(),
         })
         .unwrap();
@@ -1415,6 +1416,7 @@ mod tests {
             workspace: &source,
             package_root: &root.path().join("packages"),
             expected_base_commit: &base,
+            parent_package_id: None,
             validation_policy: ContentValidationPolicy::default(),
         })
         .unwrap();

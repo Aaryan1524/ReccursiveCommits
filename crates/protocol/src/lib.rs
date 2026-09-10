@@ -6,8 +6,8 @@ use std::{collections::BTreeSet, fmt};
 
 pub use reccursive_core::{
     AcceptanceCheck, AttemptId, EventId, FeatureId, FeaturePlan, PLAN_SCHEMA_VERSION, PackageId,
-    PlanPhase, PlanTask, PublicationMode, RepositoryId, RepositoryPolicy, RequestId, Revision,
-    TargetRef, TaskId,
+    PlanPhase, PlanTask, PublicationMode, ReasonCode, RepositoryId, RepositoryPolicy, RequestId,
+    Revision, StateReason, TargetMilestone, TargetRef, TaskId, TaskStatus,
 };
 use serde::{Deserialize, Serialize};
 pub use transport::{LocalClient, TransportError};

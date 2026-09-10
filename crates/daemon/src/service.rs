@@ -19,9 +19,10 @@ use reccursive_capture::{
 use reccursive_protocol::{
     ApiError, ApiErrorCode, AuthToken, CapturePackageRequest, Command, CreateWorkspaceRequest,
     EnrollRepositoryRequest, EventSeverityView, EventView, PackageView, PlanView,
-    ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView, RepositoryId,
-    RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope,
-    Revision, TransportError, WorkspacePrerequisiteView, WorkspaceView,
+    ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView, ReasonCode,
+    RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData,
+    ResponseEnvelope, Revision, StateReason, TaskStatus, TransportError, WorkspacePrerequisiteView,
+    WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -805,6 +806,21 @@ fn reconcile_snapshot_storage(store: &mut Store, package_root: &Path) -> Result<
             )?;
         }
     }
+
+    // Every package that was going to be re-registered now has been, so a parent link that is
+    // still dangling is a real break in the unit chain rather than an ordering artefact.
+    for (child, parent) in store.dangling_package_parents()? {
+        let path = store
+            .snapshot(child, Revision::FIRST)?
+            .map_or_else(|| PathBuf::from(child.to_string()), |record| record.path);
+        record_recovery_issue(
+            store,
+            path,
+            "broken_unit_chain",
+            &format!("package {child} was built on {parent}, which is not stored"),
+            now,
+        )?;
+    }
     Ok(())
 }
 
@@ -855,6 +871,7 @@ fn inspect_complete_package(
         base_tree: package.manifest.base_tree.clone(),
         result_tree: package.manifest.result_tree.clone(),
         content_hash: package.manifest.content_hash.clone(),
+        parent_package_id: package.manifest.parent_package_id,
         manifest: serde_json::to_value(&package.manifest)?,
         created_at_unix_ms: now,
     };
@@ -1141,6 +1158,7 @@ fn verified_snapshot_record(
             base_tree: package.manifest.base_tree.clone(),
             result_tree: package.manifest.result_tree.clone(),
             content_hash: package.manifest.content_hash.clone(),
+            parent_package_id: package.manifest.parent_package_id,
             manifest: serde_json::Value::Null,
             created_at_unix_ms: record.created_at_unix_ms,
         },
@@ -1203,6 +1221,15 @@ fn capture_package(
             })?;
         (plan.plan, workspace)
     };
+    // Each package is the delta from the unit before it in this workspace, so the previous unit is
+    // this one's parent and its result is this one's base.
+    let parent_package_id = {
+        let store = lock_store(store)?;
+        store
+            .latest_workspace_snapshot(request.feature_id, request.plan_revision)
+            .map_err(store_api_error)?
+            .map(|record| record.package_id)
+    };
     let planned_tasks: std::collections::BTreeSet<_> = plan
         .phases
         .iter()
@@ -1225,6 +1252,7 @@ fn capture_package(
         workspace: &workspace.path,
         package_root,
         expected_base_commit: &workspace.base_commit,
+        parent_package_id,
         validation_policy: ContentValidationPolicy::default(),
     })
     .map_err(snapshot_api_error)?;
@@ -1238,6 +1266,7 @@ fn capture_package(
         base_tree: package.manifest.base_tree.clone(),
         result_tree: package.manifest.result_tree.clone(),
         content_hash: package.manifest.content_hash.clone(),
+        parent_package_id,
         manifest: serde_json::to_value(&package.manifest).map_err(|_| {
             ApiError::new(
                 ApiErrorCode::Internal,
@@ -1250,6 +1279,35 @@ fn capture_package(
     lock_store(store)?
         .record_snapshot(&record)
         .map_err(store_api_error)?;
+    // Capture has already advanced the workspace HEAD; the stored base has to follow it or the
+    // next capture is refused as a base mismatch.
+    lock_store(store)?
+        .advance_workspace_base(
+            request.feature_id,
+            request.plan_revision,
+            package.advanced_base_commit(),
+        )
+        .map_err(store_api_error)?;
+    let captured_tasks: Vec<_> = package.manifest.task_ids.iter().copied().collect();
+    lock_store(store)?
+        .record_package_tasks(
+            package.manifest.package_id,
+            package.manifest.revision,
+            captured_tasks.iter().copied(),
+        )
+        .map_err(store_api_error)?;
+    // The package is the durable proof that these tasks were built and captured.
+    for task_id in &captured_tasks {
+        lock_store(store)?
+            .advance_task_to(
+                request.feature_id,
+                request.plan_revision,
+                *task_id,
+                TaskStatus::Captured,
+                created_at_unix_ms,
+            )
+            .map_err(store_api_error)?;
+    }
     let checks = lock_store(store)?
         .trusted_checks(plan.repository_id)
         .map_err(store_api_error)?;
@@ -1266,6 +1324,25 @@ fn capture_package(
         }
     }
     if let Some(check_id) = failed_check {
+        // The evidence is already durable. Block the tasks rather than losing the package, so the
+        // failure is visible and the same package can be resumed once the cause is fixed.
+        let reason = StateReason::new(
+            ReasonCode::ValidationFailed,
+            format!("trusted check {check_id} failed"),
+        )
+        .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string(), false))?;
+        for task_id in &captured_tasks {
+            lock_store(store)?
+                .advance_task(
+                    request.feature_id,
+                    request.plan_revision,
+                    *task_id,
+                    TaskStatus::Blocked,
+                    Some(reason.clone()),
+                    created_at_unix_ms,
+                )
+                .map_err(store_api_error)?;
+        }
         return Err(ApiError::new(
             ApiErrorCode::InvalidRequest,
             format!(
@@ -1274,6 +1351,18 @@ fn capture_package(
             ),
             false,
         ));
+    }
+    // Checks passed against this exact package, so the work is validated and eligible for release.
+    for task_id in &captured_tasks {
+        lock_store(store)?
+            .advance_task_to(
+                request.feature_id,
+                request.plan_revision,
+                *task_id,
+                TaskStatus::Queued,
+                created_at_unix_ms,
+            )
+            .map_err(store_api_error)?;
     }
     Ok(ResponseData::PackageCaptured {
         package: package_view(record, package.manifest)?,

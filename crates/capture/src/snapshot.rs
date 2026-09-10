@@ -29,6 +29,8 @@ pub struct SnapshotRequest<'a> {
     pub workspace: &'a Path,
     pub package_root: &'a Path,
     pub expected_base_commit: &'a str,
+    /// The unit this one was built on top of, when the workspace has already produced a package.
+    pub parent_package_id: Option<PackageId>,
     pub validation_policy: ContentValidationPolicy,
 }
 
@@ -42,6 +44,8 @@ pub struct SnapshotManifest {
     pub feature_id: FeatureId,
     pub plan_revision: Revision,
     pub task_ids: BTreeSet<TaskId>,
+    /// Immediately preceding package from the same workspace, if any.
+    pub parent_package_id: Option<PackageId>,
     pub base_commit: String,
     pub base_tree: String,
     pub result_tree: String,
@@ -58,6 +62,12 @@ pub struct SnapshotPackage {
 }
 
 impl SnapshotPackage {
+    /// The workspace HEAD after this capture, and therefore the next unit's base commit.
+    #[must_use]
+    pub fn advanced_base_commit(&self) -> &str {
+        &self.manifest.snapshot_commit
+    }
+
     /// Captures the workspace through a temporary Git index and atomically installs the package.
     pub fn capture(request: SnapshotRequest<'_>) -> Result<Self, SnapshotError> {
         if request.task_ids.is_empty() {
@@ -143,6 +153,7 @@ impl SnapshotPackage {
                 feature_id: request.feature_id,
                 plan_revision: request.plan_revision,
                 task_ids: request.task_ids,
+                parent_package_id: request.parent_package_id,
                 base_commit: actual_head,
                 base_tree,
                 result_tree,
@@ -155,6 +166,29 @@ impl SnapshotPackage {
             sync_directory(&temporary)?;
             fs::rename(&temporary, &destination)?;
             sync_directory(&parent)?;
+
+            // The package is durable from here, so the workspace can safely move forward.
+            //
+            // Capture reads its base from the workspace HEAD. Without advancing it, every package
+            // taken from one workspace shares a base and its result tree is the whole workspace,
+            // so unit N silently contains units 1..N-1. Advancing HEAD to this unit's snapshot
+            // commit makes the next unit's base exactly this unit's result, so each package is the
+            // delta for its own tasks and nothing else.
+            //
+            // Order matters for crash safety: if the process dies before this, the package is
+            // still on disk and startup recovery re-registers it, while the unchanged HEAD means
+            // no unit is lost. Failing here surfaces as a capture error rather than a silently
+            // overlapping next package.
+            git_status(
+                request.workspace,
+                ["update-ref", "HEAD", manifest.snapshot_commit.as_str()],
+            )?;
+            // Capture wrote through a temporary index, so the workspace's own index still points at
+            // the previous HEAD. Refresh it to the new HEAD, which touches no working-tree file
+            // (the tree is already what was just captured) and leaves the workspace clean rather
+            // than showing every captured file as deleted-and-untracked.
+            git_status(request.workspace, ["read-tree", "HEAD"])?;
+
             Ok(Self {
                 path: destination,
                 manifest,
@@ -577,6 +611,103 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn sequential_units_from_one_workspace_do_not_overlap() {
+        let root = tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        git_status(&workspace, ["init", "--quiet"]).unwrap();
+        git_status(&workspace, ["config", "user.name", "Fixture"]).unwrap();
+        git_status(
+            &workspace,
+            ["config", "user.email", "fixture@example.invalid"],
+        )
+        .unwrap();
+        fs::write(workspace.join("README.md"), "base\n").unwrap();
+        git_status(&workspace, ["add", "."]).unwrap();
+        git_status(&workspace, ["commit", "--quiet", "-m", "base"]).unwrap();
+
+        let feature_id = FeatureId::new();
+        let packages_root = root.path().join("packages");
+        let mut base = git_text(&workspace, ["rev-parse", "HEAD"]).unwrap();
+        let original_base = base.clone();
+        let mut parent = None;
+        let mut captured = Vec::new();
+
+        // Three units captured in order from one workspace, as an agent would build them.
+        for unit in 1..=3 {
+            fs::write(
+                workspace.join(format!("unit-{unit}.txt")),
+                format!("unit {unit}\n"),
+            )
+            .unwrap();
+            let package = SnapshotPackage::capture(SnapshotRequest {
+                package_id: PackageId::new(),
+                revision: Revision::FIRST,
+                feature_id,
+                plan_revision: Revision::FIRST,
+                task_ids: [TaskId::new()].into(),
+                workspace: &workspace,
+                package_root: &packages_root,
+                expected_base_commit: &base,
+                parent_package_id: parent,
+                validation_policy: ContentValidationPolicy::default(),
+            })
+            .unwrap();
+            base = package.advanced_base_commit().to_owned();
+            parent = Some(package.manifest.package_id);
+            captured.push(package);
+        }
+
+        // Each unit is chained to the one before it, and only the first starts from the original
+        // workspace base.
+        assert_eq!(captured[0].manifest.parent_package_id, None);
+        assert_eq!(captured[0].manifest.base_commit, original_base);
+        for unit in 1..3 {
+            assert_eq!(
+                captured[unit].manifest.parent_package_id,
+                Some(captured[unit - 1].manifest.package_id)
+            );
+            assert_eq!(
+                captured[unit].manifest.base_tree,
+                captured[unit - 1].manifest.result_tree,
+                "unit {} must start from the previous unit's result",
+                unit + 1
+            );
+        }
+
+        // The defect this guards: each unit's own change is exactly one file, not a cumulative
+        // snapshot that silently carries every earlier unit's work.
+        for (index, package) in captured.iter().enumerate() {
+            let changed = git_text(
+                &workspace,
+                [
+                    "diff",
+                    "--name-only",
+                    &package.manifest.base_tree,
+                    &package.manifest.result_tree,
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                changed,
+                format!("unit-{}.txt", index + 1),
+                "unit {} changed more than its own file",
+                index + 1
+            );
+        }
+
+        // The workspace is left consistent: HEAD is the final unit and nothing is uncommitted.
+        assert_eq!(
+            git_text(&workspace, ["rev-parse", "HEAD"]).unwrap(),
+            captured[2].manifest.snapshot_commit
+        );
+        assert_eq!(
+            git_text(&workspace, ["status", "--porcelain=v1"]).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
     fn package_reconstructs_all_git_file_kinds_and_detects_corruption() {
         let root = tempdir().unwrap();
         let workspace = root.path().join("workspace");
@@ -609,6 +740,7 @@ mod tests {
             workspace: &workspace,
             package_root: &root.path().join("packages"),
             expected_base_commit: &base,
+            parent_package_id: None,
             validation_policy: ContentValidationPolicy::default(),
         })
         .unwrap();
@@ -652,6 +784,8 @@ mod tests {
             .open(package.path.join(BUNDLE_FILE))
             .unwrap();
         bundle.write_all(b"corrupt").unwrap();
+        let next_base = package.advanced_base_commit().to_owned();
+        let previous_unit = package.manifest.package_id;
         assert!(matches!(
             SnapshotPackage::open(package.path),
             Err(SnapshotError::HashMismatch {
@@ -672,7 +806,9 @@ mod tests {
             task_ids: [TaskId::new()].into(),
             workspace: &workspace,
             package_root: &root.path().join("packages"),
-            expected_base_commit: &base,
+            // The earlier capture advanced the workspace, so this unit starts from its result.
+            expected_base_commit: &next_base,
+            parent_package_id: Some(previous_unit),
             validation_policy: ContentValidationPolicy::default(),
         })
         .unwrap_err();

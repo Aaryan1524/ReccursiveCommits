@@ -79,6 +79,8 @@ pub enum GitError {
         status: Option<i32>,
         message: String,
     },
+    #[error("managed clone path already exists: {}", .0.display())]
+    ManagedPathExists(PathBuf),
 }
 
 pub struct GitRunner;
@@ -150,6 +152,89 @@ impl GitRunner {
     }
 }
 
+/// Daemon-owned mirror used for release work, never a user's checkout.
+#[derive(Clone, Debug)]
+pub struct ManagedClone {
+    pub path: PathBuf,
+}
+
+impl ManagedClone {
+    pub fn provision(
+        remote: &str,
+        path: impl Into<PathBuf>,
+        timeout: Duration,
+    ) -> Result<Self, GitError> {
+        let path = path.into();
+        if path.exists() {
+            return Err(GitError::ManagedPathExists(path));
+        }
+        let parent = path.parent().ok_or(GitError::InvalidInvocation)?;
+        let name = path.file_name().ok_or(GitError::InvalidInvocation)?;
+        GitRunner::run(
+            &GitInvocation::new(
+                parent,
+                [
+                    OsString::from("clone"),
+                    OsString::from("--mirror"),
+                    OsString::from(remote),
+                    name.to_os_string(),
+                ],
+                timeout,
+            )?,
+            &CancellationToken::default(),
+        )?;
+        Ok(Self { path })
+    }
+
+    pub fn fetch_ref(
+        &self,
+        remote: &str,
+        reference: &str,
+        timeout: Duration,
+    ) -> Result<GitOutput, GitError> {
+        GitRunner::run(
+            &GitInvocation::new(
+                &self.path,
+                ["fetch", "--no-tags", remote, reference],
+                timeout,
+            )?,
+            &CancellationToken::default(),
+        )
+    }
+
+    pub fn create_release_workspace(
+        &self,
+        destination: impl Into<PathBuf>,
+        commit: &str,
+        timeout: Duration,
+    ) -> Result<PathBuf, GitError> {
+        let destination = destination.into();
+        if destination.exists() {
+            return Err(GitError::ManagedPathExists(destination));
+        }
+        let parent = destination.parent().ok_or(GitError::InvalidInvocation)?;
+        let name = destination.file_name().ok_or(GitError::InvalidInvocation)?;
+        GitRunner::run(
+            &GitInvocation::new(
+                parent,
+                [
+                    OsString::from("clone"),
+                    OsString::from("--no-checkout"),
+                    self.path.as_os_str().to_os_string(),
+                    name.to_os_string(),
+                ],
+                timeout,
+            )?,
+            &CancellationToken::default(),
+        )?;
+        GitRunner::run(
+            &GitInvocation::new(&destination, ["checkout", "--detach", commit], timeout)?,
+            &CancellationToken::default(),
+        )?;
+        Ok(destination)
+    }
+}
+
 fn read_bounded(mut reader: impl Read) -> (Vec<u8>, bool) {
     let mut bytes = Vec::new();
     let mut chunk = [0; 8192];
@@ -194,5 +279,88 @@ mod tests {
             GitRunner::run(&invocation, &token),
             Err(GitError::Cancelled)
         ));
+    }
+    #[test]
+    fn managed_mirror_fetches_and_release_workspace_is_detached() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let remote = root.path().join("remote.git");
+        std::process::Command::new("git")
+            .args(["init", "--quiet", source.to_str().unwrap()])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                source.to_str().unwrap(),
+                "config",
+                "user.name",
+                "Fixture",
+            ])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                source.to_str().unwrap(),
+                "config",
+                "user.email",
+                "fixture@example.invalid",
+            ])
+            .status()
+            .unwrap();
+        std::fs::write(source.join("file"), "ok").unwrap();
+        std::process::Command::new("git")
+            .args(["-C", source.to_str().unwrap(), "add", "."])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                source.to_str().unwrap(),
+                "commit",
+                "--quiet",
+                "-m",
+                "base",
+            ])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "clone",
+                "--quiet",
+                "--bare",
+                source.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        let mirror = ManagedClone::provision(
+            remote.to_str().unwrap(),
+            root.path().join("mirror.git"),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        mirror
+            .fetch_ref("origin", "HEAD", Duration::from_secs(5))
+            .unwrap();
+        let head = String::from_utf8(
+            GitRunner::run(
+                &GitInvocation::new(&source, ["rev-parse", "HEAD"], Duration::from_secs(5))
+                    .unwrap(),
+                &CancellationToken::default(),
+            )
+            .unwrap()
+            .stdout,
+        )
+        .unwrap();
+        let workspace = mirror
+            .create_release_workspace(
+                root.path().join("release"),
+                head.trim(),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert!(workspace.join("file").exists());
     }
 }

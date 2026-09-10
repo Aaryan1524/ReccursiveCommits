@@ -10,6 +10,7 @@ mod repository;
 mod snapshots;
 mod states;
 mod tasks;
+mod units;
 mod workspaces;
 
 use std::{
@@ -29,6 +30,7 @@ use rusqlite::{Connection, OpenFlags};
 pub use snapshots::{SnapshotRecord, SnapshotRecoveryIssue};
 pub use tasks::{TaskDependency, TaskRecord};
 use thiserror::Error;
+pub use units::{LifecycleOutcome, ReleaseUnitRecord};
 use uuid::Uuid;
 pub use workspaces::WorkspaceRecord;
 

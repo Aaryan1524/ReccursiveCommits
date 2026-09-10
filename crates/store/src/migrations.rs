@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 10;
+pub const STORAGE_SCHEMA_VERSION: u32 = 11;
 
 struct Migration {
     version: u32,
@@ -413,6 +413,49 @@ const MIGRATIONS: &[Migration] = &[
 
         CREATE INDEX idx_snapshot_package_tasks_task
             ON snapshot_package_tasks(task_id);
+        "#,
+    },
+    Migration {
+        version: 11,
+        sql: r#"
+        -- A release unit groups tasks that cannot independently leave the target usable, so they
+        -- are verified and published together.
+        CREATE TABLE release_units (
+            unit_id TEXT PRIMARY KEY CHECK (length(trim(unit_id)) > 0),
+            feature_id TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL CHECK (plan_revision > 0),
+            required_checks_json TEXT NOT NULL CHECK (json_valid(required_checks_json)),
+            created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+            FOREIGN KEY (feature_id, plan_revision)
+                REFERENCES feature_plans(feature_id, revision) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_release_units_plan
+            ON release_units(feature_id, plan_revision, created_at_unix_ms);
+
+        CREATE TABLE release_unit_tasks (
+            unit_id TEXT NOT NULL,
+            feature_id TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL CHECK (plan_revision > 0),
+            task_id TEXT NOT NULL,
+            PRIMARY KEY (unit_id, task_id),
+            FOREIGN KEY (unit_id) REFERENCES release_units(unit_id) ON DELETE CASCADE,
+            FOREIGN KEY (feature_id, plan_revision, task_id)
+                REFERENCES plan_tasks(feature_id, plan_revision, task_id) ON DELETE CASCADE
+        );
+
+        -- A task belongs to at most one release unit: two units claiming the same work could
+        -- publish it twice or leave each waiting on the other.
+        CREATE UNIQUE INDEX idx_release_unit_tasks_task
+            ON release_unit_tasks(feature_id, plan_revision, task_id);
+
+        -- Evidence is never deleted when work is revised or cancelled. Marking it invalidated
+        -- keeps the original result auditable while stopping it from satisfying a later release.
+        ALTER TABLE validation_evidence ADD COLUMN invalidated_at_unix_ms INTEGER
+            CHECK (invalidated_at_unix_ms IS NULL OR invalidated_at_unix_ms >= 0);
+
+        ALTER TABLE validation_evidence ADD COLUMN invalidated_reason TEXT
+            CHECK (invalidated_reason IS NULL OR length(trim(invalidated_reason)) > 0);
         "#,
     },
 ];

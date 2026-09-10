@@ -28,6 +28,39 @@ impl TaskStatus {
         matches!(self, Self::Published | Self::Cancelled | Self::Superseded)
     }
 
+    /// Reports whether a release attempt may durably occupy this state.
+    ///
+    /// Attempts own the publication half of the lifecycle only; production states belong to the
+    /// task that produced the package.
+    #[must_use]
+    pub const fn is_publication_stage(self) -> bool {
+        matches!(
+            self,
+            Self::Scheduled
+                | Self::Reconciling
+                | Self::Verifying
+                | Self::CommitPrepared
+                | Self::PushPending
+                | Self::RemoteConfirmed
+                | Self::Published
+                | Self::Blocked
+                | Self::Cancelled
+                | Self::Superseded
+        )
+    }
+
+    /// Reports whether reaching this state may have already transmitted a push to the remote.
+    ///
+    /// Callers use this to distinguish queued work that can be stopped locally from work whose
+    /// outcome must be resolved against the remote first.
+    #[must_use]
+    pub const fn may_have_reached_remote(self) -> bool {
+        matches!(
+            self,
+            Self::PushPending | Self::RemoteConfirmed | Self::Published
+        )
+    }
+
     const fn normal_successor(self) -> Option<Self> {
         match self {
             Self::Planned => Some(Self::Building),
@@ -108,6 +141,38 @@ impl TaskState {
     #[must_use]
     pub const fn blocked_from(&self) -> Option<TaskStatus> {
         self.blocked_from
+    }
+
+    /// Rebuilds a state that was previously written to durable storage.
+    ///
+    /// Persistence layers store the three fields separately so they remain queryable; this
+    /// rejects any combination `transition` could not have produced, so a corrupted or
+    /// hand-edited row cannot resume as a valid attempt.
+    pub fn restore(
+        status: TaskStatus,
+        reason: Option<StateReason>,
+        blocked_from: Option<TaskStatus>,
+    ) -> Result<Self, TransitionError> {
+        let coherent = match status {
+            TaskStatus::Blocked => {
+                reason.is_some()
+                    && blocked_from.is_some_and(|resume| {
+                        resume != TaskStatus::Blocked && !resume.is_terminal()
+                    })
+            }
+            TaskStatus::Cancelled | TaskStatus::Superseded => {
+                reason.is_some() && blocked_from.is_none()
+            }
+            _ => reason.is_none() && blocked_from.is_none(),
+        };
+        if !coherent {
+            return Err(TransitionError::IncoherentPersistedState { status });
+        }
+        Ok(Self {
+            status,
+            reason,
+            blocked_from,
+        })
     }
 
     pub fn transition(
@@ -220,6 +285,8 @@ pub enum TransitionError {
     EmptyReason,
     #[error("blocked state is missing its resume state")]
     CorruptBlockedState,
+    #[error("persisted {status:?} state carries incoherent reason or resume information")]
+    IncoherentPersistedState { status: TaskStatus },
     #[error("cannot resume blocked task at {requested:?}; resume at {expected:?}")]
     InvalidResume {
         requested: TaskStatus,
@@ -305,6 +372,77 @@ mod tests {
                 target: TaskStatus::Cancelled
             })
         );
+    }
+
+    #[test]
+    fn restore_accepts_only_states_a_transition_could_have_produced() {
+        let mut blocked = TaskState::planned();
+        blocked.transition(TaskStatus::Building, None).unwrap();
+        blocked
+            .transition(
+                TaskStatus::Blocked,
+                Some(reason(ReasonCode::AuthenticationRequired)),
+            )
+            .unwrap();
+        let rehydrated = TaskState::restore(
+            blocked.status(),
+            blocked.reason().cloned(),
+            blocked.blocked_from(),
+        )
+        .unwrap();
+        assert_eq!(rehydrated, blocked);
+
+        assert_eq!(
+            TaskState::restore(
+                TaskStatus::Blocked,
+                Some(reason(ReasonCode::Conflict)),
+                None
+            ),
+            Err(TransitionError::IncoherentPersistedState {
+                status: TaskStatus::Blocked
+            })
+        );
+        assert_eq!(
+            TaskState::restore(TaskStatus::PushPending, None, Some(TaskStatus::Verifying)),
+            Err(TransitionError::IncoherentPersistedState {
+                status: TaskStatus::PushPending
+            })
+        );
+        assert_eq!(
+            TaskState::restore(TaskStatus::Cancelled, None, None),
+            Err(TransitionError::IncoherentPersistedState {
+                status: TaskStatus::Cancelled
+            })
+        );
+    }
+
+    #[test]
+    fn publication_stages_exclude_production_and_name_transmitted_pushes() {
+        for production in [
+            TaskStatus::Planned,
+            TaskStatus::Building,
+            TaskStatus::Captured,
+            TaskStatus::Validated,
+            TaskStatus::Queued,
+        ] {
+            assert!(!production.is_publication_stage(), "{production:?}");
+            assert!(!production.may_have_reached_remote(), "{production:?}");
+        }
+        for publication in [
+            TaskStatus::Scheduled,
+            TaskStatus::Reconciling,
+            TaskStatus::Verifying,
+            TaskStatus::CommitPrepared,
+            TaskStatus::PushPending,
+            TaskStatus::RemoteConfirmed,
+            TaskStatus::Published,
+            TaskStatus::Blocked,
+        ] {
+            assert!(publication.is_publication_stage(), "{publication:?}");
+        }
+        assert!(!TaskStatus::Verifying.may_have_reached_remote());
+        assert!(TaskStatus::PushPending.may_have_reached_remote());
+        assert!(TaskStatus::Published.may_have_reached_remote());
     }
 
     #[test]

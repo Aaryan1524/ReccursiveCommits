@@ -377,6 +377,47 @@ pub enum CandidateCommitError {
     TreeMismatch,
 }
 
+/// Explicit remote destination for publishing one persisted candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidatePublishRequest {
+    pub remote: String,
+    pub target_ref: String,
+}
+
+/// Evidence that a remote branch now points to the persisted candidate commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishedCandidate {
+    pub commit: String,
+    pub target_ref: String,
+}
+
+/// A condition preventing a candidate from being safely published.
+#[derive(Debug, Error)]
+pub enum CandidatePublishError {
+    #[error(transparent)]
+    Git(#[from] GitError),
+    #[error("candidate publish remote is invalid")]
+    InvalidRemote,
+    #[error("candidate publish target must be a valid refs/heads/ branch")]
+    InvalidTargetRef,
+    #[error("persisted candidate does not belong to this candidate workspace")]
+    LocalCandidateMismatch,
+    #[error("remote target {target_ref} does not exist")]
+    TargetMissing { target_ref: String },
+    #[error("remote target {target_ref} advanced from expected {expected} to {actual}")]
+    TargetAdvanced {
+        target_ref: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("remote target {target_ref} did not confirm candidate {expected}; found {actual:?}")]
+    ConfirmationFailed {
+        target_ref: String,
+        expected: String,
+        actual: Option<String>,
+    },
+}
+
 impl CandidateWorkspace {
     /// Applies the captured delta to the current target without committing it.
     ///
@@ -480,6 +521,70 @@ impl CandidateWorkspace {
         })
     }
 
+    /// Publishes a persisted candidate only when the remote target is still the verified parent.
+    pub fn publish(
+        &self,
+        candidate: &PersistedCandidate,
+        request: &CandidatePublishRequest,
+        timeout: Duration,
+    ) -> Result<PublishedCandidate, CandidatePublishError> {
+        validate_publish_request(request)?;
+        let local_commit = git_text(&self.path, ["rev-parse", "HEAD"], timeout)?;
+        let local_parent = git_text(&self.path, ["rev-parse", "HEAD^"], timeout)?;
+        let local_tree = git_text(&self.path, ["rev-parse", "HEAD^{tree}"], timeout)?;
+        if local_commit != candidate.commit
+            || local_parent != candidate.parent_commit
+            || local_parent != self.target_commit
+            || local_tree != candidate.tree
+        {
+            return Err(CandidatePublishError::LocalCandidateMismatch);
+        }
+        match remote_ref(&self.path, &request.remote, &request.target_ref, timeout)? {
+            Some(actual) if actual == self.target_commit => {}
+            Some(actual) => {
+                return Err(CandidatePublishError::TargetAdvanced {
+                    target_ref: request.target_ref.clone(),
+                    expected: self.target_commit.clone(),
+                    actual,
+                });
+            }
+            None => {
+                return Err(CandidatePublishError::TargetMissing {
+                    target_ref: request.target_ref.clone(),
+                });
+            }
+        }
+        GitRunner::run(
+            &GitInvocation::new(
+                &self.path,
+                vec![
+                    OsString::from("push"),
+                    OsString::from("--porcelain"),
+                    OsString::from(format!(
+                        "--force-with-lease={}:{}",
+                        request.target_ref, self.target_commit
+                    )),
+                    OsString::from(&request.remote),
+                    OsString::from(format!("{}:{}", candidate.commit, request.target_ref)),
+                ],
+                timeout,
+            )?,
+            &CancellationToken::default(),
+        )?;
+        let actual = remote_ref(&self.path, &request.remote, &request.target_ref, timeout)?;
+        if actual.as_deref() != Some(candidate.commit.as_str()) {
+            return Err(CandidatePublishError::ConfirmationFailed {
+                target_ref: request.target_ref.clone(),
+                expected: candidate.commit.clone(),
+                actual,
+            });
+        }
+        Ok(PublishedCandidate {
+            commit: candidate.commit.clone(),
+            target_ref: request.target_ref.clone(),
+        })
+    }
+
     fn unmerged_paths(&self, timeout: Duration) -> Result<Vec<String>, GitError> {
         let output = GitRunner::run(
             &GitInvocation::new(
@@ -523,6 +628,67 @@ fn validate_commit_request(request: &CandidateCommitRequest) -> Result<(), Candi
         });
     }
     Ok(())
+}
+
+fn validate_publish_request(
+    request: &CandidatePublishRequest,
+) -> Result<(), CandidatePublishError> {
+    if request.remote.trim().is_empty() || request.remote.contains(['\0', '\n', '\r']) {
+        return Err(CandidatePublishError::InvalidRemote);
+    }
+    let Some(branch) = request.target_ref.strip_prefix("refs/heads/") else {
+        return Err(CandidatePublishError::InvalidTargetRef);
+    };
+    if branch.is_empty()
+        || branch.ends_with(['/', '.'])
+        || branch.contains("..")
+        || branch.contains("//")
+        || branch.contains("@{")
+        || branch.split('/').any(|part| part.ends_with(".lock"))
+        || branch
+            .chars()
+            .any(|character| character.is_whitespace() || "~^:?*[\\".contains(character))
+    {
+        return Err(CandidatePublishError::InvalidTargetRef);
+    }
+    Ok(())
+}
+
+fn remote_ref(
+    workspace: &std::path::Path,
+    remote: &str,
+    target_ref: &str,
+    timeout: Duration,
+) -> Result<Option<String>, GitError> {
+    let output = GitRunner::run(
+        &GitInvocation::new(
+            workspace,
+            ["ls-remote", "--refs", remote, target_ref],
+            timeout,
+        )?,
+        &CancellationToken::default(),
+    )?;
+    let output = String::from_utf8(output.stdout).map_err(|_| GitError::NonUtf8Output)?;
+    let Some(line) = output.lines().next() else {
+        return Ok(None);
+    };
+    let mut fields = line.split_whitespace();
+    let commit = fields.next().filter(|value| is_object_id(value));
+    let reference = fields.next();
+    if fields.next().is_some() || reference != Some(target_ref) {
+        return Err(GitError::Failed {
+            status: None,
+            message: "remote returned an invalid ref response".into(),
+        });
+    }
+    commit.map(str::to_owned).map(Some).ok_or(GitError::Failed {
+        status: None,
+        message: "remote returned an invalid object ID".into(),
+    })
+}
+
+fn is_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn git_text(
@@ -823,6 +989,34 @@ mod tests {
             git_text(&source, ["rev-parse", "HEAD"], Duration::from_secs(5)).unwrap(),
             target
         );
+        let publish_request = CandidatePublishRequest {
+            remote: remote.to_string_lossy().into_owned(),
+            target_ref: "refs/heads/main".into(),
+        };
+        assert_eq!(
+            candidate
+                .publish(&persisted, &publish_request, Duration::from_secs(5))
+                .unwrap(),
+            PublishedCandidate {
+                commit: persisted.commit.clone(),
+                target_ref: "refs/heads/main".into(),
+            }
+        );
+        assert_eq!(
+            remote_ref(
+                &candidate.path,
+                &publish_request.remote,
+                &publish_request.target_ref,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            Some(persisted.commit.clone())
+        );
+        assert!(matches!(
+            candidate.publish(&persisted, &publish_request, Duration::from_secs(5)),
+            Err(CandidatePublishError::TargetAdvanced { expected, actual, .. })
+                if expected == target && actual == persisted.commit
+        ));
         fixture_git(&candidate.path, &["reset", "--hard", base.as_str()]);
         assert!(matches!(
             candidate.verify(Duration::from_secs(5)),
@@ -863,6 +1057,31 @@ mod tests {
             Err(CandidateCommitError::InvalidIdentity {
                 field: "author email"
             })
+        ));
+    }
+
+    #[test]
+    fn candidate_publish_request_rejects_unsafe_destinations() {
+        assert!(matches!(
+            validate_publish_request(&CandidatePublishRequest {
+                remote: "\n".into(),
+                target_ref: "refs/heads/main".into(),
+            }),
+            Err(CandidatePublishError::InvalidRemote)
+        ));
+        assert!(matches!(
+            validate_publish_request(&CandidatePublishRequest {
+                remote: "origin".into(),
+                target_ref: "main".into(),
+            }),
+            Err(CandidatePublishError::InvalidTargetRef)
+        ));
+        assert!(matches!(
+            validate_publish_request(&CandidatePublishRequest {
+                remote: "origin".into(),
+                target_ref: "refs/heads/../main".into(),
+            }),
+            Err(CandidatePublishError::InvalidTargetRef)
         ));
     }
 

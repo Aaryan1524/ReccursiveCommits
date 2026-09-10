@@ -4,6 +4,7 @@ mod graph;
 mod ids;
 mod plan;
 mod policy;
+mod release;
 mod revision;
 mod task;
 
@@ -17,6 +18,7 @@ pub use policy::{
     PackageError, PackageRevision, PolicyError, PolicyRef, PublicationMode, RepositoryPolicy,
     TargetMilestone, TargetRef,
 };
+pub use release::{ReleaseUnit, ReleaseUnitError};
 pub use revision::{Revision, RevisionError};
 pub use task::{ReasonCode, StateReason, TaskState, TaskStatus, TransitionError};
 

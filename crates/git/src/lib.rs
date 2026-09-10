@@ -194,6 +194,20 @@ impl ManagedClone {
         Ok(Self { path })
     }
 
+    /// Adopts a mirror that was provisioned earlier, without contacting the remote.
+    ///
+    /// Provisioning clones; a daemon that restarts must reuse the mirror it already owns rather
+    /// than re-cloning a repository on every release.
+    #[must_use]
+    pub fn adopt(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Resolves a reference in the mirror to the commit it points at.
+    pub fn resolve(&self, reference: &str, timeout: Duration) -> Result<String, GitError> {
+        git_text(&self.path, ["rev-parse", reference], timeout)
+    }
+
     pub fn fetch_ref(
         &self,
         remote: &str,

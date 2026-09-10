@@ -422,6 +422,7 @@ name = "reccursive-daemon"
 version = "0.1.0"
 dependencies = [
  "reccursive-capture",
+ "reccursive-git",
  "reccursive-protocol",
  "reccursive-store",
  "serde_json",

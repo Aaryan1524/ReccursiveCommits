@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 reccursive-capture = { path = "../capture" }
+reccursive-git = { path = "../git" }
 reccursive-protocol = { path = "../protocol" }
 reccursive-store = { path = "../store" }
 serde_json.workspace = true

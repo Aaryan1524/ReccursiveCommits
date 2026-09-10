@@ -83,6 +83,7 @@ impl LocalService {
         let workspace_root = state_root.join("workspaces");
         let package_root = state_root.join("packages");
         reconcile_snapshot_storage(&mut store, &package_root)?;
+        reconcile_interrupted_releases(&mut store, &managed_root, &state_root.join("releases"))?;
         Ok(Self {
             owner,
             store: Arc::new(Mutex::new(store)),
@@ -820,6 +821,44 @@ fn reconcile_snapshot_storage(store: &mut Store, package_root: &Path) -> Result<
             &format!("package {child} was built on {parent}, which is not stored"),
             now,
         )?;
+    }
+    Ok(())
+}
+
+/// Resolves any push that may have reached the remote before the last shutdown.
+///
+/// Invariant 6: this runs before the service accepts work, so a successful-but-unrecorded push is
+/// discovered rather than repeated as a second commit. It is deliberately best-effort — a daemon
+/// starting without network access must still come up, and the attempt stays listed for the next
+/// attempt at resolution rather than being lost.
+fn reconcile_interrupted_releases(
+    store: &mut Store,
+    managed_root: &Path,
+    release_root: &Path,
+) -> Result<(), StoreError> {
+    let pending = store.release_attempts_awaiting_remote_resolution()?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let worker = crate::release::ReleaseWorker::new(
+        managed_root,
+        release_root,
+        crate::SERVICE_NAME.to_owned(),
+    );
+    let now = recovery_unix_ms()?;
+    if let Err(error) = crate::release::recover_interrupted_releases(store, &worker, now) {
+        for attempt in pending {
+            record_recovery_issue(
+                store,
+                PathBuf::from(attempt.attempt_id.to_string()),
+                "unresolved_publication",
+                &format!(
+                    "a push that may have reached {} could not be resolved: {error}",
+                    attempt.target.as_str()
+                ),
+                now,
+            )?;
+        }
     }
     Ok(())
 }

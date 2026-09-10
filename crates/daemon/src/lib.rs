@@ -22,3 +22,5 @@ mod tests {
         assert_eq!(api_version(), reccursive_protocol::API_VERSION);
     }
 }
+
+pub mod release;

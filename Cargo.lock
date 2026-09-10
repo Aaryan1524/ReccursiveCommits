@@ -433,6 +433,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "reccursive-git"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror",
+ "wait-timeout",
+]
+
+[[package]]
 name = "reccursive-protocol"
 version = "0.1.0"
 dependencies = [

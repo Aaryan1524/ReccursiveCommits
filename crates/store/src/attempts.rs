@@ -76,6 +76,9 @@ pub struct ReleaseAttempt {
     /// What the remote was actually observed to hold, once it could be read.
     pub observed_remote_sha: Option<String>,
     pub failure_classification: Option<String>,
+    /// Unsuccessful publication attempts recorded so far, durable across restart so bounded
+    /// retry stays bounded when the process dies between failures.
+    pub failed_attempts: u8,
     pub state: TaskState,
     pub lease: AttemptLease,
     pub created_at_unix_ms: i64,
@@ -83,15 +86,56 @@ pub struct ReleaseAttempt {
 }
 
 impl ReleaseAttempt {
+    /// The stage this attempt actually reached, seeing through a block to the state it paused at.
+    ///
+    /// Blocking does not undo a transmitted push, so recovery decisions must read the resume state
+    /// rather than the block itself.
+    #[must_use]
+    pub const fn reached_stage(&self) -> TaskStatus {
+        match self.state.status() {
+            TaskStatus::Blocked => match self.state.blocked_from() {
+                Some(resume) => resume,
+                None => TaskStatus::Blocked,
+            },
+            other => other,
+        }
+    }
+
     /// Reports whether this attempt must be resolved against the remote before more work is built.
     ///
     /// A push that was transmitted but never confirmed is indistinguishable locally from one that
-    /// never left the machine, so the remote is the only authority.
+    /// never left the machine, so the remote is the only authority. An attempt that blocked while
+    /// its push was in flight is in exactly that position and must not be skipped.
     #[must_use]
     pub const fn needs_remote_resolution(&self) -> bool {
-        matches!(self.state.status(), TaskStatus::PushPending)
+        matches!(self.reached_stage(), TaskStatus::PushPending)
+    }
+
+    /// Reports whether this attempt still owns its remote and target.
+    ///
+    /// Mirrors the schema's partial unique index exactly: a blocked attempt keeps the target only
+    /// when it blocked at or after its push.
+    #[must_use]
+    pub const fn holds_target(&self) -> bool {
+        match self.state.status() {
+            TaskStatus::Published | TaskStatus::Cancelled | TaskStatus::Superseded => false,
+            TaskStatus::Blocked => matches!(
+                self.state.blocked_from(),
+                Some(TaskStatus::PushPending | TaskStatus::RemoteConfirmed)
+            ),
+            _ => true,
+        }
     }
 }
+
+/// Rows still owning their remote and target; kept identical to the schema's partial unique index.
+const TARGET_HELD_PREDICATE: &str = "(status IN ('scheduled', 'reconciling', 'verifying', \
+     'commit_prepared', 'push_pending', 'remote_confirmed') \
+     OR (status = 'blocked' AND blocked_from IN ('push_pending', 'remote_confirmed')))";
+
+/// Rows whose push may have reached the remote without a recorded outcome.
+const AWAITING_RESOLUTION_PREDICATE: &str =
+    "(status = 'push_pending' OR (status = 'blocked' AND blocked_from = 'push_pending'))";
 
 fn validate_object_id(name: &str, value: &str) -> Result<(), StoreError> {
     if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -160,7 +204,8 @@ fn require_publication_stage(status: TaskStatus) -> Result<&'static str, StoreEr
 const ATTEMPT_COLUMNS: &str = "attempt_id, repository_id, package_id, package_revision, \
      target_remote, target_ref, base_commit, candidate_sha, push_intent_at_unix_ms, \
      observed_remote_sha, failure_classification, status, reason_json, blocked_from, \
-     lease_owner, lease_expires_at_unix_ms, created_at_unix_ms, updated_at_unix_ms";
+     failed_attempts, lease_owner, lease_expires_at_unix_ms, created_at_unix_ms, \
+     updated_at_unix_ms";
 
 fn attempt_from_row(row: &Row<'_>) -> Result<ReleaseAttempt, rusqlite::Error> {
     let parse = |column: usize, value: String| -> Result<_, rusqlite::Error> {
@@ -218,13 +263,14 @@ fn attempt_from_row(row: &Row<'_>) -> Result<ReleaseAttempt, rusqlite::Error> {
         push_intent_at_unix_ms: row.get(8)?,
         observed_remote_sha: row.get(9)?,
         failure_classification: row.get(10)?,
+        failed_attempts: row.get(14)?,
         state,
         lease: AttemptLease {
-            owner: row.get(14)?,
-            expires_at_unix_ms: row.get(15)?,
+            owner: row.get(15)?,
+            expires_at_unix_ms: row.get(16)?,
         },
-        created_at_unix_ms: row.get(16)?,
-        updated_at_unix_ms: row.get(17)?,
+        created_at_unix_ms: row.get(17)?,
+        updated_at_unix_ms: row.get(18)?,
     })
 }
 
@@ -342,12 +388,17 @@ impl Store {
             ));
         }
 
-        self.connection.execute(
-            "UPDATE release_attempts
-             SET candidate_sha = ?2, push_intent_at_unix_ms = ?3, updated_at_unix_ms = ?3
-             WHERE attempt_id = ?1",
-            params![id.to_string(), candidate_sha, now_unix_ms],
-        )?;
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE release_attempts
+                 SET candidate_sha = ?2, push_intent_at_unix_ms = ?3, updated_at_unix_ms = ?3
+                 WHERE attempt_id = ?1 AND status = 'commit_prepared'
+                   AND (candidate_sha IS NULL OR candidate_sha = ?2)",
+                params![id.to_string(), candidate_sha, now_unix_ms],
+            )
+            .map_err(map_attempt_write_error)?;
+        expect_one_row(changed)?;
         self.expect_attempt(id)
     }
 
@@ -366,25 +417,31 @@ impl Store {
                 "attempt update time must not move backwards".into(),
             ));
         }
+        let observed_status = require_publication_stage(attempt.state.status())?;
+        let observed_blocked_from = attempt.state.blocked_from().and_then(status_column);
         attempt
             .state
             .transition(target, reason)
             .map_err(|error| StoreError::Conflict(error.to_string()))?;
 
-        self.connection
+        let changed = self
+            .connection
             .execute(
                 "UPDATE release_attempts
-             SET status = ?2, reason_json = ?3, blocked_from = ?4, updated_at_unix_ms = ?5
-             WHERE attempt_id = ?1",
+                 SET status = ?2, reason_json = ?3, blocked_from = ?4, updated_at_unix_ms = ?5
+                 WHERE attempt_id = ?1 AND status = ?6 AND blocked_from IS ?7",
                 params![
                     id.to_string(),
                     column,
                     encode_reason(attempt.state.reason())?,
                     attempt.state.blocked_from().and_then(status_column),
                     now_unix_ms,
+                    observed_status,
+                    observed_blocked_from,
                 ],
             )
             .map_err(map_attempt_write_error)?;
+        expect_one_row(changed)?;
         self.expect_attempt(id)
     }
 
@@ -392,32 +449,67 @@ impl Store {
     pub fn record_remote_observation(
         &mut self,
         id: AttemptId,
-        observed_remote_sha: Option<&str>,
-        failure_classification: Option<&str>,
+        observed_remote_sha: &str,
         now_unix_ms: i64,
     ) -> Result<ReleaseAttempt, StoreError> {
-        if let Some(sha) = observed_remote_sha {
-            validate_object_id("observed remote commit", sha)?;
-        }
-        if let Some(classification) = failure_classification
-            && (classification.trim().is_empty() || classification.len() > 256)
-        {
+        validate_object_id("observed remote commit", observed_remote_sha)?;
+        let attempt = self.expect_attempt(id)?;
+        let observed_status = require_publication_stage(attempt.state.status())?;
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE release_attempts
+                 SET observed_remote_sha = ?2, updated_at_unix_ms = ?3
+                 WHERE attempt_id = ?1 AND status = ?4",
+                params![
+                    id.to_string(),
+                    observed_remote_sha,
+                    now_unix_ms,
+                    observed_status,
+                ],
+            )
+            .map_err(map_attempt_write_error)?;
+        expect_one_row(changed)?;
+        self.expect_attempt(id)
+    }
+
+    /// Records one unsuccessful publication and its classification.
+    ///
+    /// The counter is durable so a process that dies between failures cannot restart a retry
+    /// budget it has already spent.
+    pub fn record_publication_failure(
+        &mut self,
+        id: AttemptId,
+        classification: &str,
+        now_unix_ms: i64,
+    ) -> Result<ReleaseAttempt, StoreError> {
+        if classification.trim().is_empty() || classification.len() > 256 {
             return Err(StoreError::InvalidData(
                 "failure classification must be a short non-empty label".into(),
             ));
         }
-        self.expect_attempt(id)?;
-        self.connection.execute(
-            "UPDATE release_attempts
-             SET observed_remote_sha = ?2, failure_classification = ?3, updated_at_unix_ms = ?4
-             WHERE attempt_id = ?1",
-            params![
-                id.to_string(),
-                observed_remote_sha,
-                failure_classification,
-                now_unix_ms
-            ],
-        )?;
+        let attempt = self.expect_attempt(id)?;
+        if attempt.failed_attempts == u8::MAX {
+            return Err(StoreError::Conflict(
+                "attempt has already recorded the maximum number of failures".into(),
+            ));
+        }
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE release_attempts
+                 SET failure_classification = ?2, failed_attempts = failed_attempts + 1,
+                     updated_at_unix_ms = ?3
+                 WHERE attempt_id = ?1 AND failed_attempts = ?4",
+                params![
+                    id.to_string(),
+                    classification,
+                    now_unix_ms,
+                    attempt.failed_attempts,
+                ],
+            )
+            .map_err(map_attempt_write_error)?;
+        expect_one_row(changed)?;
         self.expect_attempt(id)
     }
 
@@ -430,7 +522,7 @@ impl Store {
     ) -> Result<Vec<ReleaseAttempt>, StoreError> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT {ATTEMPT_COLUMNS} FROM release_attempts
-             WHERE status = 'push_pending' ORDER BY updated_at_unix_ms"
+             WHERE {AWAITING_RESOLUTION_PREDICATE} ORDER BY updated_at_unix_ms"
         ))?;
         let rows = statement.query_map([], attempt_from_row)?;
         rows.map(|row| row.map_err(StoreError::from)).collect()
@@ -448,7 +540,7 @@ impl Store {
                 &format!(
                     "SELECT {ATTEMPT_COLUMNS} FROM release_attempts
                      WHERE repository_id = ?1 AND target_remote = ?2 AND target_ref = ?3
-                       AND status NOT IN ('published', 'cancelled', 'superseded', 'blocked')"
+                       AND {TARGET_HELD_PREDICATE}"
                 ),
                 params![repository_id.to_string(), remote, target.as_str()],
                 attempt_from_row,
@@ -475,17 +567,23 @@ impl Store {
                 attempt.lease.owner, attempt.lease.expires_at_unix_ms
             )));
         }
-        self.connection.execute(
-            "UPDATE release_attempts
-             SET lease_owner = ?2, lease_expires_at_unix_ms = ?3, updated_at_unix_ms = ?4
-             WHERE attempt_id = ?1",
-            params![
-                id.to_string(),
-                lease.owner,
-                lease.expires_at_unix_ms,
-                now_unix_ms
-            ],
-        )?;
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE release_attempts
+                 SET lease_owner = ?2, lease_expires_at_unix_ms = ?3, updated_at_unix_ms = ?4
+                 WHERE attempt_id = ?1 AND lease_owner = ?5 AND lease_expires_at_unix_ms = ?6",
+                params![
+                    id.to_string(),
+                    lease.owner,
+                    lease.expires_at_unix_ms,
+                    now_unix_ms,
+                    attempt.lease.owner,
+                    attempt.lease.expires_at_unix_ms,
+                ],
+            )
+            .map_err(map_attempt_write_error)?;
+        expect_one_row(changed)?;
         self.expect_attempt(id)
     }
 
@@ -493,6 +591,25 @@ impl Store {
         self.release_attempt(id)?
             .ok_or_else(|| StoreError::InvalidData(format!("release attempt {id} is not stored")))
     }
+}
+
+/// Rejects a guarded update whose row changed between the read and the write.
+///
+/// Every mutation here decides from a value it read first, so the write repeats that value as a
+/// condition and the decision is applied atomically. Losing the race is a conflict, never a silent
+/// overwrite.
+///
+/// A single-threaded caller cannot reach this branch, because each mutation re-reads immediately
+/// before writing. It exists for two owners racing across processes — the case the lease exists to
+/// arbitrate and WAL mode permits. Deterministic coverage arrives with the P4-T07 concurrency
+/// tests; until then this is the guard that keeps that race a conflict rather than lost work.
+fn expect_one_row(changed: usize) -> Result<(), StoreError> {
+    if changed == 1 {
+        return Ok(());
+    }
+    Err(StoreError::Conflict(
+        "release attempt changed concurrently; re-read it before retrying".into(),
+    ))
 }
 
 fn map_attempt_write_error(error: rusqlite::Error) -> StoreError {
@@ -742,7 +859,7 @@ mod tests {
 
         fixture
             .store
-            .record_remote_observation(request.attempt_id, Some(&object_id('e')), None, 7)
+            .record_remote_observation(request.attempt_id, &object_id('e'), 7)
             .unwrap();
         fixture
             .store
@@ -830,6 +947,93 @@ mod tests {
             .unwrap();
         assert_eq!(recovered.lease.owner, "daemon-b");
         assert_eq!(recovered.state.status(), TaskStatus::Scheduled);
+    }
+
+    #[test]
+    fn blocking_after_a_push_keeps_the_target_and_stays_queued_for_resolution() {
+        let mut fixture = fixture();
+        let request = fixture.request("daemon-a", 10_000);
+        fixture.store.open_release_attempt(&request).unwrap();
+        fixture.advance_to_commit_prepared(request.attempt_id);
+        fixture
+            .store
+            .record_push_intent(request.attempt_id, &object_id('e'), 5)
+            .unwrap();
+        fixture
+            .store
+            .advance_release_attempt(request.attempt_id, TaskStatus::PushPending, None, 6)
+            .unwrap();
+
+        let blocked = fixture
+            .store
+            .advance_release_attempt(
+                request.attempt_id,
+                TaskStatus::Blocked,
+                Some(StateReason::new(ReasonCode::DeviceUnavailable, "network went away").unwrap()),
+                7,
+            )
+            .unwrap();
+
+        assert!(
+            blocked.needs_remote_resolution(),
+            "a push that was in flight when the attempt blocked still has an unknown outcome"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .release_attempts_awaiting_remote_resolution()
+                .unwrap()
+                .len(),
+            1,
+            "blocking must not hide a transmitted push from restart reconciliation"
+        );
+
+        assert!(blocked.holds_target());
+        let duplicate = fixture
+            .store
+            .open_release_attempt(&fixture.request("daemon-a", 10_000));
+        assert!(
+            matches!(duplicate, Err(StoreError::Conflict(_))),
+            "a second attempt must not build a candidate while an earlier push may be live: \
+             {duplicate:?}"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .live_release_attempt(fixture.repository_id, REMOTE, &fixture.target)
+                .unwrap()
+                .map(|attempt| attempt.attempt_id),
+            Some(request.attempt_id)
+        );
+    }
+
+    #[test]
+    fn failure_count_is_durable_so_a_restart_cannot_refill_the_retry_budget() {
+        let mut fixture = fixture();
+        let request = fixture.request("daemon-a", 10_000);
+        let opened = fixture.store.open_release_attempt(&request).unwrap();
+        assert_eq!(opened.failed_attempts, 0);
+
+        for expected in 1..=3 {
+            let recorded = fixture
+                .store
+                .record_publication_failure(
+                    request.attempt_id,
+                    "transport",
+                    i64::from(expected) + 1,
+                )
+                .unwrap();
+            assert_eq!(recorded.failed_attempts, expected);
+        }
+        assert_eq!(
+            fixture
+                .store
+                .release_attempt(request.attempt_id)
+                .unwrap()
+                .unwrap()
+                .failed_attempts,
+            3
+        );
     }
 
     #[test]

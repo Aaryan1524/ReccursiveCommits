@@ -1526,4 +1526,145 @@ mod tests {
             Err(RetryPolicyError::Invalid)
         ));
     }
+
+    #[test]
+    fn publication_fault_matrix_never_retries_an_ambiguous_remote_state() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let remote = root.path().join("remote.git");
+        let release = root.path().join("release");
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "init",
+                    "--quiet",
+                    "--initial-branch=main",
+                    source.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fixture_git(&source, &["config", "user.name", "Fixture"]);
+        fixture_git(
+            &source,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(source.join("file.txt"), "base\n").unwrap();
+        fixture_git(&source, &["add", "."]);
+        fixture_git(&source, &["commit", "--quiet", "-m", "base"]);
+        let target = git_text(&source, ["rev-parse", "HEAD"], Duration::from_secs(5)).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "clone",
+                    "--quiet",
+                    "--bare",
+                    source.to_str().unwrap(),
+                    remote.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "clone",
+                    "--quiet",
+                    remote.to_str().unwrap(),
+                    release.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fixture_git(
+            &release,
+            &["checkout", "--quiet", "--detach", target.as_str()],
+        );
+        std::fs::write(release.join("file.txt"), "candidate\n").unwrap();
+        fixture_git(&release, &["add", "."]);
+        let candidate = CandidateWorkspace {
+            path: release,
+            target_commit: target.clone(),
+            snapshot_commit: "a".repeat(40),
+            snapshot_ref: "refs/reccursive/test".into(),
+        };
+        let request = CandidatePublishRequest {
+            remote: remote.to_string_lossy().into_owned(),
+            target_ref: "refs/heads/main".into(),
+        };
+
+        // Fault before persistence: no candidate can have reached the remote.
+        assert_eq!(
+            remote_ref(
+                &candidate.path,
+                &request.remote,
+                &request.target_ref,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            Some(target.clone())
+        );
+        let persisted = candidate
+            .persist(
+                &CandidateCommitRequest {
+                    message: "Persist candidate".into(),
+                    author_name: "Fixture Author".into(),
+                    author_email: "fixture.author@example.invalid".into(),
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+
+        // Fault after persistence but before push: recovery permits a leased retry.
+        assert_eq!(
+            candidate
+                .recover_publication(&persisted, &request, Duration::from_secs(5))
+                .unwrap(),
+            PublicationRecovery::PendingRetry {
+                target_ref: request.target_ref.clone(),
+                target_commit: target.clone(),
+            }
+        );
+
+        // Fault after push but before local confirmation: remote reachability confirms success.
+        candidate
+            .publish(&persisted, &request, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            candidate
+                .recover_publication(&persisted, &request, Duration::from_secs(5))
+                .unwrap(),
+            PublicationRecovery::Published(PublishedCandidate {
+                commit: persisted.commit.clone(),
+                target_ref: request.target_ref.clone(),
+            })
+        );
+
+        // A different remote commit is ambiguous, so recovery cannot authorize another push.
+        std::fs::write(source.join("concurrent.txt"), "other writer\n").unwrap();
+        fixture_git(&source, &["add", "."]);
+        fixture_git(&source, &["commit", "--quiet", "-m", "concurrent writer"]);
+        let concurrent = git_text(&source, ["rev-parse", "HEAD"], Duration::from_secs(5)).unwrap();
+        fixture_git(
+            &source,
+            &["push", remote.to_str().unwrap(), "HEAD:refs/heads/race"],
+        );
+        fixture_git(
+            &remote,
+            &["update-ref", "refs/heads/main", concurrent.as_str()],
+        );
+        assert_eq!(
+            candidate
+                .recover_publication(&persisted, &request, Duration::from_secs(5))
+                .unwrap(),
+            PublicationRecovery::Ambiguous {
+                target_ref: request.target_ref,
+                expected_target: target,
+                actual_commit: concurrent,
+            }
+        );
+    }
 }

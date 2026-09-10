@@ -8,6 +8,8 @@ mod plans;
 mod redaction;
 mod repository;
 mod snapshots;
+mod states;
+mod tasks;
 mod workspaces;
 
 use std::{
@@ -25,6 +27,7 @@ pub use redaction::{redact_json, redact_text};
 pub use repository::{RepositoryRegistration, StoredRepository};
 use rusqlite::{Connection, OpenFlags};
 pub use snapshots::{SnapshotRecord, SnapshotRecoveryIssue};
+pub use tasks::{TaskDependency, TaskRecord};
 use thiserror::Error;
 use uuid::Uuid;
 pub use workspaces::WorkspaceRecord;

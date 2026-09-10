@@ -61,6 +61,15 @@ impl TaskStatus {
         )
     }
 
+    /// The next state on the ordinary path, or `None` where progress needs an explicit decision.
+    ///
+    /// Callers use this to walk a task forward without restating the lifecycle, so a state added
+    /// here is picked up everywhere rather than duplicated.
+    #[must_use]
+    pub const fn next_ordinary(self) -> Option<Self> {
+        self.normal_successor()
+    }
+
     const fn normal_successor(self) -> Option<Self> {
         match self {
             Self::Planned => Some(Self::Building),

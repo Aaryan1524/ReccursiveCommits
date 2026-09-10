@@ -344,6 +344,39 @@ pub enum CandidateVerificationError {
     UnmergedPaths { paths: Vec<String> },
 }
 
+/// Explicit identity and message for a local release candidate commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateCommitRequest {
+    pub message: String,
+    pub author_name: String,
+    pub author_email: String,
+}
+
+/// Immutable identity of a candidate commit that exists only in its managed workspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedCandidate {
+    pub commit: String,
+    pub parent_commit: String,
+    pub tree: String,
+}
+
+/// A condition preventing a verified candidate from being persisted as a commit.
+#[derive(Debug, Error)]
+pub enum CandidateCommitError {
+    #[error(transparent)]
+    Verification(#[from] CandidateVerificationError),
+    #[error("candidate commit message must contain non-whitespace text and no NUL bytes")]
+    InvalidMessage,
+    #[error("candidate commit {field} is invalid")]
+    InvalidIdentity { field: &'static str },
+    #[error(transparent)]
+    Git(#[from] GitError),
+    #[error("persisted candidate parent differs from verified target")]
+    ParentMismatch,
+    #[error("persisted candidate tree differs from verified staged tree")]
+    TreeMismatch,
+}
+
 impl CandidateWorkspace {
     /// Applies the captured delta to the current target without committing it.
     ///
@@ -405,6 +438,48 @@ impl CandidateWorkspace {
         })
     }
 
+    /// Creates a local commit from a verified candidate. This never updates a remote ref.
+    pub fn persist(
+        &self,
+        request: &CandidateCommitRequest,
+        timeout: Duration,
+    ) -> Result<PersistedCandidate, CandidateCommitError> {
+        validate_commit_request(request)?;
+        let verified = self.verify(timeout)?;
+        GitRunner::run(
+            &GitInvocation::new(
+                &self.path,
+                vec![
+                    OsString::from("-c"),
+                    OsString::from(format!("user.name={}", request.author_name)),
+                    OsString::from("-c"),
+                    OsString::from(format!("user.email={}", request.author_email)),
+                    OsString::from("commit"),
+                    OsString::from("--no-verify"),
+                    OsString::from("--no-gpg-sign"),
+                    OsString::from("-m"),
+                    OsString::from(&request.message),
+                ],
+                timeout,
+            )?,
+            &CancellationToken::default(),
+        )?;
+        let commit = git_text(&self.path, ["rev-parse", "HEAD"], timeout)?;
+        let parent_commit = git_text(&self.path, ["rev-parse", "HEAD^"], timeout)?;
+        let tree = git_text(&self.path, ["rev-parse", "HEAD^{tree}"], timeout)?;
+        if parent_commit != verified.target_commit {
+            return Err(CandidateCommitError::ParentMismatch);
+        }
+        if tree != verified.staged_tree {
+            return Err(CandidateCommitError::TreeMismatch);
+        }
+        Ok(PersistedCandidate {
+            commit,
+            parent_commit,
+            tree,
+        })
+    }
+
     fn unmerged_paths(&self, timeout: Duration) -> Result<Vec<String>, GitError> {
         let output = GitRunner::run(
             &GitInvocation::new(
@@ -424,6 +499,30 @@ impl CandidateWorkspace {
         paths.dedup();
         Ok(paths)
     }
+}
+
+fn validate_commit_request(request: &CandidateCommitRequest) -> Result<(), CandidateCommitError> {
+    if request.message.trim().is_empty() || request.message.contains('\0') {
+        return Err(CandidateCommitError::InvalidMessage);
+    }
+    for (field, value) in [
+        ("author name", &request.author_name),
+        ("author email", &request.author_email),
+    ] {
+        if value.trim().is_empty()
+            || value.trim() != value
+            || value.contains(['\0', '\n', '\r'])
+            || value.len() > 320
+        {
+            return Err(CandidateCommitError::InvalidIdentity { field });
+        }
+    }
+    if !request.author_email.contains('@') {
+        return Err(CandidateCommitError::InvalidIdentity {
+            field: "author email",
+        });
+    }
+    Ok(())
 }
 
 fn git_text(
@@ -687,7 +786,7 @@ mod tests {
             candidate.verify(Duration::from_secs(5)).unwrap(),
             CandidateVerification {
                 target_commit: target.clone(),
-                staged_tree,
+                staged_tree: staged_tree.clone(),
             }
         );
         assert_eq!(
@@ -699,11 +798,71 @@ mod tests {
             .unwrap(),
             target
         );
+        let persisted = candidate
+            .persist(
+                &CandidateCommitRequest {
+                    message: "Apply captured change".into(),
+                    author_name: "Fixture Author".into(),
+                    author_email: "fixture.author@example.invalid".into(),
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(persisted.parent_commit, target);
+        assert_eq!(persisted.tree, staged_tree);
+        assert_eq!(
+            git_text(
+                &candidate.path,
+                ["log", "-1", "--format=%an <%ae>"],
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            "Fixture Author <fixture.author@example.invalid>"
+        );
+        assert_eq!(
+            git_text(&source, ["rev-parse", "HEAD"], Duration::from_secs(5)).unwrap(),
+            target
+        );
         fixture_git(&candidate.path, &["reset", "--hard", base.as_str()]);
         assert!(matches!(
             candidate.verify(Duration::from_secs(5)),
             Err(CandidateVerificationError::TargetChanged { expected, actual })
                 if expected == target && actual == base
+        ));
+    }
+
+    #[test]
+    fn candidate_commit_request_rejects_invalid_identity_and_message() {
+        let valid = CandidateCommitRequest {
+            message: "Apply change".into(),
+            author_name: "Fixture Author".into(),
+            author_email: "fixture@example.invalid".into(),
+        };
+        assert!(validate_commit_request(&valid).is_ok());
+        assert!(matches!(
+            validate_commit_request(&CandidateCommitRequest {
+                message: " \n".into(),
+                ..valid.clone()
+            }),
+            Err(CandidateCommitError::InvalidMessage)
+        ));
+        assert!(matches!(
+            validate_commit_request(&CandidateCommitRequest {
+                author_name: "Fixture\nAuthor".into(),
+                ..valid.clone()
+            }),
+            Err(CandidateCommitError::InvalidIdentity {
+                field: "author name"
+            })
+        ));
+        assert!(matches!(
+            validate_commit_request(&CandidateCommitRequest {
+                author_email: "fixture.example.invalid".into(),
+                ..valid
+            }),
+            Err(CandidateCommitError::InvalidIdentity {
+                field: "author email"
+            })
         ));
     }
 

@@ -95,6 +95,9 @@ impl Store {
                 ],
             )
             .map_err(map_plan_write_error)?;
+        // Same transaction as the plan document: a revision is never visible without the rows that
+        // make its tasks and dependencies queryable.
+        crate::tasks::insert_plan_tasks(&transaction, plan, created_at_unix_ms)?;
         transaction.commit()?;
         Ok(())
     }

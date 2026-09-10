@@ -19,9 +19,10 @@ use reccursive_capture::{
 use reccursive_protocol::{
     ApiError, ApiErrorCode, AuthToken, CapturePackageRequest, Command, CreateWorkspaceRequest,
     EnrollRepositoryRequest, EventSeverityView, EventView, PackageView, PlanView,
-    ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView, RepositoryId,
-    RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope,
-    Revision, TransportError, WorkspacePrerequisiteView, WorkspaceView,
+    ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView, ReasonCode,
+    RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData,
+    ResponseEnvelope, Revision, StateReason, TaskStatus, TransportError, WorkspacePrerequisiteView,
+    WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -1287,6 +1288,26 @@ fn capture_package(
             package.advanced_base_commit(),
         )
         .map_err(store_api_error)?;
+    let captured_tasks: Vec<_> = package.manifest.task_ids.iter().copied().collect();
+    lock_store(store)?
+        .record_package_tasks(
+            package.manifest.package_id,
+            package.manifest.revision,
+            captured_tasks.iter().copied(),
+        )
+        .map_err(store_api_error)?;
+    // The package is the durable proof that these tasks were built and captured.
+    for task_id in &captured_tasks {
+        lock_store(store)?
+            .advance_task_to(
+                request.feature_id,
+                request.plan_revision,
+                *task_id,
+                TaskStatus::Captured,
+                created_at_unix_ms,
+            )
+            .map_err(store_api_error)?;
+    }
     let checks = lock_store(store)?
         .trusted_checks(plan.repository_id)
         .map_err(store_api_error)?;
@@ -1303,6 +1324,25 @@ fn capture_package(
         }
     }
     if let Some(check_id) = failed_check {
+        // The evidence is already durable. Block the tasks rather than losing the package, so the
+        // failure is visible and the same package can be resumed once the cause is fixed.
+        let reason = StateReason::new(
+            ReasonCode::ValidationFailed,
+            format!("trusted check {check_id} failed"),
+        )
+        .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string(), false))?;
+        for task_id in &captured_tasks {
+            lock_store(store)?
+                .advance_task(
+                    request.feature_id,
+                    request.plan_revision,
+                    *task_id,
+                    TaskStatus::Blocked,
+                    Some(reason.clone()),
+                    created_at_unix_ms,
+                )
+                .map_err(store_api_error)?;
+        }
         return Err(ApiError::new(
             ApiErrorCode::InvalidRequest,
             format!(
@@ -1311,6 +1351,18 @@ fn capture_package(
             ),
             false,
         ));
+    }
+    // Checks passed against this exact package, so the work is validated and eligible for release.
+    for task_id in &captured_tasks {
+        lock_store(store)?
+            .advance_task_to(
+                request.feature_id,
+                request.plan_revision,
+                *task_id,
+                TaskStatus::Queued,
+                created_at_unix_ms,
+            )
+            .map_err(store_api_error)?;
     }
     Ok(ResponseData::PackageCaptured {
         package: package_view(record, package.manifest)?,

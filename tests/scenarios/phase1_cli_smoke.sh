@@ -114,6 +114,20 @@ grep -q '"path":"README.md","state":"present"' <<<"$workspace_json" || \
 [[ "$(git -C "$fixture_root/repository" status --porcelain=v1)" == "$source_status_before" ]] || \
   fail "workspace creation changed the source checkout"
 
+package_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" \
+  --json package capture feature_00000000-0000-4000-8000-000000000001 \
+  --revision 1 --task task_00000000-0000-4000-8000-000000000002)"
+grep -q '"type":"package_captured"' <<<"$package_json" || \
+  fail "package capture did not return the expected JSON payload"
+grep -Eq '"base_tree":"[0-9a-f]{40}"' <<<"$package_json" || \
+  fail "package did not record a base tree"
+grep -Eq '"result_tree":"[0-9a-f]{40}"' <<<"$package_json" || \
+  fail "package did not record a result tree"
+grep -Eq '"content_hash":"[0-9a-f]{64}"' <<<"$package_json" || \
+  fail "package did not record a content hash"
+package_id="$(sed -E 's/.*"package_id":"(package_[^"]+)".*/\1/' <<<"$package_json")"
+[[ "$package_id" == package_* ]] || fail "package capture did not return an ID"
+
 list_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" \
   --json repository list)"
 grep -q '"type":"repositories"' <<<"$list_json" || \
@@ -147,6 +161,10 @@ workspace_after_restart="$("$binary_dir/reccursive" --state-dir "$fixture_root/s
   --json workspace show feature_00000000-0000-4000-8000-000000000001 --revision 1)"
 grep -q '"type":"workspace"' <<<"$workspace_after_restart" || \
   fail "workspace ownership did not survive daemon restart"
+package_after_restart="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" \
+  --json package show "$package_id")"
+grep -q '"type":"package"' <<<"$package_after_restart" || \
+  fail "verified snapshot package did not survive daemon restart"
 
 logs_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" --json logs --limit 20)"
 grep -q '"type":"events"' <<<"$logs_json" || \
@@ -160,4 +178,4 @@ grep -q '"reason_code":"conflict"' <<<"$logs_json" || \
 grep -q '"request_id":"request_' <<<"$logs_json" || \
   fail "diagnostic events were not correlated by request ID"
 
-printf 'PASS foundation CLI, plan import, isolated workspace ownership, diagnostics, and restart persistence\n'
+printf 'PASS plan import, isolated workspace, immutable package, diagnostics, and restart persistence\n'

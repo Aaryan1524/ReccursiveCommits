@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 4;
+pub const STORAGE_SCHEMA_VERSION: u32 = 5;
 
 struct Migration {
     version: u32,
@@ -188,6 +188,29 @@ const MIGRATIONS: &[Migration] = &[
             FOREIGN KEY (feature_id, plan_revision)
                 REFERENCES feature_plans(feature_id, revision) ON DELETE RESTRICT
         );
+        "#,
+    },
+    Migration {
+        version: 5,
+        sql: r#"
+        CREATE TABLE snapshot_packages (
+            package_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision > 0),
+            feature_id TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL CHECK (plan_revision > 0),
+            package_path TEXT NOT NULL UNIQUE CHECK (length(package_path) > 0),
+            base_tree TEXT NOT NULL CHECK (length(base_tree) = 40),
+            result_tree TEXT NOT NULL CHECK (length(result_tree) = 40),
+            content_hash TEXT NOT NULL CHECK (length(content_hash) = 64),
+            manifest_json TEXT NOT NULL CHECK (json_valid(manifest_json)),
+            created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+            PRIMARY KEY (package_id, revision),
+            FOREIGN KEY (feature_id, plan_revision)
+                REFERENCES build_workspaces(feature_id, plan_revision) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX idx_snapshot_packages_feature
+            ON snapshot_packages(feature_id, plan_revision, created_at_unix_ms);
         "#,
     },
 ];

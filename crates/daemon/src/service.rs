@@ -12,18 +12,20 @@ use std::{
 };
 
 use reccursive_capture::{
-    OwnedWorkspace, PrerequisiteState, WorkspaceError, WorkspaceRequest as CaptureWorkspaceRequest,
+    OwnedWorkspace, PrerequisiteState, SnapshotError, SnapshotPackage, SnapshotRequest,
+    WorkspaceError, WorkspaceRequest as CaptureWorkspaceRequest,
 };
 use reccursive_protocol::{
-    ApiError, ApiErrorCode, AuthToken, Command, CreateWorkspaceRequest, EnrollRepositoryRequest,
-    EventSeverityView, EventView, PlanView, ProtocolValidationError, RepositoryId,
-    RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope,
-    Revision, TransportError, WorkspacePrerequisiteView, WorkspaceView,
+    ApiError, ApiErrorCode, AuthToken, CapturePackageRequest, Command, CreateWorkspaceRequest,
+    EnrollRepositoryRequest, EventSeverityView, EventView, PackageView, PlanView,
+    ProtocolValidationError, RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope,
+    RequestId, ResponseData, ResponseEnvelope, Revision, TransportError, WorkspacePrerequisiteView,
+    WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
-    DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, RepositoryRegistration, Store,
-    StoreError, StoredEvent, StoredPlan, StoredRepository, WorkspaceRecord,
+    DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, RepositoryRegistration,
+    SnapshotRecord, Store, StoreError, StoredEvent, StoredPlan, StoredRepository, WorkspaceRecord,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -38,6 +40,7 @@ pub struct ServicePaths {
     pub auth_token: PathBuf,
     pub database: PathBuf,
     pub workspaces: PathBuf,
+    pub packages: PathBuf,
 }
 
 impl ServicePaths {
@@ -50,6 +53,7 @@ impl ServicePaths {
             auth_token: state_dir.join("auth.token"),
             database: state_dir.join("state.sqlite"),
             workspaces: state_dir.join("workspaces"),
+            packages: state_dir.join("packages"),
             state_dir,
         }
     }
@@ -61,6 +65,7 @@ pub struct LocalService {
     store: Arc<Mutex<Store>>,
     managed_root: Arc<PathBuf>,
     workspace_root: Arc<PathBuf>,
+    package_root: Arc<PathBuf>,
 }
 
 impl LocalService {
@@ -71,11 +76,13 @@ impl LocalService {
         let state_root = fs::canonicalize(&owner.paths.state_dir)?;
         let managed_root = state_root.join("repositories");
         let workspace_root = state_root.join("workspaces");
+        let package_root = state_root.join("packages");
         Ok(Self {
             owner,
             store: Arc::new(Mutex::new(store)),
             managed_root: Arc::new(managed_root),
             workspace_root: Arc::new(workspace_root),
+            package_root: Arc::new(package_root),
         })
     }
 
@@ -87,9 +94,16 @@ impl LocalService {
             let store = Arc::clone(&self.store);
             let managed_root = Arc::clone(&self.managed_root);
             let workspace_root = Arc::clone(&self.workspace_root);
+            let package_root = Arc::clone(&self.package_root);
             thread::spawn(move || {
-                let _ =
-                    handle_connection(stream, &auth_token, &store, &managed_root, &workspace_root);
+                let _ = handle_connection(
+                    stream,
+                    &auth_token,
+                    &store,
+                    &managed_root,
+                    &workspace_root,
+                    &package_root,
+                );
             });
         }
         Ok(())
@@ -104,8 +118,16 @@ impl LocalService {
             let store = Arc::clone(&self.store);
             let managed_root = Arc::clone(&self.managed_root);
             let workspace_root = Arc::clone(&self.workspace_root);
+            let package_root = Arc::clone(&self.package_root);
             workers.push(thread::spawn(move || {
-                handle_connection(stream, &auth_token, &store, &managed_root, &workspace_root)
+                handle_connection(
+                    stream,
+                    &auth_token,
+                    &store,
+                    &managed_root,
+                    &workspace_root,
+                    &package_root,
+                )
             }));
         }
         for worker in workers {
@@ -232,6 +254,7 @@ fn handle_connection(
     store: &Mutex<Store>,
     managed_root: &Path,
     workspace_root: &Path,
+    package_root: &Path,
 ) -> Result<(), ServiceError> {
     let request = match read_message::<RequestEnvelope>(&mut stream) {
         Ok(request) => request,
@@ -267,7 +290,13 @@ fn handle_connection(
     } else {
         let request_id = request.request_id;
         let command_name = command_name(&request.command);
-        let result = dispatch(request.command, store, managed_root, workspace_root);
+        let result = dispatch(
+            request.command,
+            store,
+            managed_root,
+            workspace_root,
+            package_root,
+        );
         match record_api_event(store, request_id, command_name, &result) {
             Ok(()) => match result {
                 Ok(data) => ResponseEnvelope::success(request_id, data),
@@ -285,6 +314,7 @@ fn dispatch(
     store: &Mutex<Store>,
     managed_root: &Path,
     workspace_root: &Path,
+    package_root: &Path,
 ) -> Result<ResponseData, ApiError> {
     match command {
         Command::Ping => {
@@ -357,6 +387,11 @@ fn dispatch(
             feature_id,
             revision,
         } => get_workspace(feature_id, revision, store),
+        Command::CapturePackage(request) => capture_package(request, store, package_root),
+        Command::GetPackage {
+            package_id,
+            revision,
+        } => get_package(package_id, revision, store),
         Command::EnrollRepository(request) => enroll_repository(request, store, managed_root),
     }
 }
@@ -372,6 +407,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::PlanHistory { .. } => "plan.history",
         Command::CreateWorkspace(_) => "workspace.create",
         Command::GetWorkspace { .. } => "workspace.show",
+        Command::CapturePackage(_) => "package.capture",
+        Command::GetPackage { .. } => "package.show",
         Command::Status => "status",
     }
 }
@@ -401,6 +438,12 @@ fn record_api_event(
             Some("workspace".into()),
             Some(workspace.feature_id.to_string()),
             Some(workspace.revision),
+        ),
+        Ok(ResponseData::PackageCaptured { package }) | Ok(ResponseData::Package { package }) => (
+            None,
+            Some("snapshot_package".into()),
+            Some(package.package_id.to_string()),
+            Some(package.revision),
         ),
         _ => (None, None, None, None),
     };
@@ -612,6 +655,171 @@ fn workspace_api_error(error: WorkspaceError) -> ApiError {
     let code = match &error {
         WorkspaceError::AlreadyExists { .. } => ApiErrorCode::Conflict,
         WorkspaceError::Git { .. } | WorkspaceError::Io(_) => ApiErrorCode::TemporarilyUnavailable,
+        _ => ApiErrorCode::InvalidRequest,
+    };
+    ApiError::new(
+        code,
+        error.to_string(),
+        code == ApiErrorCode::TemporarilyUnavailable,
+    )
+}
+
+fn capture_package(
+    request: CapturePackageRequest,
+    store: &Mutex<Store>,
+    package_root: &Path,
+) -> Result<ResponseData, ApiError> {
+    let (plan, workspace) = {
+        let store = lock_store(store)?;
+        let plan = store
+            .plan(request.feature_id, Some(request.plan_revision))
+            .map_err(store_api_error)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::NotFound,
+                    format!(
+                        "feature plan {} revision {} was not found",
+                        request.feature_id,
+                        request.plan_revision.get()
+                    ),
+                    false,
+                )
+            })?;
+        let workspace = store
+            .workspace(request.feature_id, request.plan_revision)
+            .map_err(store_api_error)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::NotFound,
+                    "create the owned workspace before capturing a package",
+                    false,
+                )
+            })?;
+        (plan.plan, workspace)
+    };
+    let planned_tasks: std::collections::BTreeSet<_> = plan
+        .phases
+        .iter()
+        .flat_map(|phase| phase.tasks.iter().map(|task| task.id))
+        .collect();
+    if !request.task_ids.is_subset(&planned_tasks) {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            "snapshot task selection contains an ID outside the plan revision",
+            false,
+        ));
+    }
+
+    let package = SnapshotPackage::capture(SnapshotRequest {
+        package_id: reccursive_protocol::PackageId::new(),
+        revision: Revision::FIRST,
+        feature_id: request.feature_id,
+        plan_revision: request.plan_revision,
+        task_ids: request.task_ids,
+        workspace: &workspace.path,
+        package_root,
+        expected_base_commit: &workspace.base_commit,
+    })
+    .map_err(snapshot_api_error)?;
+    let created_at_unix_ms = current_unix_ms()?;
+    let record = SnapshotRecord {
+        package_id: package.manifest.package_id,
+        revision: package.manifest.revision,
+        feature_id: package.manifest.feature_id,
+        plan_revision: package.manifest.plan_revision,
+        path: package.path.clone(),
+        base_tree: package.manifest.base_tree.clone(),
+        result_tree: package.manifest.result_tree.clone(),
+        content_hash: package.manifest.content_hash.clone(),
+        manifest: serde_json::to_value(&package.manifest).map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                "snapshot manifest could not be encoded",
+                false,
+            )
+        })?,
+        created_at_unix_ms,
+    };
+    lock_store(store)?
+        .record_snapshot(&record)
+        .map_err(store_api_error)?;
+    Ok(ResponseData::PackageCaptured {
+        package: package_view(record, package.manifest)?,
+    })
+}
+
+fn get_package(
+    package_id: reccursive_protocol::PackageId,
+    revision: Revision,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let record = lock_store(store)?
+        .snapshot(package_id, revision)
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotFound,
+                format!(
+                    "snapshot package {package_id} revision {} was not found",
+                    revision.get()
+                ),
+                false,
+            )
+        })?;
+    let package = SnapshotPackage::open(record.path.clone()).map_err(snapshot_api_error)?;
+    if package.manifest.content_hash != record.content_hash {
+        return Err(ApiError::new(
+            ApiErrorCode::Internal,
+            "snapshot record does not match its authenticated manifest",
+            false,
+        ));
+    }
+    Ok(ResponseData::Package {
+        package: package_view(record, package.manifest)?,
+    })
+}
+
+fn package_view(
+    record: SnapshotRecord,
+    manifest: reccursive_capture::SnapshotManifest,
+) -> Result<PackageView, ApiError> {
+    if record.package_id != manifest.package_id
+        || record.revision != manifest.revision
+        || record.feature_id != manifest.feature_id
+        || record.plan_revision != manifest.plan_revision
+        || record.base_tree != manifest.base_tree
+        || record.result_tree != manifest.result_tree
+    {
+        return Err(ApiError::new(
+            ApiErrorCode::Internal,
+            "snapshot database record and manifest disagree",
+            false,
+        ));
+    }
+    Ok(PackageView {
+        package_id: record.package_id,
+        revision: record.revision,
+        feature_id: record.feature_id,
+        plan_revision: record.plan_revision,
+        task_ids: manifest.task_ids,
+        path: record.path.to_string_lossy().into_owned(),
+        base_commit: manifest.base_commit,
+        base_tree: record.base_tree,
+        result_tree: record.result_tree,
+        content_hash: record.content_hash,
+        created_at_unix_ms: record.created_at_unix_ms,
+    })
+}
+
+fn snapshot_api_error(error: SnapshotError) -> ApiError {
+    let code = match &error {
+        SnapshotError::AlreadyExists { .. } | SnapshotError::IncompleteExists { .. } => {
+            ApiErrorCode::Conflict
+        }
+        SnapshotError::Io(_) | SnapshotError::Git { .. } => ApiErrorCode::TemporarilyUnavailable,
+        SnapshotError::HashMismatch { .. }
+        | SnapshotError::TreeMismatch { .. }
+        | SnapshotError::UnsupportedSchema { .. } => ApiErrorCode::Internal,
         _ => ApiErrorCode::InvalidRequest,
     };
     ApiError::new(

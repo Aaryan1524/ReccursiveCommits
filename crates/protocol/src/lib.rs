@@ -2,12 +2,12 @@
 
 pub mod transport;
 
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 pub use reccursive_core::{
-    AcceptanceCheck, AttemptId, EventId, FeatureId, FeaturePlan, PLAN_SCHEMA_VERSION, PlanPhase,
-    PlanTask, PublicationMode, RepositoryId, RepositoryPolicy, RequestId, Revision, TargetRef,
-    TaskId,
+    AcceptanceCheck, AttemptId, EventId, FeatureId, FeaturePlan, PLAN_SCHEMA_VERSION, PackageId,
+    PlanPhase, PlanTask, PublicationMode, RepositoryId, RepositoryPolicy, RequestId, Revision,
+    TargetRef, TaskId,
 };
 use serde::{Deserialize, Serialize};
 pub use transport::{LocalClient, TransportError};
@@ -75,6 +75,7 @@ impl RequestEnvelope {
         match &self.command {
             Command::EnrollRepository(request) => request.validate(),
             Command::CreateWorkspace(request) => request.validate(),
+            Command::CapturePackage(request) => request.validate(),
             Command::ImportPlan { plan } => plan
                 .validate()
                 .map_err(|error| ProtocolValidationError::InvalidPlan(error.to_string())),
@@ -87,6 +88,7 @@ impl RequestEnvelope {
             | Command::GetPlan { .. }
             | Command::PlanHistory { .. }
             | Command::GetWorkspace { .. }
+            | Command::GetPackage { .. }
             | Command::Status => Ok(()),
         }
     }
@@ -117,7 +119,29 @@ pub enum Command {
         feature_id: FeatureId,
         revision: Revision,
     },
+    CapturePackage(CapturePackageRequest),
+    GetPackage {
+        package_id: PackageId,
+        revision: Revision,
+    },
     Status,
+}
+
+/// Task selection for one immutable snapshot package.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CapturePackageRequest {
+    pub feature_id: FeatureId,
+    pub plan_revision: Revision,
+    pub task_ids: BTreeSet<TaskId>,
+}
+
+impl CapturePackageRequest {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.task_ids.is_empty() || self.task_ids.len() > 1_000 {
+            return Err(ProtocolValidationError::InvalidPackageTasks);
+        }
+        Ok(())
+    }
 }
 
 /// Explicit request for a daemon-owned workspace.
@@ -264,6 +288,22 @@ pub struct WorkspaceView {
     pub created_at_unix_ms: i64,
 }
 
+/// Authenticated immutable package metadata.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackageView {
+    pub package_id: PackageId,
+    pub revision: Revision,
+    pub feature_id: FeatureId,
+    pub plan_revision: Revision,
+    pub task_ids: BTreeSet<TaskId>,
+    pub path: String,
+    pub base_commit: String,
+    pub base_tree: String,
+    pub result_tree: String,
+    pub content_hash: String,
+    pub created_at_unix_ms: i64,
+}
+
 /// Correlated daemon response.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResponseEnvelope {
@@ -323,6 +363,12 @@ pub enum ResponseData {
     },
     Workspace {
         workspace: WorkspaceView,
+    },
+    PackageCaptured {
+        package: PackageView,
+    },
+    Package {
+        package: PackageView,
     },
     Status {
         service_version: String,
@@ -385,6 +431,8 @@ pub enum ProtocolValidationError {
     InvalidPlan(String),
     #[error("invalid prerequisite selection: {0}")]
     InvalidPrerequisite(String),
+    #[error("snapshot package must select between 1 and 1000 plan tasks")]
+    InvalidPackageTasks,
 }
 
 #[cfg(test)]

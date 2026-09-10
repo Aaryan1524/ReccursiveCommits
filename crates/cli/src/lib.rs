@@ -8,9 +8,10 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use reccursive_protocol::{
-    ApiError, ApiErrorCode, Command, CreateWorkspaceRequest, EnrollRepositoryRequest,
-    EventSeverityView, EventView, FeatureId, FeaturePlan, LocalClient, PlanView, PublicationMode,
-    RepositoryView, ResponseData, Revision, TargetRef, WorkspaceView,
+    ApiError, ApiErrorCode, CapturePackageRequest, Command, CreateWorkspaceRequest,
+    EnrollRepositoryRequest, EventSeverityView, EventView, FeatureId, FeaturePlan, LocalClient,
+    PackageId, PackageView, PlanView, PublicationMode, RepositoryView, ResponseData, Revision,
+    TargetRef, TaskId, WorkspaceView,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -59,6 +60,11 @@ enum TopLevelCommand {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+    /// Capture and inspect immutable snapshot packages.
+    Package {
+        #[command(subcommand)]
+        command: PackageCommand,
+    },
     /// Show service and queue summary.
     Status,
     /// Check local prerequisites and service connectivity.
@@ -68,6 +74,24 @@ enum TopLevelCommand {
         /// Maximum number of newest events to return.
         #[arg(long, default_value_t = 50, value_parser = parse_event_limit)]
         limit: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PackageCommand {
+    /// Capture current owned-workspace changes for one or more plan tasks.
+    Capture {
+        feature_id: FeatureId,
+        #[arg(long, value_parser = parse_revision)]
+        revision: Revision,
+        #[arg(long = "task", required = true)]
+        task_ids: Vec<TaskId>,
+    },
+    /// Verify and show an immutable snapshot package.
+    Show {
+        package_id: PackageId,
+        #[arg(long, value_parser = parse_revision, default_value = "1")]
+        revision: Revision,
     },
 }
 
@@ -293,6 +317,36 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                     &paths,
                     Command::GetWorkspace {
                         feature_id,
+                        revision,
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+        },
+        TopLevelCommand::Package { command } => match command {
+            PackageCommand::Capture {
+                feature_id,
+                revision,
+                task_ids,
+            } => {
+                let data = send(
+                    &paths,
+                    Command::CapturePackage(CapturePackageRequest {
+                        feature_id,
+                        plan_revision: revision,
+                        task_ids: task_ids.into_iter().collect(),
+                    }),
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            PackageCommand::Show {
+                package_id,
+                revision,
+            } => {
+                let data = send(
+                    &paths,
+                    Command::GetPackage {
+                        package_id,
                         revision,
                     },
                 )?;
@@ -539,6 +593,10 @@ fn output_data(
             writeln!(out, "Created owned workspace {}", workspace.path)
         }
         ResponseData::Workspace { workspace } => output_workspace(out, &workspace),
+        ResponseData::PackageCaptured { package } => {
+            writeln!(out, "Captured immutable package {}", package.package_id)
+        }
+        ResponseData::Package { package } => output_package(out, &package),
     }
     .map_err(output_error)
 }
@@ -587,6 +645,20 @@ fn output_workspace(out: &mut impl Write, workspace: &WorkspaceView) -> io::Resu
         workspace.base_commit,
         workspace.path,
         workspace.prerequisites.len()
+    )
+}
+
+fn output_package(out: &mut impl Write, package: &PackageView) -> io::Result<()> {
+    writeln!(
+        out,
+        "Package: {}\nRevision: {}\nFeature: {}\nBase tree: {}\nResult tree: {}\nContent hash: {}\nTasks: {}",
+        package.package_id,
+        package.revision.get(),
+        package.feature_id,
+        package.base_tree,
+        package.result_tree,
+        package.content_hash,
+        package.task_ids.len()
     )
 }
 

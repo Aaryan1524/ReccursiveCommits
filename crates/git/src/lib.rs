@@ -418,6 +418,24 @@ pub enum CandidatePublishError {
     },
 }
 
+/// Read-only classification used after a publish attempt has an uncertain result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublicationRecovery {
+    /// The remote already contains the candidate; no retry is needed.
+    Published(PublishedCandidate),
+    /// The remote remains at the verified target, so a leased retry is safe.
+    PendingRetry {
+        target_ref: String,
+        target_commit: String,
+    },
+    /// Another commit is present. Automatic retry is unsafe and must stop.
+    Ambiguous {
+        target_ref: String,
+        expected_target: String,
+        actual_commit: String,
+    },
+}
+
 impl CandidateWorkspace {
     /// Applies the captured delta to the current target without committing it.
     ///
@@ -529,16 +547,7 @@ impl CandidateWorkspace {
         timeout: Duration,
     ) -> Result<PublishedCandidate, CandidatePublishError> {
         validate_publish_request(request)?;
-        let local_commit = git_text(&self.path, ["rev-parse", "HEAD"], timeout)?;
-        let local_parent = git_text(&self.path, ["rev-parse", "HEAD^"], timeout)?;
-        let local_tree = git_text(&self.path, ["rev-parse", "HEAD^{tree}"], timeout)?;
-        if local_commit != candidate.commit
-            || local_parent != candidate.parent_commit
-            || local_parent != self.target_commit
-            || local_tree != candidate.tree
-        {
-            return Err(CandidatePublishError::LocalCandidateMismatch);
-        }
+        self.validate_persisted_candidate(candidate, timeout)?;
         match remote_ref(&self.path, &request.remote, &request.target_ref, timeout)? {
             Some(actual) if actual == self.target_commit => {}
             Some(actual) => {
@@ -583,6 +592,55 @@ impl CandidateWorkspace {
             commit: candidate.commit.clone(),
             target_ref: request.target_ref.clone(),
         })
+    }
+
+    /// Resolves an uncertain publish result without modifying the remote.
+    pub fn recover_publication(
+        &self,
+        candidate: &PersistedCandidate,
+        request: &CandidatePublishRequest,
+        timeout: Duration,
+    ) -> Result<PublicationRecovery, CandidatePublishError> {
+        validate_publish_request(request)?;
+        self.validate_persisted_candidate(candidate, timeout)?;
+        match remote_ref(&self.path, &request.remote, &request.target_ref, timeout)? {
+            Some(actual) if actual == candidate.commit => {
+                Ok(PublicationRecovery::Published(PublishedCandidate {
+                    commit: candidate.commit.clone(),
+                    target_ref: request.target_ref.clone(),
+                }))
+            }
+            Some(actual) if actual == self.target_commit => Ok(PublicationRecovery::PendingRetry {
+                target_ref: request.target_ref.clone(),
+                target_commit: self.target_commit.clone(),
+            }),
+            Some(actual) => Ok(PublicationRecovery::Ambiguous {
+                target_ref: request.target_ref.clone(),
+                expected_target: self.target_commit.clone(),
+                actual_commit: actual,
+            }),
+            None => Err(CandidatePublishError::TargetMissing {
+                target_ref: request.target_ref.clone(),
+            }),
+        }
+    }
+
+    fn validate_persisted_candidate(
+        &self,
+        candidate: &PersistedCandidate,
+        timeout: Duration,
+    ) -> Result<(), CandidatePublishError> {
+        let local_commit = git_text(&self.path, ["rev-parse", "HEAD"], timeout)?;
+        let local_parent = git_text(&self.path, ["rev-parse", "HEAD^"], timeout)?;
+        let local_tree = git_text(&self.path, ["rev-parse", "HEAD^{tree}"], timeout)?;
+        if local_commit != candidate.commit
+            || local_parent != candidate.parent_commit
+            || local_parent != self.target_commit
+            || local_tree != candidate.tree
+        {
+            return Err(CandidatePublishError::LocalCandidateMismatch);
+        }
+        Ok(())
     }
 
     fn unmerged_paths(&self, timeout: Duration) -> Result<Vec<String>, GitError> {
@@ -995,6 +1053,15 @@ mod tests {
         };
         assert_eq!(
             candidate
+                .recover_publication(&persisted, &publish_request, Duration::from_secs(5))
+                .unwrap(),
+            PublicationRecovery::PendingRetry {
+                target_ref: "refs/heads/main".into(),
+                target_commit: target.clone(),
+            }
+        );
+        assert_eq!(
+            candidate
                 .publish(&persisted, &publish_request, Duration::from_secs(5))
                 .unwrap(),
             PublishedCandidate {
@@ -1012,11 +1079,42 @@ mod tests {
             .unwrap(),
             Some(persisted.commit.clone())
         );
+        assert_eq!(
+            candidate
+                .recover_publication(&persisted, &publish_request, Duration::from_secs(5))
+                .unwrap(),
+            PublicationRecovery::Published(PublishedCandidate {
+                commit: persisted.commit.clone(),
+                target_ref: "refs/heads/main".into(),
+            })
+        );
         assert!(matches!(
             candidate.publish(&persisted, &publish_request, Duration::from_secs(5)),
             Err(CandidatePublishError::TargetAdvanced { expected, actual, .. })
                 if expected == target && actual == persisted.commit
         ));
+        std::fs::write(source.join("concurrent.txt"), "another publisher\n").unwrap();
+        fixture_git(&source, &["add", "."]);
+        fixture_git(&source, &["commit", "--quiet", "-m", "concurrent publish"]);
+        let concurrent = git_text(&source, ["rev-parse", "HEAD"], Duration::from_secs(5)).unwrap();
+        fixture_git(
+            &source,
+            &["push", remote.to_str().unwrap(), "HEAD:refs/heads/race"],
+        );
+        fixture_git(
+            &remote,
+            &["update-ref", "refs/heads/main", concurrent.as_str()],
+        );
+        assert_eq!(
+            candidate
+                .recover_publication(&persisted, &publish_request, Duration::from_secs(5))
+                .unwrap(),
+            PublicationRecovery::Ambiguous {
+                target_ref: "refs/heads/main".into(),
+                expected_target: target.clone(),
+                actual_commit: concurrent,
+            }
+        );
         fixture_git(&candidate.path, &["reset", "--hard", base.as_str()]);
         assert!(matches!(
             candidate.verify(Duration::from_secs(5)),

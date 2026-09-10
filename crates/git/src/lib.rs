@@ -16,6 +16,8 @@ use std::{
 use thiserror::Error;
 use wait_timeout::ChildExt;
 
+use reccursive_capture::{SnapshotError, SnapshotPackage};
+
 pub const MAX_CAPTURED_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
@@ -81,6 +83,12 @@ pub enum GitError {
     },
     #[error("managed clone path already exists: {}", .0.display())]
     ManagedPathExists(PathBuf),
+    #[error("snapshot package could not be verified: {0}")]
+    Snapshot(#[from] SnapshotError),
+    #[error("candidate snapshot {component} differs from its authenticated manifest")]
+    CandidateSnapshotMismatch { component: &'static str },
+    #[error("Git returned non-UTF-8 output where a path was required")]
+    NonUtf8Output,
 }
 
 pub struct GitRunner;
@@ -233,6 +241,156 @@ impl ManagedClone {
         )?;
         Ok(destination)
     }
+
+    /// Creates a detached release workspace at the current target and imports one verified
+    /// snapshot under a daemon-owned ref. No change is applied until `apply_snapshot` is called.
+    pub fn prepare_candidate_workspace(
+        &self,
+        destination: impl Into<PathBuf>,
+        target_commit: &str,
+        snapshot: &SnapshotPackage,
+        timeout: Duration,
+    ) -> Result<CandidateWorkspace, GitError> {
+        let snapshot = SnapshotPackage::open(snapshot.path.clone())?;
+        let path = self.create_release_workspace(destination, target_commit, timeout)?;
+        let snapshot_ref = format!(
+            "refs/reccursive/snapshots/{}/{}",
+            snapshot.manifest.package_id,
+            snapshot.manifest.revision.get()
+        );
+        let imported_ref = format!(
+            "refs/reccursive/candidates/{}/{}",
+            snapshot.manifest.package_id,
+            snapshot.manifest.revision.get()
+        );
+        GitRunner::run(
+            &GitInvocation::new(
+                &path,
+                vec![
+                    OsString::from("fetch"),
+                    OsString::from("--no-tags"),
+                    snapshot.path.join("objects.bundle").into_os_string(),
+                    OsString::from(format!("{snapshot_ref}:{imported_ref}")),
+                ],
+                timeout,
+            )?,
+            &CancellationToken::default(),
+        )?;
+        if git_text(&path, ["rev-parse", imported_ref.as_str()], timeout)?
+            != snapshot.manifest.snapshot_commit
+        {
+            return Err(GitError::CandidateSnapshotMismatch {
+                component: "commit",
+            });
+        }
+        let snapshot_tree = format!("{imported_ref}^{{tree}}");
+        if git_text(&path, ["rev-parse", snapshot_tree.as_str()], timeout)?
+            != snapshot.manifest.result_tree
+        {
+            return Err(GitError::CandidateSnapshotMismatch { component: "tree" });
+        }
+        let snapshot_parent = format!("{imported_ref}^");
+        if git_text(&path, ["rev-parse", snapshot_parent.as_str()], timeout)?
+            != snapshot.manifest.base_commit
+        {
+            return Err(GitError::CandidateSnapshotMismatch {
+                component: "base commit",
+            });
+        }
+        let resolved_target = git_text(&path, ["rev-parse", "HEAD"], timeout)?;
+        Ok(CandidateWorkspace {
+            path,
+            target_commit: resolved_target,
+            snapshot_commit: snapshot.manifest.snapshot_commit,
+            snapshot_ref: imported_ref,
+        })
+    }
+}
+
+/// A temporary, detached release workspace. Applying the snapshot changes its index and worktree
+/// but does not create a commit, allowing conflict and dependency checks to run first.
+#[derive(Clone, Debug)]
+pub struct CandidateWorkspace {
+    pub path: PathBuf,
+    pub target_commit: String,
+    pub snapshot_commit: String,
+    snapshot_ref: String,
+}
+
+/// Result of attempting to apply a snapshot to a candidate workspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CandidateApplyOutcome {
+    /// The captured delta is staged and ready for verification; no commit was created.
+    Applied { staged_tree: String },
+    /// Git found unmerged paths. The workspace remains available for later reconciliation.
+    Conflicted { paths: Vec<String> },
+}
+
+impl CandidateWorkspace {
+    /// Applies the captured delta to the current target without committing it.
+    ///
+    /// If Git reports a conflict, the workspace is intentionally retained for reconciliation.
+    pub fn apply_snapshot(&self, timeout: Duration) -> Result<CandidateApplyOutcome, GitError> {
+        match GitRunner::run(
+            &GitInvocation::new(
+                &self.path,
+                ["cherry-pick", "--no-commit", self.snapshot_ref.as_str()],
+                timeout,
+            )?,
+            &CancellationToken::default(),
+        ) {
+            Ok(_) => Ok(CandidateApplyOutcome::Applied {
+                staged_tree: self.staged_tree(timeout)?,
+            }),
+            Err(error) => {
+                let paths = self.unmerged_paths(timeout)?;
+                if paths.is_empty() {
+                    Err(error)
+                } else {
+                    Ok(CandidateApplyOutcome::Conflicted { paths })
+                }
+            }
+        }
+    }
+
+    /// Returns the candidate tree currently staged in this workspace.
+    pub fn staged_tree(&self, timeout: Duration) -> Result<String, GitError> {
+        git_text(&self.path, ["write-tree"], timeout)
+    }
+
+    fn unmerged_paths(&self, timeout: Duration) -> Result<Vec<String>, GitError> {
+        let output = GitRunner::run(
+            &GitInvocation::new(
+                &self.path,
+                ["diff", "--name-only", "--diff-filter=U", "-z"],
+                timeout,
+            )?,
+            &CancellationToken::default(),
+        )?;
+        let mut paths = output
+            .stdout
+            .split(|byte| *byte == b'\0')
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8(path.to_vec()).map_err(|_| GitError::NonUtf8Output))
+            .collect::<Result<Vec<_>, _>>()?;
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+}
+
+fn git_text(
+    path: &std::path::Path,
+    arguments: impl IntoIterator<Item = impl Into<OsString>>,
+    timeout: Duration,
+) -> Result<String, GitError> {
+    let output = GitRunner::run(
+        &GitInvocation::new(path, arguments, timeout)?,
+        &CancellationToken::default(),
+    )?;
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| GitError::NonUtf8Output)
 }
 
 fn read_bounded(mut reader: impl Read) -> (Vec<u8>, bool) {
@@ -257,7 +415,22 @@ fn read_bounded(mut reader: impl Read) -> (Vec<u8>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reccursive_capture::{ContentValidationPolicy, SnapshotRequest};
+    use reccursive_core::{FeatureId, PackageId, Revision, TaskId};
     use tempfile::tempdir;
+
+    fn fixture_git(path: &std::path::Path, arguments: &[&str]) {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(arguments)
+                .status()
+                .unwrap()
+                .success(),
+            "fixture Git command failed: {arguments:?}"
+        );
+    }
     #[test]
     fn argument_is_not_interpreted_by_a_shell() {
         let dir = tempdir().unwrap();
@@ -362,5 +535,196 @@ mod tests {
             )
             .unwrap();
         assert!(workspace.join("file").exists());
+    }
+
+    #[test]
+    fn candidate_applies_a_verified_snapshot_to_the_latest_target_without_committing() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let remote = root.path().join("remote.git");
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "init",
+                    "--quiet",
+                    "--initial-branch=main",
+                    source.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fixture_git(&source, &["config", "user.name", "Fixture"]);
+        fixture_git(
+            &source,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(source.join("file.txt"), "base\n").unwrap();
+        fixture_git(&source, &["add", "."]);
+        fixture_git(&source, &["commit", "--quiet", "-m", "base"]);
+        let base = git_text(&source, ["rev-parse", "HEAD"], Duration::from_secs(5)).unwrap();
+
+        std::fs::write(source.join("file.txt"), "captured change\n").unwrap();
+        let snapshot = SnapshotPackage::capture(SnapshotRequest {
+            package_id: PackageId::new(),
+            revision: Revision::FIRST,
+            feature_id: FeatureId::new(),
+            plan_revision: Revision::FIRST,
+            task_ids: [TaskId::new()].into(),
+            workspace: &source,
+            package_root: &root.path().join("packages"),
+            expected_base_commit: &base,
+            validation_policy: ContentValidationPolicy::default(),
+        })
+        .unwrap();
+
+        std::fs::write(source.join("file.txt"), "base\n").unwrap();
+        std::fs::write(source.join("target-only.txt"), "new target work\n").unwrap();
+        fixture_git(&source, &["add", "."]);
+        fixture_git(&source, &["commit", "--quiet", "-m", "advance target"]);
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "clone",
+                    "--quiet",
+                    "--bare",
+                    source.to_str().unwrap(),
+                    remote.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let target = git_text(&source, ["rev-parse", "HEAD"], Duration::from_secs(5)).unwrap();
+        let target_tree = git_text(
+            &source,
+            ["rev-parse", "HEAD^{tree}"],
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        let mirror = ManagedClone::provision(
+            remote.to_str().unwrap(),
+            root.path().join("mirror.git"),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let candidate = mirror
+            .prepare_candidate_workspace(
+                root.path().join("candidate"),
+                &target,
+                &snapshot,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        let outcome = candidate.apply_snapshot(Duration::from_secs(5)).unwrap();
+
+        assert_eq!(candidate.target_commit, target);
+        assert_eq!(candidate.snapshot_commit, snapshot.manifest.snapshot_commit);
+        assert_eq!(
+            std::fs::read_to_string(candidate.path.join("file.txt")).unwrap(),
+            "captured change\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(candidate.path.join("target-only.txt")).unwrap(),
+            "new target work\n"
+        );
+        assert_ne!(
+            candidate.staged_tree(Duration::from_secs(5)).unwrap(),
+            target_tree
+        );
+        assert!(matches!(outcome, CandidateApplyOutcome::Applied { .. }));
+        assert_eq!(
+            git_text(
+                &candidate.path,
+                ["rev-parse", "HEAD"],
+                Duration::from_secs(5)
+            )
+            .unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn candidate_reports_unmerged_paths_and_retains_the_workspace() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let remote = root.path().join("remote.git");
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "init",
+                    "--quiet",
+                    "--initial-branch=main",
+                    source.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fixture_git(&source, &["config", "user.name", "Fixture"]);
+        fixture_git(
+            &source,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(source.join("file.txt"), "base\n").unwrap();
+        fixture_git(&source, &["add", "."]);
+        fixture_git(&source, &["commit", "--quiet", "-m", "base"]);
+        let base = git_text(&source, ["rev-parse", "HEAD"], Duration::from_secs(5)).unwrap();
+
+        std::fs::write(source.join("file.txt"), "captured change\n").unwrap();
+        let snapshot = SnapshotPackage::capture(SnapshotRequest {
+            package_id: PackageId::new(),
+            revision: Revision::FIRST,
+            feature_id: FeatureId::new(),
+            plan_revision: Revision::FIRST,
+            task_ids: [TaskId::new()].into(),
+            workspace: &source,
+            package_root: &root.path().join("packages"),
+            expected_base_commit: &base,
+            validation_policy: ContentValidationPolicy::default(),
+        })
+        .unwrap();
+
+        std::fs::write(source.join("file.txt"), "target change\n").unwrap();
+        fixture_git(&source, &["add", "."]);
+        fixture_git(&source, &["commit", "--quiet", "-m", "advance target"]);
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "clone",
+                    "--quiet",
+                    "--bare",
+                    source.to_str().unwrap(),
+                    remote.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let target = git_text(&source, ["rev-parse", "HEAD"], Duration::from_secs(5)).unwrap();
+        let mirror = ManagedClone::provision(
+            remote.to_str().unwrap(),
+            root.path().join("mirror.git"),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let candidate = mirror
+            .prepare_candidate_workspace(
+                root.path().join("candidate"),
+                &target,
+                &snapshot,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+
+        assert_eq!(
+            candidate.apply_snapshot(Duration::from_secs(5)).unwrap(),
+            CandidateApplyOutcome::Conflicted {
+                paths: vec!["file.txt".into()]
+            }
+        );
+        assert!(candidate.path.join(".git").exists());
+        assert!(candidate.path.join("file.txt").exists());
     }
 }

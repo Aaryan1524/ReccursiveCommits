@@ -8,10 +8,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+reccursive-capture = { path = "../capture" }
 thiserror.workspace = true
 wait-timeout.workspace = true
 
 [dev-dependencies]
+reccursive-core = { path = "../core" }
 tempfile = "3.0"
 
 [lints]

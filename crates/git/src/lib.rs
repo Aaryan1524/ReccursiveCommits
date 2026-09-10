@@ -87,6 +87,8 @@ pub enum GitError {
     Snapshot(#[from] SnapshotError),
     #[error("candidate snapshot {component} differs from its authenticated manifest")]
     CandidateSnapshotMismatch { component: &'static str },
+    #[error("Git returned non-UTF-8 output where a path was required")]
+    NonUtf8Output,
 }
 
 pub struct GitRunner;
@@ -315,25 +317,65 @@ pub struct CandidateWorkspace {
     snapshot_ref: String,
 }
 
+/// Result of attempting to apply a snapshot to a candidate workspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CandidateApplyOutcome {
+    /// The captured delta is staged and ready for verification; no commit was created.
+    Applied { staged_tree: String },
+    /// Git found unmerged paths. The workspace remains available for later reconciliation.
+    Conflicted { paths: Vec<String> },
+}
+
 impl CandidateWorkspace {
     /// Applies the captured delta to the current target without committing it.
     ///
     /// If Git reports a conflict, the workspace is intentionally retained for reconciliation.
-    pub fn apply_snapshot(&self, timeout: Duration) -> Result<(), GitError> {
-        GitRunner::run(
+    pub fn apply_snapshot(&self, timeout: Duration) -> Result<CandidateApplyOutcome, GitError> {
+        match GitRunner::run(
             &GitInvocation::new(
                 &self.path,
                 ["cherry-pick", "--no-commit", self.snapshot_ref.as_str()],
                 timeout,
             )?,
             &CancellationToken::default(),
-        )?;
-        Ok(())
+        ) {
+            Ok(_) => Ok(CandidateApplyOutcome::Applied {
+                staged_tree: self.staged_tree(timeout)?,
+            }),
+            Err(error) => {
+                let paths = self.unmerged_paths(timeout)?;
+                if paths.is_empty() {
+                    Err(error)
+                } else {
+                    Ok(CandidateApplyOutcome::Conflicted { paths })
+                }
+            }
+        }
     }
 
     /// Returns the candidate tree currently staged in this workspace.
     pub fn staged_tree(&self, timeout: Duration) -> Result<String, GitError> {
         git_text(&self.path, ["write-tree"], timeout)
+    }
+
+    fn unmerged_paths(&self, timeout: Duration) -> Result<Vec<String>, GitError> {
+        let output = GitRunner::run(
+            &GitInvocation::new(
+                &self.path,
+                ["diff", "--name-only", "--diff-filter=U", "-z"],
+                timeout,
+            )?,
+            &CancellationToken::default(),
+        )?;
+        let mut paths = output
+            .stdout
+            .split(|byte| *byte == b'\0')
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8(path.to_vec()).map_err(|_| GitError::NonUtf8Output))
+            .collect::<Result<Vec<_>, _>>()?;
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
     }
 }
 
@@ -348,10 +390,7 @@ fn git_text(
     )?;
     String::from_utf8(output.stdout)
         .map(|value| value.trim().to_owned())
-        .map_err(|_| GitError::Failed {
-            status: None,
-            message: "Git returned non-UTF-8 output".into(),
-        })
+        .map_err(|_| GitError::NonUtf8Output)
 }
 
 fn read_bounded(mut reader: impl Read) -> (Vec<u8>, bool) {
@@ -578,7 +617,7 @@ mod tests {
                 Duration::from_secs(5),
             )
             .unwrap();
-        candidate.apply_snapshot(Duration::from_secs(5)).unwrap();
+        let outcome = candidate.apply_snapshot(Duration::from_secs(5)).unwrap();
 
         assert_eq!(candidate.target_commit, target);
         assert_eq!(candidate.snapshot_commit, snapshot.manifest.snapshot_commit);
@@ -594,6 +633,7 @@ mod tests {
             candidate.staged_tree(Duration::from_secs(5)).unwrap(),
             target_tree
         );
+        assert!(matches!(outcome, CandidateApplyOutcome::Applied { .. }));
         assert_eq!(
             git_text(
                 &candidate.path,
@@ -603,5 +643,88 @@ mod tests {
             .unwrap(),
             target
         );
+    }
+
+    #[test]
+    fn candidate_reports_unmerged_paths_and_retains_the_workspace() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let remote = root.path().join("remote.git");
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "init",
+                    "--quiet",
+                    "--initial-branch=main",
+                    source.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fixture_git(&source, &["config", "user.name", "Fixture"]);
+        fixture_git(
+            &source,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(source.join("file.txt"), "base\n").unwrap();
+        fixture_git(&source, &["add", "."]);
+        fixture_git(&source, &["commit", "--quiet", "-m", "base"]);
+        let base = git_text(&source, ["rev-parse", "HEAD"], Duration::from_secs(5)).unwrap();
+
+        std::fs::write(source.join("file.txt"), "captured change\n").unwrap();
+        let snapshot = SnapshotPackage::capture(SnapshotRequest {
+            package_id: PackageId::new(),
+            revision: Revision::FIRST,
+            feature_id: FeatureId::new(),
+            plan_revision: Revision::FIRST,
+            task_ids: [TaskId::new()].into(),
+            workspace: &source,
+            package_root: &root.path().join("packages"),
+            expected_base_commit: &base,
+            validation_policy: ContentValidationPolicy::default(),
+        })
+        .unwrap();
+
+        std::fs::write(source.join("file.txt"), "target change\n").unwrap();
+        fixture_git(&source, &["add", "."]);
+        fixture_git(&source, &["commit", "--quiet", "-m", "advance target"]);
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "clone",
+                    "--quiet",
+                    "--bare",
+                    source.to_str().unwrap(),
+                    remote.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let target = git_text(&source, ["rev-parse", "HEAD"], Duration::from_secs(5)).unwrap();
+        let mirror = ManagedClone::provision(
+            remote.to_str().unwrap(),
+            root.path().join("mirror.git"),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let candidate = mirror
+            .prepare_candidate_workspace(
+                root.path().join("candidate"),
+                &target,
+                &snapshot,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+
+        assert_eq!(
+            candidate.apply_snapshot(Duration::from_secs(5)).unwrap(),
+            CandidateApplyOutcome::Conflicted {
+                paths: vec!["file.txt".into()]
+            }
+        );
+        assert!(candidate.path.join(".git").exists());
+        assert!(candidate.path.join("file.txt").exists());
     }
 }

@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::{ContentValidationPolicy, ContentViolation};
+
 const SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 const BUNDLE_FILE: &str = "objects.bundle";
 const MANIFEST_FILE: &str = "manifest.json";
@@ -27,6 +29,7 @@ pub struct SnapshotRequest<'a> {
     pub workspace: &'a Path,
     pub package_root: &'a Path,
     pub expected_base_commit: &'a str,
+    pub validation_policy: ContentValidationPolicy,
 }
 
 /// Portable metadata authenticated together with the Git object bundle.
@@ -88,6 +91,12 @@ impl SnapshotPackage {
             git_with_index(request.workspace, &index, ["read-tree", "HEAD"])?;
             git_with_index(request.workspace, &index, ["add", "-A", "--", "."])?;
             let result_tree = git_text_with_index(request.workspace, &index, ["write-tree"])?;
+            validate_result_tree(
+                request.workspace,
+                &base_tree,
+                &result_tree,
+                &request.validation_policy,
+            )?;
             let snapshot_commit = git_commit_tree(request.workspace, &result_tree, &actual_head)?;
             let snapshot_ref = format!(
                 "refs/reccursive/snapshots/{}/{}",
@@ -387,6 +396,76 @@ fn git_commit_tree(workspace: &Path, tree: &str, parent: &str) -> Result<String,
     command_output(command)
 }
 
+fn validate_result_tree(
+    workspace: &Path,
+    base_tree: &str,
+    result_tree: &str,
+    policy: &ContentValidationPolicy,
+) -> Result<(), SnapshotError> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(workspace).args([
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-r",
+        "-z",
+        base_tree,
+        result_tree,
+    ]);
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(SnapshotError::Git {
+            command: format!("{command:?}"),
+            message: String::from_utf8_lossy(&output.stderr).trim().into(),
+        });
+    }
+    let mut violations = Vec::new();
+    for raw_path in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = String::from_utf8_lossy(raw_path).into_owned();
+        let object = format!("{result_tree}:{path}");
+        let mut size_command = Command::new("git");
+        size_command
+            .arg("-C")
+            .arg(workspace)
+            .args(["cat-file", "-s", &object]);
+        let size_output = size_command.output()?;
+        if !size_output.status.success() {
+            continue;
+        }
+        let size = String::from_utf8_lossy(&size_output.stdout)
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| SnapshotError::InvalidObjectId {
+                value: object.clone(),
+            })?;
+        let bytes = if size <= policy.secret_scan_max_bytes {
+            let mut blob_command = Command::new("git");
+            blob_command
+                .arg("-C")
+                .arg(workspace)
+                .args(["cat-file", "blob", &object]);
+            let blob_output = blob_command.output()?;
+            if blob_output.status.success() {
+                Some(blob_output.stdout)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        violations.extend(policy.validate_path(&path, size, bytes.as_deref()));
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(SnapshotError::ContentBlocked { violations })
+    }
+}
+
 fn git_with_index<const N: usize>(
     workspace: &Path,
     index: &Path,
@@ -456,6 +535,8 @@ fn command_output(mut command: Command) -> Result<String, SnapshotError> {
 /// Immutable snapshot creation or verification failure.
 #[derive(Debug, Error)]
 pub enum SnapshotError {
+    #[error("capture content validation blocked {} item(s)", violations.len())]
+    ContentBlocked { violations: Vec<ContentViolation> },
     #[error("snapshot must contain at least one task")]
     NoTasks,
     #[error("invalid full Git object ID: {value:?}")]
@@ -528,6 +609,7 @@ mod tests {
             workspace: &workspace,
             package_root: &root.path().join("packages"),
             expected_base_commit: &base,
+            validation_policy: ContentValidationPolicy::default(),
         })
         .unwrap();
         let reopened = SnapshotPackage::open(package.path.clone()).unwrap();
@@ -576,5 +658,25 @@ mod tests {
                 component: "bundle"
             })
         ));
+
+        fs::write(
+            workspace.join(".env"),
+            "API_KEY=sk-this-must-not-appear-in-errors-123456\n",
+        )
+        .unwrap();
+        let error = SnapshotPackage::capture(SnapshotRequest {
+            package_id: PackageId::new(),
+            revision: Revision::FIRST,
+            feature_id: FeatureId::new(),
+            plan_revision: Revision::FIRST,
+            task_ids: [TaskId::new()].into(),
+            workspace: &workspace,
+            package_root: &root.path().join("packages"),
+            expected_base_commit: &base,
+            validation_policy: ContentValidationPolicy::default(),
+        })
+        .unwrap_err();
+        assert!(matches!(error, SnapshotError::ContentBlocked { .. }));
+        assert!(!error.to_string().contains("sk-this-must-not-appear"));
     }
 }

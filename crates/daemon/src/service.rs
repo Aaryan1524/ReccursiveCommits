@@ -13,8 +13,8 @@ use std::{
 };
 
 use reccursive_capture::{
-    OwnedWorkspace, PrerequisiteState, SnapshotError, SnapshotPackage, SnapshotRequest,
-    WorkspaceError, WorkspaceRequest as CaptureWorkspaceRequest,
+    ContentValidationPolicy, OwnedWorkspace, PrerequisiteState, SnapshotError, SnapshotPackage,
+    SnapshotRequest, WorkspaceError, WorkspaceRequest as CaptureWorkspaceRequest,
 };
 use reccursive_protocol::{
     ApiError, ApiErrorCode, AuthToken, CapturePackageRequest, Command, CreateWorkspaceRequest,
@@ -1224,6 +1224,7 @@ fn capture_package(
         workspace: &workspace.path,
         package_root,
         expected_base_commit: &workspace.base_commit,
+        validation_policy: ContentValidationPolicy::default(),
     })
     .map_err(snapshot_api_error)?;
     let created_at_unix_ms = current_unix_ms()?;
@@ -1325,6 +1326,7 @@ fn snapshot_api_error(error: SnapshotError) -> ApiError {
         SnapshotError::HashMismatch { .. }
         | SnapshotError::TreeMismatch { .. }
         | SnapshotError::UnsupportedSchema { .. } => ApiErrorCode::Internal,
+        SnapshotError::ContentBlocked { .. } => ApiErrorCode::InvalidRequest,
         _ => ApiErrorCode::InvalidRequest,
     };
     ApiError::new(

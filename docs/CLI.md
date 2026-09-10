@@ -61,6 +61,11 @@ minified JavaScript, files larger than 10 MiB, and several high-confidence priva
 key, GitHub, AWS, and API-key patterns. A failure identifies the rule and the
 repository-relative path only; it never returns matched secret content.
 
+Capture also runs daemon-owned trusted checks in the isolated workspace. New
+repositories receive `git diff --check {base_commit}` with a 30-second limit;
+the command and its result are stored separately from agent output and package
+metadata. A failed or timed-out check blocks capture after recording evidence.
+
 `queue audit` reconciles crash evidence with durable state. A fully authenticated
 package that was written before its database row is re-registered, and a complete
 partial directory is promoted atomically. Incomplete, invalid, missing, or unsafe

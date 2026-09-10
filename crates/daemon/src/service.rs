@@ -27,12 +27,13 @@ use reccursive_protocol::{
 use reccursive_store::{
     DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, RepositoryRegistration,
     SnapshotRecord, SnapshotRecoveryIssue, Store, StoreError, StoredEvent, StoredPlan,
-    StoredRepository, WorkspaceRecord,
+    StoredRepository, TrustedCheck, ValidationEvidence, WorkspaceRecord,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
+use wait_timeout::ChildExt;
 
 /// Files owned by one daemon installation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1249,8 +1250,87 @@ fn capture_package(
     lock_store(store)?
         .record_snapshot(&record)
         .map_err(store_api_error)?;
+    let checks = lock_store(store)?
+        .trusted_checks(plan.repository_id)
+        .map_err(store_api_error)?;
+    let mut failed_check = None;
+    for check in checks.into_iter().filter(|check| check.enabled) {
+        let evidence = run_trusted_check(&check, &workspace, package.manifest.package_id)?;
+        let passed = evidence.exit_code == Some(0) && !evidence.timed_out;
+        lock_store(store)?
+            .record_validation_evidence(&evidence)
+            .map_err(store_api_error)?;
+        if !passed {
+            failed_check = Some(check.id);
+            break;
+        }
+    }
+    if let Some(check_id) = failed_check {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            format!(
+                "trusted check {check_id} failed for captured package {}; inspect daemon logs",
+                package.manifest.package_id
+            ),
+            false,
+        ));
+    }
     Ok(ResponseData::PackageCaptured {
         package: package_view(record, package.manifest)?,
+    })
+}
+
+fn run_trusted_check(
+    check: &TrustedCheck,
+    workspace: &WorkspaceRecord,
+    package_id: reccursive_protocol::PackageId,
+) -> Result<ValidationEvidence, ApiError> {
+    let command: Vec<_> = check
+        .command
+        .iter()
+        .map(|argument| argument.replace("{base_commit}", &workspace.base_commit))
+        .collect();
+    let mut process = std::process::Command::new(&command[0]);
+    process.args(&command[1..]).current_dir(&workspace.path);
+    let mut child = process.spawn().map_err(|_| {
+        ApiError::new(
+            ApiErrorCode::TemporarilyUnavailable,
+            "trusted check could not be started",
+            true,
+        )
+    })?;
+    let status = child
+        .wait_timeout(std::time::Duration::from_secs(u64::from(
+            check.timeout_seconds,
+        )))
+        .map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::TemporarilyUnavailable,
+                "trusted check could not be observed",
+                true,
+            )
+        })?;
+    let (exit_code, timed_out, output_summary) = match status {
+        Some(status) => (status.code(), false, String::new()),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            (
+                None,
+                true,
+                "trusted check exceeded its configured timeout".into(),
+            )
+        }
+    };
+    Ok(ValidationEvidence {
+        package_id,
+        revision: Revision::FIRST,
+        check_id: check.id.clone(),
+        command,
+        exit_code,
+        timed_out,
+        output_summary: reccursive_store::redact_text(&output_summary),
+        executed_at_unix_ms: current_unix_ms()?,
     })
 }
 
@@ -1375,6 +1455,20 @@ fn enroll_repository(
     let mut store = lock_store(store)?;
     store
         .enroll_repository(&registration, &policy)
+        .map_err(store_api_error)?;
+    store
+        .add_trusted_check(&TrustedCheck {
+            repository_id,
+            id: "git_diff_check".into(),
+            command: vec![
+                "git".into(),
+                "diff".into(),
+                "--check".into(),
+                "{base_commit}".into(),
+            ],
+            timeout_seconds: 30,
+            enabled: true,
+        })
         .map_err(store_api_error)?;
     Ok(ResponseData::RepositoryEnrolled {
         repository: repository_view(StoredRepository {

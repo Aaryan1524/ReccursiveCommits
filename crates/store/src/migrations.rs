@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 6;
+pub const STORAGE_SCHEMA_VERSION: u32 = 7;
 
 struct Migration {
     version: u32,
@@ -227,6 +227,33 @@ const MIGRATIONS: &[Migration] = &[
         CREATE INDEX idx_snapshot_recovery_issues_last_seen
             ON snapshot_recovery_issues(last_seen_at_unix_ms DESC);
         "#,
+    },
+    Migration {
+        version: 7,
+        sql: r#"
+        CREATE TABLE trusted_checks (
+            repository_id TEXT NOT NULL,
+            check_id TEXT NOT NULL,
+            command_json TEXT NOT NULL CHECK (json_valid(command_json)),
+            timeout_seconds INTEGER NOT NULL CHECK (timeout_seconds BETWEEN 1 AND 3600),
+            enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+            PRIMARY KEY (repository_id, check_id),
+            FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+        );
+        CREATE TABLE validation_evidence (
+            package_id TEXT NOT NULL,
+            package_revision INTEGER NOT NULL CHECK (package_revision > 0),
+            check_id TEXT NOT NULL,
+            command_json TEXT NOT NULL CHECK (json_valid(command_json)),
+            exit_code INTEGER,
+            timed_out INTEGER NOT NULL CHECK (timed_out IN (0, 1)),
+            output_summary TEXT NOT NULL,
+            executed_at_unix_ms INTEGER NOT NULL CHECK (executed_at_unix_ms >= 0),
+            PRIMARY KEY (package_id, package_revision, check_id),
+            FOREIGN KEY (package_id, package_revision)
+                REFERENCES snapshot_packages(package_id, revision) ON DELETE CASCADE
+        );
+    "#,
     },
 ];
 

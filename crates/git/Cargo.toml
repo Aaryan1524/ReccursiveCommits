@@ -1,0 +1,18 @@
+[package]
+name = "reccursive-git"
+description = "Safe noninteractive Git process adapter for ReccursiveCommits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+wait-timeout.workspace = true
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[lints]
+workspace = true

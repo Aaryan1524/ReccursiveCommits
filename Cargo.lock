@@ -436,6 +436,8 @@ dependencies = [
 name = "reccursive-git"
 version = "0.1.0"
 dependencies = [
+ "reccursive-capture",
+ "reccursive-core",
  "tempfile",
  "thiserror",
  "wait-timeout",

@@ -54,6 +54,12 @@ prerequisites, and duplicate ownership are rejected rather than guessed.
 tasks. The immutable package contains a self-contained Git object bundle plus an
 authenticated manifest with exact base/result trees. `package show` recalculates
 the bundle and manifest hashes before returning metadata; corruption is an error.
+Before the package is created, capture validates the exact prospective Git tree.
+The current default policy blocks `.env` paths, generated output under
+`node_modules/`, `target/`, `dist/`, `build/`, and `coverage/`, source maps and
+minified JavaScript, files larger than 10 MiB, and several high-confidence private
+key, GitHub, AWS, and API-key patterns. A failure identifies the rule and the
+repository-relative path only; it never returns matched secret content.
 
 `queue audit` reconciles crash evidence with durable state. A fully authenticated
 package that was written before its database row is re-registered, and a complete

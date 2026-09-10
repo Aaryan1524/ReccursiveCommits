@@ -279,6 +279,8 @@ const MIGRATIONS: &[Migration] = &[
             )),
             reason_json TEXT CHECK (reason_json IS NULL OR json_valid(reason_json)),
             blocked_from TEXT,
+            failed_attempts INTEGER NOT NULL DEFAULT 0
+                CHECK (failed_attempts BETWEEN 0 AND 255),
             lease_owner TEXT NOT NULL CHECK (length(trim(lease_owner)) > 0),
             lease_expires_at_unix_ms INTEGER NOT NULL CHECK (lease_expires_at_unix_ms >= 0),
             created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
@@ -302,14 +304,21 @@ const MIGRATIONS: &[Migration] = &[
         );
 
         -- Invariant 4: one live attempt owns a given managed remote and target at a time.
-        -- Blocked attempts release the target so unrelated eligible units are not starved.
+        -- An attempt blocked before its push releases the target, so a unit paused for manual
+        -- resolution does not starve unrelated eligible work on the same branch. An attempt
+        -- blocked at or after its push keeps the target: its commit may already be on the remote,
+        -- and letting a second attempt build a fresh candidate is how duplicates are created.
         CREATE UNIQUE INDEX idx_release_attempts_live_target
             ON release_attempts(repository_id, target_remote, target_ref)
-            WHERE status NOT IN ('published', 'cancelled', 'superseded', 'blocked');
+            WHERE status IN ('scheduled', 'reconciling', 'verifying', 'commit_prepared',
+                             'push_pending', 'remote_confirmed')
+               OR (status = 'blocked'
+                   AND blocked_from IN ('push_pending', 'remote_confirmed'));
 
-        -- Invariant 6: restart must find attempts whose remote outcome is still unknown.
+        -- Invariant 6: restart must find attempts whose remote outcome is still unknown,
+        -- including one that blocked while its push was in flight.
         CREATE INDEX idx_release_attempts_unresolved
-            ON release_attempts(status, updated_at_unix_ms);
+            ON release_attempts(status, blocked_from, updated_at_unix_ms);
 
         CREATE INDEX idx_release_attempts_package
             ON release_attempts(package_id, package_revision, created_at_unix_ms);

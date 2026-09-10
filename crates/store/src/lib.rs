@@ -1,5 +1,6 @@
 //! Durable local persistence boundary.
 
+mod attempts;
 mod checks;
 mod events;
 mod migrations;
@@ -15,6 +16,7 @@ use std::{
     time::Duration,
 };
 
+pub use attempts::{AttemptLease, NewReleaseAttempt, ReleaseAttempt};
 pub use checks::{TrustedCheck, ValidationEvidence};
 pub use events::{DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, StoredEvent};
 pub use migrations::STORAGE_SCHEMA_VERSION;

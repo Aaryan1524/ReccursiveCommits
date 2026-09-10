@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 7;
+pub const STORAGE_SCHEMA_VERSION: u32 = 8;
 
 struct Migration {
     version: u32,
@@ -254,6 +254,66 @@ const MIGRATIONS: &[Migration] = &[
                 REFERENCES snapshot_packages(package_id, revision) ON DELETE CASCADE
         );
     "#,
+    },
+    Migration {
+        version: 8,
+        sql: r#"
+        CREATE TABLE release_attempts (
+            attempt_id TEXT PRIMARY KEY CHECK (length(trim(attempt_id)) > 0),
+            repository_id TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            package_revision INTEGER NOT NULL CHECK (package_revision > 0),
+            target_remote TEXT NOT NULL CHECK (length(trim(target_remote)) > 0),
+            target_ref TEXT NOT NULL CHECK (target_ref LIKE 'refs/heads/_%'),
+            base_commit TEXT NOT NULL CHECK (length(base_commit) = 40),
+            candidate_sha TEXT CHECK (candidate_sha IS NULL OR length(candidate_sha) = 40),
+            push_intent_at_unix_ms INTEGER
+                CHECK (push_intent_at_unix_ms IS NULL OR push_intent_at_unix_ms >= 0),
+            observed_remote_sha TEXT
+                CHECK (observed_remote_sha IS NULL OR length(observed_remote_sha) = 40),
+            failure_classification TEXT
+                CHECK (failure_classification IS NULL OR length(trim(failure_classification)) > 0),
+            status TEXT NOT NULL CHECK (status IN (
+                'scheduled', 'reconciling', 'verifying', 'commit_prepared', 'push_pending',
+                'remote_confirmed', 'published', 'blocked', 'cancelled', 'superseded'
+            )),
+            reason_json TEXT CHECK (reason_json IS NULL OR json_valid(reason_json)),
+            blocked_from TEXT,
+            lease_owner TEXT NOT NULL CHECK (length(trim(lease_owner)) > 0),
+            lease_expires_at_unix_ms INTEGER NOT NULL CHECK (lease_expires_at_unix_ms >= 0),
+            created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+            updated_at_unix_ms INTEGER NOT NULL
+                CHECK (updated_at_unix_ms >= created_at_unix_ms),
+
+            -- Invariant 5: a state that may have transmitted a push always has a durable
+            -- candidate commit and a durable push intent recorded before the remote was contacted.
+            CHECK (
+                status NOT IN ('push_pending', 'remote_confirmed', 'published')
+                OR (candidate_sha IS NOT NULL AND push_intent_at_unix_ms IS NOT NULL)
+            ),
+            -- A blocked attempt always keeps the exact state it must resume at.
+            CHECK (
+                (status = 'blocked') = (blocked_from IS NOT NULL)
+            ),
+
+            FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+            FOREIGN KEY (package_id, package_revision)
+                REFERENCES snapshot_packages(package_id, revision) ON DELETE RESTRICT
+        );
+
+        -- Invariant 4: one live attempt owns a given managed remote and target at a time.
+        -- Blocked attempts release the target so unrelated eligible units are not starved.
+        CREATE UNIQUE INDEX idx_release_attempts_live_target
+            ON release_attempts(repository_id, target_remote, target_ref)
+            WHERE status NOT IN ('published', 'cancelled', 'superseded', 'blocked');
+
+        -- Invariant 6: restart must find attempts whose remote outcome is still unknown.
+        CREATE INDEX idx_release_attempts_unresolved
+            ON release_attempts(status, updated_at_unix_ms);
+
+        CREATE INDEX idx_release_attempts_package
+            ON release_attempts(package_id, package_revision, created_at_unix_ms);
+        "#,
     },
 ];
 

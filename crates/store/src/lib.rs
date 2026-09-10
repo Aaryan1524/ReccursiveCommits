@@ -5,6 +5,7 @@ mod migrations;
 mod plans;
 mod redaction;
 mod repository;
+mod snapshots;
 mod workspaces;
 
 use std::{
@@ -19,6 +20,7 @@ pub use plans::StoredPlan;
 pub use redaction::{redact_json, redact_text};
 pub use repository::{RepositoryRegistration, StoredRepository};
 use rusqlite::{Connection, OpenFlags};
+pub use snapshots::SnapshotRecord;
 use thiserror::Error;
 use uuid::Uuid;
 pub use workspaces::WorkspaceRecord;

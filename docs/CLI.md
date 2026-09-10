@@ -23,6 +23,8 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state plan history feature_<
 cargo run -p reccursive-cli -- --state-dir /path/to/state workspace create feature_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state workspace create feature_<uuid> --include src/config.rs
 cargo run -p reccursive-cli -- --state-dir /path/to/state workspace show feature_<uuid> --revision 1
+cargo run -p reccursive-cli -- --state-dir /path/to/state package capture feature_<uuid> --revision 1 --task task_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state package show package_<uuid>
 ```
 
 Pass `--json` for a stable JSON envelope with no prompts or spinners. The
@@ -45,6 +47,11 @@ or index. A dirty file is included only when its repository-relative path is nam
 with `--include`; unmentioned changes remain solely in the user's checkout.
 Renames, copies, unresolved merges, unsafe paths, clean paths presented as dirty
 prerequisites, and duplicate ownership are rejected rather than guessed.
+
+`package capture` snapshots the complete owned workspace for the selected plan
+tasks. The immutable package contains a self-contained Git object bundle plus an
+authenticated manifest with exact base/result trees. `package show` recalculates
+the bundle and manifest hashes before returning metadata; corruption is an error.
 
 ## Exit codes
 

@@ -2,6 +2,7 @@
 
 mod graph;
 mod ids;
+mod lifecycle;
 mod plan;
 mod policy;
 mod release;
@@ -13,6 +14,7 @@ pub use ids::{
     AttemptId, EventId, FeatureId, IdParseError, PackageId, ReleaseUnitId, RepositoryId, RequestId,
     TaskId,
 };
+pub use lifecycle::{LifecycleError, RevisionLifecycle};
 pub use plan::{AcceptanceCheck, FeaturePlan, PLAN_SCHEMA_VERSION, PlanError, PlanPhase, PlanTask};
 pub use policy::{
     PackageError, PackageRevision, PolicyError, PolicyRef, PublicationMode, RepositoryPolicy,

@@ -190,6 +190,46 @@ impl SnapshotPackage {
         Ok(Self { path, manifest })
     }
 
+    /// Copies a verified package into a new empty directory and re-verifies the result.
+    ///
+    /// This deliberately copies only the authenticated manifest and bundle. Mutable build
+    /// workspaces, Git indexes, credentials, and daemon configuration never become part of a
+    /// portable queue export.
+    pub fn copy_verified_to(&self, destination: &Path) -> Result<Self, SnapshotError> {
+        let verified = Self::open(self.path.clone())?;
+        if fs::symlink_metadata(destination).is_ok() {
+            return Err(SnapshotError::AlreadyExists {
+                path: destination.to_path_buf(),
+            });
+        }
+        fs::create_dir(destination)?;
+        let copy_result = (|| {
+            for name in [BUNDLE_FILE, MANIFEST_FILE] {
+                let source = verified.path.join(name);
+                let target = destination.join(name);
+                let mut input = File::open(source)?;
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(target)?;
+                std::io::copy(&mut input, &mut output)?;
+                output.sync_all()?;
+            }
+            sync_directory(destination)?;
+            let copied = Self::open(destination.to_path_buf())?;
+            if copied.manifest != verified.manifest {
+                return Err(SnapshotError::HashMismatch {
+                    component: "copied manifest",
+                });
+            }
+            Ok(copied)
+        })();
+        if copy_result.is_err() {
+            let _ = fs::remove_dir_all(destination);
+        }
+        copy_result
+    }
+
     /// Reconstructs the exact result tree into a new detached Git worktree.
     pub fn reconstruct(&self, destination: &Path) -> Result<(), SnapshotError> {
         let verified = Self::open(self.path.clone())?;
@@ -492,6 +532,14 @@ mod tests {
         .unwrap();
         let reopened = SnapshotPackage::open(package.path.clone()).unwrap();
         assert_eq!(reopened.manifest.result_tree, package.manifest.result_tree);
+
+        let copied = reopened
+            .copy_verified_to(&root.path().join("copied-package"))
+            .unwrap();
+        assert_eq!(copied.manifest, package.manifest);
+        copied
+            .reconstruct(&root.path().join("copied-restored"))
+            .unwrap();
 
         let restored = root.path().join("restored");
         reopened.reconstruct(&restored).unwrap();

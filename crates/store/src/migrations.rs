@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 5;
+pub const STORAGE_SCHEMA_VERSION: u32 = 6;
 
 struct Migration {
     version: u32,
@@ -211,6 +211,21 @@ const MIGRATIONS: &[Migration] = &[
 
         CREATE INDEX idx_snapshot_packages_feature
             ON snapshot_packages(feature_id, plan_revision, created_at_unix_ms);
+        "#,
+    },
+    Migration {
+        version: 6,
+        sql: r#"
+        CREATE TABLE snapshot_recovery_issues (
+            package_path TEXT PRIMARY KEY CHECK (length(package_path) > 0),
+            kind TEXT NOT NULL CHECK (length(trim(kind)) > 0),
+            message TEXT NOT NULL CHECK (length(trim(message)) > 0),
+            first_seen_at_unix_ms INTEGER NOT NULL CHECK (first_seen_at_unix_ms >= 0),
+            last_seen_at_unix_ms INTEGER NOT NULL CHECK (last_seen_at_unix_ms >= 0)
+        );
+
+        CREATE INDEX idx_snapshot_recovery_issues_last_seen
+            ON snapshot_recovery_issues(last_seen_at_unix_ms DESC);
         "#,
     },
 ];

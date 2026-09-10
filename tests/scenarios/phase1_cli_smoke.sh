@@ -145,6 +145,8 @@ grep -q '"code":"conflict"' <<<"$duplicate_json" || \
   fail "duplicate enrollment did not return the conflict error code"
 
 stop_daemon
+package_directory="$fixture_root/state/packages/$package_id"
+mv "$package_directory/revision-1" "$package_directory/.revision-1.partial"
 start_daemon
 status_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" --json status)"
 grep -q '"repository_count":1' <<<"$status_json" || \
@@ -165,6 +167,25 @@ package_after_restart="$("$binary_dir/reccursive" --state-dir "$fixture_root/sta
   --json package show "$package_id")"
 grep -q '"type":"package"' <<<"$package_after_restart" || \
   fail "verified snapshot package did not survive daemon restart"
+[[ -d "$package_directory/revision-1" ]] || \
+  fail "complete partial package was not recovered during daemon startup"
+queue_audit_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" --json queue audit)"
+grep -q '"type":"queue_audit"' <<<"$queue_audit_json" || \
+  fail "queue audit did not return the expected JSON payload"
+grep -q '"verified_package_count":1' <<<"$queue_audit_json" || \
+  fail "queue audit did not verify the recovered package"
+grep -q '"issues":\[\]' <<<"$queue_audit_json" || \
+  fail "recovered package left an unresolved recovery issue"
+queue_export_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" \
+  --json queue export "$fixture_root/queue-export")"
+grep -q '"type":"queue_exported"' <<<"$queue_export_json" || \
+  fail "queue export did not return the expected JSON payload"
+[[ -f "$fixture_root/queue-export/state.sqlite" ]] || \
+  fail "queue export did not include a verified database backup"
+[[ -f "$fixture_root/queue-export/queue-export.json" ]] || \
+  fail "queue export did not include its manifest"
+[[ -f "$fixture_root/queue-export/packages/$package_id/revision-1/objects.bundle" ]] || \
+  fail "queue export did not include the immutable object bundle"
 
 logs_json="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" --json logs --limit 20)"
 grep -q '"type":"events"' <<<"$logs_json" || \
@@ -178,4 +199,4 @@ grep -q '"reason_code":"conflict"' <<<"$logs_json" || \
 grep -q '"request_id":"request_' <<<"$logs_json" || \
   fail "diagnostic events were not correlated by request ID"
 
-printf 'PASS plan import, isolated workspace, immutable package, diagnostics, and restart persistence\n'
+printf 'PASS plan import, isolated workspace, immutable package recovery, queue export, diagnostics, and restart persistence\n'

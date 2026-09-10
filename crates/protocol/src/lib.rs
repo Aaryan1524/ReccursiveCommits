@@ -76,6 +76,11 @@ impl RequestEnvelope {
             Command::EnrollRepository(request) => request.validate(),
             Command::CreateWorkspace(request) => request.validate(),
             Command::CapturePackage(request) => request.validate(),
+            Command::ExportQueue { destination }
+                if destination.is_empty() || destination.len() > 4_096 =>
+            {
+                Err(ProtocolValidationError::InvalidExportDestination)
+            }
             Command::ImportPlan { plan } => plan
                 .validate()
                 .map_err(|error| ProtocolValidationError::InvalidPlan(error.to_string())),
@@ -89,6 +94,8 @@ impl RequestEnvelope {
             | Command::PlanHistory { .. }
             | Command::GetWorkspace { .. }
             | Command::GetPackage { .. }
+            | Command::AuditQueue
+            | Command::ExportQueue { .. }
             | Command::Status => Ok(()),
         }
     }
@@ -123,6 +130,12 @@ pub enum Command {
     GetPackage {
         package_id: PackageId,
         revision: Revision,
+    },
+    /// Inspect package storage and any crash-recovery evidence.
+    AuditQueue,
+    /// Write a portable, verified backup of queue state and immutable packages.
+    ExportQueue {
+        destination: String,
     },
     Status,
 }
@@ -304,6 +317,32 @@ pub struct PackageView {
     pub created_at_unix_ms: i64,
 }
 
+/// An unresolved package-storage issue retained for recovery and operator action.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueueRecoveryIssueView {
+    pub path: String,
+    pub kind: String,
+    pub message: String,
+    pub first_seen_at_unix_ms: i64,
+    pub last_seen_at_unix_ms: i64,
+}
+
+/// Current package-storage verification result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueueAuditView {
+    pub verified_package_count: usize,
+    pub issues: Vec<QueueRecoveryIssueView>,
+}
+
+/// Metadata for a portable queue backup written by the daemon.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueueExportView {
+    pub destination: String,
+    pub verified_package_count: usize,
+    pub unresolved_issue_count: usize,
+    pub database_sha256: String,
+}
+
 /// Correlated daemon response.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResponseEnvelope {
@@ -370,6 +409,12 @@ pub enum ResponseData {
     Package {
         package: PackageView,
     },
+    QueueAudit {
+        audit: QueueAuditView,
+    },
+    QueueExported {
+        export: QueueExportView,
+    },
     Status {
         service_version: String,
         schema_version: u32,
@@ -433,6 +478,8 @@ pub enum ProtocolValidationError {
     InvalidPrerequisite(String),
     #[error("snapshot package must select between 1 and 1000 plan tasks")]
     InvalidPackageTasks,
+    #[error("queue export destination must contain 1-4096 bytes")]
+    InvalidExportDestination,
 }
 
 #[cfg(test)]

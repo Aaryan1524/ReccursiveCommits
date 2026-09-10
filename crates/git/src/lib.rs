@@ -326,6 +326,24 @@ pub enum CandidateApplyOutcome {
     Conflicted { paths: Vec<String> },
 }
 
+/// Evidence that a candidate workspace is safe to turn into a release commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateVerification {
+    pub target_commit: String,
+    pub staged_tree: String,
+}
+
+/// A condition preventing a candidate from becoming a release commit.
+#[derive(Debug, Error)]
+pub enum CandidateVerificationError {
+    #[error(transparent)]
+    Git(#[from] GitError),
+    #[error("candidate target changed from {expected} to {actual}")]
+    TargetChanged { expected: String, actual: String },
+    #[error("candidate has unresolved paths: {paths:?}")]
+    UnmergedPaths { paths: Vec<String> },
+}
+
 impl CandidateWorkspace {
     /// Applies the captured delta to the current target without committing it.
     ///
@@ -356,6 +374,35 @@ impl CandidateWorkspace {
     /// Returns the candidate tree currently staged in this workspace.
     pub fn staged_tree(&self, timeout: Duration) -> Result<String, GitError> {
         git_text(&self.path, ["write-tree"], timeout)
+    }
+
+    /// Verifies the staged candidate before a release commit may be created.
+    ///
+    /// This verifies local Git invariants only. Repository-specific trusted checks are run by the
+    /// daemon release service, where their configured commands and durable evidence are owned.
+    pub fn verify(
+        &self,
+        timeout: Duration,
+    ) -> Result<CandidateVerification, CandidateVerificationError> {
+        let actual_target = git_text(&self.path, ["rev-parse", "HEAD"], timeout)?;
+        if actual_target != self.target_commit {
+            return Err(CandidateVerificationError::TargetChanged {
+                expected: self.target_commit.clone(),
+                actual: actual_target,
+            });
+        }
+        let paths = self.unmerged_paths(timeout)?;
+        if !paths.is_empty() {
+            return Err(CandidateVerificationError::UnmergedPaths { paths });
+        }
+        GitRunner::run(
+            &GitInvocation::new(&self.path, ["diff", "--cached", "--check"], timeout)?,
+            &CancellationToken::default(),
+        )?;
+        Ok(CandidateVerification {
+            target_commit: self.target_commit.clone(),
+            staged_tree: self.staged_tree(timeout)?,
+        })
     }
 
     fn unmerged_paths(&self, timeout: Duration) -> Result<Vec<String>, GitError> {
@@ -633,7 +680,16 @@ mod tests {
             candidate.staged_tree(Duration::from_secs(5)).unwrap(),
             target_tree
         );
-        assert!(matches!(outcome, CandidateApplyOutcome::Applied { .. }));
+        let CandidateApplyOutcome::Applied { staged_tree } = outcome else {
+            panic!("expected a clean candidate")
+        };
+        assert_eq!(
+            candidate.verify(Duration::from_secs(5)).unwrap(),
+            CandidateVerification {
+                target_commit: target.clone(),
+                staged_tree,
+            }
+        );
         assert_eq!(
             git_text(
                 &candidate.path,
@@ -643,6 +699,12 @@ mod tests {
             .unwrap(),
             target
         );
+        fixture_git(&candidate.path, &["reset", "--hard", base.as_str()]);
+        assert!(matches!(
+            candidate.verify(Duration::from_secs(5)),
+            Err(CandidateVerificationError::TargetChanged { expected, actual })
+                if expected == target && actual == base
+        ));
     }
 
     #[test]
@@ -726,5 +788,9 @@ mod tests {
         );
         assert!(candidate.path.join(".git").exists());
         assert!(candidate.path.join("file.txt").exists());
+        assert!(matches!(
+            candidate.verify(Duration::from_secs(5)),
+            Err(CandidateVerificationError::UnmergedPaths { paths }) if paths == ["file.txt"]
+        ));
     }
 }

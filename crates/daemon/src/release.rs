@@ -54,6 +54,26 @@ pub enum ReleaseOutcome {
         classification: String,
         detail: String,
     },
+    /// A retryable transport failure was recorded for a scheduler to resume later.
+    Deferred {
+        attempt_id: AttemptId,
+        retry_not_before_unix_ms: i64,
+        detail: String,
+    },
+}
+
+/// Result of reconciling all release attempts whose previous push may have reached a remote.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecoveryReport {
+    pub resolved_attempt_ids: Vec<AttemptId>,
+    pub failures: Vec<RecoveryFailure>,
+}
+
+/// One recovery failure that must remain visible without preventing other targets from resolving.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryFailure {
+    pub attempt_id: AttemptId,
+    pub detail: String,
 }
 
 /// A release could not be started at all, so no attempt state was changed.
@@ -243,7 +263,7 @@ impl ReleaseWorker {
                 });
             }
         };
-        store.record_push_intent(id, &candidate.commit, now_unix_ms)?;
+        store.record_push_intent(id, &candidate.commit, &candidate.parent_commit, now_unix_ms)?;
 
         self.publish_with_retry(
             store,
@@ -274,61 +294,60 @@ impl ReleaseWorker {
         };
 
         store.advance_release_attempt(id, TaskStatus::PushPending, None, now_unix_ms)?;
-        let mut failures: u8 = 0;
-        loop {
-            match workspace.publish(candidate, &publish_request, GIT_TIMEOUT) {
-                Ok(published) => {
-                    store.record_remote_observation(id, &published.commit, now_unix_ms)?;
-                    store.advance_release_attempt(
-                        id,
-                        TaskStatus::RemoteConfirmed,
-                        None,
+        match workspace.publish(candidate, &publish_request, GIT_TIMEOUT) {
+            Ok(published) => {
+                self.confirm_publication(store, attempt, &published.commit, now_unix_ms)?;
+                Ok(ReleaseOutcome::Published {
+                    attempt_id: id,
+                    commit: published.commit,
+                })
+            }
+            Err(error) => {
+                let classification = classify(&error);
+                let failures = attempt.failed_attempts.saturating_add(1);
+                match self.retry.decide(failures, &error) {
+                    // Delays are not slept here: the caller owns scheduling, and a worker that
+                    // blocks a thread for minutes would hold its lease against everything else.
+                    PublicationResolution::Retry { after } => {
+                        let retry_not_before_unix_ms = retry_not_before(now_unix_ms, after)?;
+                        store.defer_publication_retry(
+                            id,
+                            classification,
+                            retry_not_before_unix_ms,
+                            now_unix_ms,
+                        )?;
+                        Ok(ReleaseOutcome::Deferred {
+                            attempt_id: id,
+                            retry_not_before_unix_ms,
+                            detail: format!("{classification}: {error}"),
+                        })
+                    }
+                    PublicationResolution::RecoverRemote => self.resolve_against_remote(
+                        store,
+                        attempt,
+                        workspace,
+                        candidate,
+                        &publish_request,
                         now_unix_ms,
-                    )?;
-                    store.advance_release_attempt(id, TaskStatus::Published, None, now_unix_ms)?;
-                    self.publish_tasks(store, attempt, now_unix_ms)?;
-                    return Ok(ReleaseOutcome::Published {
-                        attempt_id: id,
-                        commit: published.commit,
-                    });
-                }
-                Err(error) => {
-                    failures = failures.saturating_add(1);
-                    let classification = classify(&error);
-                    store.record_publication_failure(id, classification, now_unix_ms)?;
-                    match self.retry.decide(failures, &error) {
-                        // Delays are not slept here: the caller owns scheduling, and a worker that
-                        // blocks a thread for minutes would hold its lease against everything else.
-                        PublicationResolution::Retry { .. } => continue,
-                        PublicationResolution::RecoverRemote => {
-                            return self.resolve_against_remote(
-                                store,
-                                attempt,
-                                workspace,
-                                candidate,
-                                &publish_request,
-                                now_unix_ms,
-                            );
-                        }
-                        PublicationResolution::RebuildCandidate => {
-                            let detail = format!("target moved during publication: {error}");
-                            self.block(store, attempt, "target_changed", &detail, now_unix_ms)?;
-                            return Ok(ReleaseOutcome::Blocked {
-                                attempt_id: id,
-                                classification: "target_changed".to_owned(),
-                                detail,
-                            });
-                        }
-                        PublicationResolution::Manual { block } => {
-                            let detail = format!("{block:?}: {error}");
-                            let classification = format!("{block:?}").to_lowercase();
-                            self.block(store, attempt, &classification, &detail, now_unix_ms)?;
-                            return Ok(ReleaseOutcome::Blocked {
-                                attempt_id: id,
-                                classification,
-                                detail,
-                            });
-                        }
+                    ),
+                    PublicationResolution::RebuildCandidate => {
+                        let detail = format!("target moved during publication: {error}");
+                        self.block(store, attempt, "target_changed", &detail, now_unix_ms)?;
+                        Ok(ReleaseOutcome::Blocked {
+                            attempt_id: id,
+                            classification: "target_changed".to_owned(),
+                            detail,
+                        })
+                    }
+                    PublicationResolution::Manual { block } => {
+                        let detail = format!("{block:?}: {error}");
+                        let classification = format!("{block:?}").to_lowercase();
+                        self.block(store, attempt, &classification, &detail, now_unix_ms)?;
+                        Ok(ReleaseOutcome::Blocked {
+                            attempt_id: id,
+                            classification,
+                            detail,
+                        })
                     }
                 }
             }
@@ -349,15 +368,7 @@ impl ReleaseWorker {
         match workspace.recover_publication(candidate, request, GIT_TIMEOUT)? {
             PublicationRecovery::Published(published) => {
                 // The push landed after all. Recording it is what stops a duplicate commit.
-                store.record_remote_observation(id, &published.commit, now_unix_ms)?;
-                store.advance_release_attempt(
-                    id,
-                    TaskStatus::RemoteConfirmed,
-                    None,
-                    now_unix_ms,
-                )?;
-                store.advance_release_attempt(id, TaskStatus::Published, None, now_unix_ms)?;
-                self.publish_tasks(store, attempt, now_unix_ms)?;
+                self.confirm_publication(store, attempt, &published.commit, now_unix_ms)?;
                 Ok(ReleaseOutcome::Published {
                     attempt_id: id,
                     commit: published.commit,
@@ -391,6 +402,43 @@ impl ReleaseWorker {
         }
     }
 
+    /// Confirms that a candidate reached the remote and publishes the tasks it carries.
+    fn confirm_publication(
+        &self,
+        store: &mut Store,
+        attempt: &ReleaseAttempt,
+        candidate_sha: &str,
+        now_unix_ms: i64,
+    ) -> Result<(), StoreError> {
+        let current = store
+            .release_attempt(attempt.attempt_id)?
+            .ok_or_else(|| StoreError::InvalidData("release attempt disappeared".into()))?;
+        // A prior transport failure can have blocked the attempt at `push_pending`. Recovery is
+        // allowed to resume precisely that state, never skip over it.
+        if current.state.status() == TaskStatus::Blocked {
+            store.advance_release_attempt(
+                attempt.attempt_id,
+                TaskStatus::PushPending,
+                None,
+                now_unix_ms,
+            )?;
+        }
+        store.record_remote_observation(attempt.attempt_id, candidate_sha, now_unix_ms)?;
+        store.advance_release_attempt(
+            attempt.attempt_id,
+            TaskStatus::RemoteConfirmed,
+            None,
+            now_unix_ms,
+        )?;
+        store.advance_release_attempt(
+            attempt.attempt_id,
+            TaskStatus::Published,
+            None,
+            now_unix_ms,
+        )?;
+        self.publish_tasks(store, attempt, now_unix_ms)
+    }
+
     /// Marks the tasks a published package delivers as published.
     fn publish_tasks(
         &self,
@@ -422,23 +470,23 @@ impl ReleaseWorker {
         detail: &str,
         now_unix_ms: i64,
     ) -> Result<(), StoreError> {
-        store.record_publication_failure(attempt.attempt_id, classification, now_unix_ms)?;
-        let reason = StateReason::new(reason_code(classification), detail)
-            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
         // A terminal or already-blocked attempt keeps the state it has; this must never mask the
         // original explanation with a later one.
         let current = store
             .release_attempt(attempt.attempt_id)?
-            .map(|attempt| attempt.state.status());
-        if matches!(current, Some(status) if !status.is_terminal() && status != TaskStatus::Blocked)
-        {
-            store.advance_release_attempt(
-                attempt.attempt_id,
-                TaskStatus::Blocked,
-                Some(reason.clone()),
-                now_unix_ms,
-            )?;
+            .ok_or_else(|| StoreError::InvalidData("release attempt disappeared".into()))?;
+        if current.state.status().is_terminal() || current.state.status() == TaskStatus::Blocked {
+            return Ok(());
         }
+        store.record_publication_failure(attempt.attempt_id, classification, now_unix_ms)?;
+        let reason = StateReason::new(reason_code(classification), detail)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        store.advance_release_attempt(
+            attempt.attempt_id,
+            TaskStatus::Blocked,
+            Some(reason.clone()),
+            now_unix_ms,
+        )?;
 
         let Some(snapshot) = store.snapshot(attempt.package_id, attempt.package_revision)? else {
             return Ok(());
@@ -484,50 +532,65 @@ pub fn recover_interrupted_releases(
     store: &mut Store,
     worker: &ReleaseWorker,
     now_unix_ms: i64,
-) -> Result<Vec<AttemptId>, ReleaseError> {
-    let mut resolved = Vec::new();
+) -> Result<RecoveryReport, StoreError> {
+    let mut report = RecoveryReport::default();
     for attempt in store.release_attempts_awaiting_remote_resolution()? {
-        let Some(candidate_sha) = attempt.candidate_sha.clone() else {
-            continue;
-        };
-        let Some(snapshot) = store.snapshot(attempt.package_id, attempt.package_revision)? else {
-            continue;
-        };
-        let Ok(package) = SnapshotPackage::open(snapshot.path.clone()) else {
-            continue;
-        };
-        let clone = worker.managed_clone(&attempt.remote, &attempt.repository_id.to_string())?;
-        clone.fetch_ref(&attempt.remote, attempt.target.as_str(), GIT_TIMEOUT)?;
-
-        std::fs::create_dir_all(&worker.workspace_root)?;
-        let workspace = worker
-            .workspace_root
-            .join(format!("recover-{}", attempt.attempt_id));
-        let candidate_workspace = clone.prepare_candidate_workspace(
-            workspace,
-            &attempt.base_commit,
-            &package,
-            GIT_TIMEOUT,
-        )?;
-        let candidate = PersistedCandidate {
-            commit: candidate_sha,
-            parent_commit: attempt.base_commit.clone(),
-            tree: snapshot.result_tree.clone(),
-        };
-        worker.resolve_against_remote(
-            store,
-            &attempt,
-            &candidate_workspace,
-            &candidate,
-            &CandidatePublishRequest {
-                remote: attempt.remote.clone(),
-                target_ref: attempt.target.as_str().to_owned(),
-            },
-            now_unix_ms,
-        )?;
-        resolved.push(attempt.attempt_id);
+        match recover_interrupted_release(store, worker, &attempt, now_unix_ms) {
+            Ok(()) => report.resolved_attempt_ids.push(attempt.attempt_id),
+            Err(error) => report.failures.push(RecoveryFailure {
+                attempt_id: attempt.attempt_id,
+                detail: error.to_string(),
+            }),
+        }
     }
-    Ok(resolved)
+    Ok(report)
+}
+
+fn recover_interrupted_release(
+    store: &mut Store,
+    worker: &ReleaseWorker,
+    attempt: &ReleaseAttempt,
+    now_unix_ms: i64,
+) -> Result<(), ReleaseError> {
+    let candidate_sha = attempt.candidate_sha.as_deref().ok_or_else(|| {
+        ReleaseError::Unavailable("transmitted push is missing its candidate commit".into())
+    })?;
+    let clone = worker.managed_clone(&attempt.remote, &attempt.repository_id.to_string())?;
+    clone.fetch_ref(&attempt.remote, attempt.target.as_str(), GIT_TIMEOUT)?;
+    let observed = clone.resolve(attempt.target.as_str(), GIT_TIMEOUT)?;
+
+    if observed == candidate_sha {
+        worker.confirm_publication(store, attempt, candidate_sha, now_unix_ms)?;
+        return Ok(());
+    }
+
+    // A prior worker already classified this as a retryable transport failure. Startup must
+    // inspect the remote, but it must not erase that durable backoff merely because the target
+    // still has the candidate's parent.
+    if attempt.candidate_parent_sha.as_deref() == Some(observed.as_str())
+        && attempt.retry_not_before_unix_ms.is_some()
+    {
+        return Ok(());
+    }
+
+    let classification = if attempt.candidate_parent_sha.as_deref() == Some(observed.as_str()) {
+        "transport"
+    } else {
+        "ambiguous_remote"
+    };
+    let detail = format!(
+        "remote holds {observed}, not candidate {candidate_sha}; manual resolution is required"
+    );
+    worker.block(store, attempt, classification, &detail, now_unix_ms)?;
+    Ok(())
+}
+
+fn retry_not_before(now_unix_ms: i64, delay: Duration) -> Result<i64, ReleaseError> {
+    let delay_ms = i64::try_from(delay.as_millis())
+        .map_err(|_| ReleaseError::Unavailable("publication retry delay is too large".into()))?;
+    now_unix_ms
+        .checked_add(delay_ms)
+        .ok_or_else(|| ReleaseError::Unavailable("publication retry time overflows".into()))
 }
 
 fn snapshot_base_commit(snapshot: &SnapshotRecord) -> Result<String, ReleaseError> {
@@ -577,6 +640,7 @@ mod tests {
         store: Store,
         worker: ReleaseWorker,
         remote: PathBuf,
+        repository_id: RepositoryId,
         package_id: PackageId,
         feature_id: FeatureId,
         task_id: TaskId,
@@ -751,6 +815,7 @@ mod tests {
             store,
             worker,
             remote,
+            repository_id,
             package_id: package.manifest.package_id,
             feature_id,
             task_id,
@@ -887,6 +952,93 @@ mod tests {
                     TaskStatus::Blocked
                 );
             }
+            ReleaseOutcome::Deferred { .. } => {
+                panic!("a competing writer must not be treated as a transport retry")
+            }
         }
+    }
+
+    #[test]
+    fn restart_confirms_a_push_that_landed_before_its_outcome_was_durable() {
+        let mut fixture = fixture();
+        let source = fixture._root.path().join("source");
+        let parent = fixture.remote_head();
+        fs::write(source.join("feature.txt"), "the unit\n").unwrap();
+        git(&source, &["add", "."]);
+        git(
+            &source,
+            &["commit", "--quiet", "-m", "candidate that landed"],
+        );
+        git(&source, &["push", "--quiet", "origin", "main"]);
+        let candidate = fixture.remote_head();
+
+        let attempt_id = AttemptId::new();
+        fixture
+            .store
+            .open_release_attempt(&NewReleaseAttempt {
+                attempt_id,
+                repository_id: fixture.repository_id,
+                package_id: fixture.package_id,
+                package_revision: Revision::FIRST,
+                remote: fixture.remote.to_string_lossy().into_owned(),
+                target: TargetRef::new("refs/heads/main").unwrap(),
+                base_commit: parent.clone(),
+                lease: AttemptLease {
+                    owner: "daemon-before-crash".into(),
+                    expires_at_unix_ms: 10_000,
+                },
+                created_at_unix_ms: 1,
+            })
+            .unwrap();
+        for (at, status) in [
+            TaskStatus::Reconciling,
+            TaskStatus::Verifying,
+            TaskStatus::CommitPrepared,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fixture
+                .store
+                .advance_release_attempt(attempt_id, status, None, at as i64 + 2)
+                .unwrap();
+        }
+        fixture
+            .store
+            .record_push_intent(attempt_id, &candidate, &parent, 5)
+            .unwrap();
+        fixture
+            .store
+            .advance_release_attempt(attempt_id, TaskStatus::PushPending, None, 6)
+            .unwrap();
+
+        let report = recover_interrupted_releases(&mut fixture.store, &fixture.worker, 20).unwrap();
+        assert_eq!(report.resolved_attempt_ids, vec![attempt_id]);
+        assert!(report.failures.is_empty());
+        assert_eq!(
+            fixture.remote_head(),
+            candidate,
+            "recovery must not push again"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .release_attempt(attempt_id)
+                .unwrap()
+                .unwrap()
+                .state
+                .status(),
+            TaskStatus::Published
+        );
+        assert_eq!(
+            fixture
+                .store
+                .task(fixture.feature_id, Revision::FIRST, fixture.task_id)
+                .unwrap()
+                .unwrap()
+                .state
+                .status(),
+            TaskStatus::Published
+        );
     }
 }

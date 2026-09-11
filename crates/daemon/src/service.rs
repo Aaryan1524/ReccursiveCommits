@@ -836,8 +836,10 @@ fn reconcile_interrupted_releases(
     managed_root: &Path,
     release_root: &Path,
 ) -> Result<(), StoreError> {
-    let pending = store.release_attempts_awaiting_remote_resolution()?;
-    if pending.is_empty() {
+    if store
+        .release_attempts_awaiting_remote_resolution()?
+        .is_empty()
+    {
         return Ok(());
     }
     let worker = crate::release::ReleaseWorker::new(
@@ -846,19 +848,15 @@ fn reconcile_interrupted_releases(
         crate::SERVICE_NAME.to_owned(),
     );
     let now = recovery_unix_ms()?;
-    if let Err(error) = crate::release::recover_interrupted_releases(store, &worker, now) {
-        for attempt in pending {
-            record_recovery_issue(
-                store,
-                PathBuf::from(attempt.attempt_id.to_string()),
-                "unresolved_publication",
-                &format!(
-                    "a push that may have reached {} could not be resolved: {error}",
-                    attempt.target.as_str()
-                ),
-                now,
-            )?;
-        }
+    let report = crate::release::recover_interrupted_releases(store, &worker, now)?;
+    for failure in report.failures {
+        record_recovery_issue(
+            store,
+            PathBuf::from(failure.attempt_id.to_string()),
+            "unresolved_publication",
+            &failure.detail,
+            now,
+        )?;
     }
     Ok(())
 }

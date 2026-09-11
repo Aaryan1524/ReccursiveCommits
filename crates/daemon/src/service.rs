@@ -17,12 +17,12 @@ use reccursive_capture::{
     SnapshotRequest, WorkspaceError, WorkspaceRequest as CaptureWorkspaceRequest,
 };
 use reccursive_protocol::{
-    ApiError, ApiErrorCode, AuthToken, CapturePackageRequest, Command, CreateWorkspaceRequest,
-    EnrollRepositoryRequest, EventSeverityView, EventView, PackageView, PlanView,
-    ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView, ReasonCode,
-    RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData,
-    ResponseEnvelope, Revision, StateReason, TaskStatus, TransportError, WorkspacePrerequisiteView,
-    WorkspaceView,
+    ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest, Command,
+    CreateWorkspaceRequest, EnrollRepositoryRequest, EventSeverityView, EventView, PackageView,
+    PlanView, ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView,
+    ReasonCode, RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId,
+    ResponseData, ResponseEnvelope, Revision, StateReason, TaskCancellationView, TaskStatus,
+    TransportError, WorkspacePrerequisiteView, WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -395,6 +395,7 @@ fn dispatch(
             revision,
         } => get_workspace(feature_id, revision, store),
         Command::CapturePackage(request) => capture_package(request, store, package_root),
+        Command::CancelTask(request) => cancel_task(request, store),
         Command::GetPackage {
             package_id,
             revision,
@@ -417,6 +418,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::CreateWorkspace(_) => "workspace.create",
         Command::GetWorkspace { .. } => "workspace.show",
         Command::CapturePackage(_) => "package.capture",
+        Command::CancelTask(_) => "task.cancel",
         Command::GetPackage { .. } => "package.show",
         Command::AuditQueue => "queue.audit",
         Command::ExportQueue { .. } => "queue.export",
@@ -455,6 +457,12 @@ fn record_api_event(
             Some("snapshot_package".into()),
             Some(package.package_id.to_string()),
             Some(package.revision),
+        ),
+        Ok(ResponseData::TaskCancelled { cancellation }) => (
+            None,
+            Some("plan_task".into()),
+            Some(cancellation.task_id.to_string()),
+            Some(cancellation.plan_revision),
         ),
         Ok(ResponseData::QueueExported { .. }) | Ok(ResponseData::QueueAudit { .. }) => {
             (None, Some("queue_storage".into()), None, None)
@@ -1403,6 +1411,28 @@ fn capture_package(
     }
     Ok(ResponseData::PackageCaptured {
         package: package_view(record, package.manifest)?,
+    })
+}
+
+fn cancel_task(request: CancelTaskRequest, store: &Mutex<Store>) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let outcome = lock_store(store)?
+        .cancel_task(
+            request.feature_id,
+            request.plan_revision,
+            request.task_id,
+            &request.message,
+            now,
+        )
+        .map_err(store_api_error)?;
+    Ok(ResponseData::TaskCancelled {
+        cancellation: TaskCancellationView {
+            feature_id: request.feature_id,
+            plan_revision: request.plan_revision,
+            task_id: request.task_id,
+            blocked_dependents: outcome.blocked_dependents,
+            invalidated_evidence: outcome.invalidated_evidence,
+        },
     })
 }
 

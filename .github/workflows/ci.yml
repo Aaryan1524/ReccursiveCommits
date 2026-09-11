@@ -36,3 +36,4 @@ jobs:
       - run: cargo test --workspace --all-targets --locked
       - run: cargo build --workspace --locked
       - run: ./tests/scenarios/phase1_cli_smoke.sh
+      - run: ./tests/scenarios/phase2_capture_chain.sh

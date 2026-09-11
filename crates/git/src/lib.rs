@@ -214,10 +214,15 @@ impl ManagedClone {
         reference: &str,
         timeout: Duration,
     ) -> Result<GitOutput, GitError> {
+        // A bare managed mirror has no remote-tracking branch. Fetching only `reference` updates
+        // FETCH_HEAD, while callers intentionally resolve the named local ref afterwards. Force
+        // that ref to the remote value so a long-lived mirror cannot reconcile a later candidate
+        // onto yesterday's target.
+        let refspec = format!("+{reference}:{reference}");
         GitRunner::run(
             &GitInvocation::new(
                 &self.path,
-                ["fetch", "--no-tags", remote, reference],
+                ["fetch", "--no-tags", remote, refspec.as_str()],
                 timeout,
             )?,
             &CancellationToken::default(),

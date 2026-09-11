@@ -9,7 +9,11 @@
 //! A process that dies mid-push therefore restarts knowing exactly which commit may already be on
 //! the remote, and resolves that against the remote rather than building a second candidate.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use reccursive_capture::SnapshotPackage;
 use reccursive_git::{
@@ -21,8 +25,11 @@ use reccursive_protocol::{
     AttemptId, PackageId, ReasonCode, Revision, StateReason, TargetRef, TaskStatus,
 };
 use reccursive_store::{
-    AttemptLease, NewReleaseAttempt, ReleaseAttempt, SnapshotRecord, Store, StoreError,
+    AttemptLease, CandidateValidationEvidence, NewReleaseAttempt, ReleaseAttempt, SnapshotRecord,
+    Store, StoreError, TrustedCheck,
 };
+use sha2::{Digest, Sha256};
+use wait_timeout::ChildExt;
 
 /// How long any single Git operation may run before it is treated as unresponsive.
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -238,6 +245,54 @@ impl ReleaseWorker {
                 classification: classification.to_owned(),
                 detail,
             });
+        }
+
+        // The package was already tested in its original workspace. Reconciliation changes the
+        // parent commit, so trusted checks must run again against this exact staged candidate.
+        for check in store
+            .trusted_checks(attempt.repository_id)?
+            .into_iter()
+            .filter(|check| check.enabled)
+        {
+            let evidence = match run_candidate_check(
+                &check,
+                id,
+                snapshot,
+                &workspace.path,
+                &target_commit,
+                now_unix_ms,
+            ) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    let detail = error.to_string();
+                    self.block(
+                        store,
+                        attempt,
+                        "validation_unavailable",
+                        &detail,
+                        now_unix_ms,
+                    )?;
+                    return Ok(ReleaseOutcome::Blocked {
+                        attempt_id: id,
+                        classification: "validation_unavailable".to_owned(),
+                        detail,
+                    });
+                }
+            };
+            let passed = evidence.exit_code == Some(0) && !evidence.timed_out;
+            store.record_candidate_validation_evidence(&evidence)?;
+            if !passed {
+                let detail = format!(
+                    "trusted check {} failed against reconciled candidate",
+                    check.id
+                );
+                self.block(store, attempt, "validation_failed", &detail, now_unix_ms)?;
+                return Ok(ReleaseOutcome::Blocked {
+                    attempt_id: id,
+                    classification: "validation_failed".to_owned(),
+                    detail,
+                });
+            }
         }
 
         // Create the commit, then make its identity and the intent to push it durable before the
@@ -604,6 +659,88 @@ fn snapshot_base_commit(snapshot: &SnapshotRecord) -> Result<String, ReleaseErro
         })
 }
 
+fn run_candidate_check(
+    check: &TrustedCheck,
+    attempt_id: AttemptId,
+    snapshot: &SnapshotRecord,
+    directory: &Path,
+    base_commit: &str,
+    now_unix_ms: i64,
+) -> Result<CandidateValidationEvidence, ReleaseError> {
+    let command: Vec<_> = check
+        .command
+        .iter()
+        .map(|argument| argument.replace("{base_commit}", base_commit))
+        .collect();
+    let mut process = Command::new(&command[0]);
+    process.args(&command[1..]).current_dir(directory);
+    let mut child = process.spawn().map_err(|error| {
+        ReleaseError::Unavailable(format!(
+            "trusted check {} could not be started: {error}",
+            check.id
+        ))
+    })?;
+    let status = child
+        .wait_timeout(Duration::from_secs(u64::from(check.timeout_seconds)))
+        .map_err(|error| {
+            ReleaseError::Unavailable(format!(
+                "trusted check {} could not be observed: {error}",
+                check.id
+            ))
+        })?;
+    let (exit_code, timed_out, output_summary) = match status {
+        Some(status) => (status.code(), false, String::new()),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            (
+                None,
+                true,
+                "trusted check exceeded its configured timeout".to_owned(),
+            )
+        }
+    };
+    Ok(CandidateValidationEvidence {
+        attempt_id,
+        package_id: snapshot.package_id,
+        revision: snapshot.revision,
+        check_id: check.id.clone(),
+        base_commit: base_commit.to_owned(),
+        package_content_hash: snapshot.content_hash.clone(),
+        command,
+        environment_fingerprint: inherited_environment_fingerprint(),
+        exit_code,
+        timed_out,
+        output_summary: reccursive_store::redact_text(&output_summary),
+        executed_at_unix_ms: now_unix_ms.max(current_unix_ms()?),
+        invalidated_at_unix_ms: None,
+        invalidated_reason: None,
+    })
+}
+
+fn inherited_environment_fingerprint() -> String {
+    let mut values: Vec<_> = std::env::vars_os()
+        .map(|(key, value)| format!("{}={}", key.to_string_lossy(), value.to_string_lossy()))
+        .collect();
+    values.sort_unstable();
+    let mut hasher = Sha256::new();
+    for value in values {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn current_unix_ms() -> Result<i64, ReleaseError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            ReleaseError::Unavailable(format!("system clock is before epoch: {error}"))
+        })?;
+    i64::try_from(duration.as_millis())
+        .map_err(|_| ReleaseError::Unavailable("system clock exceeds supported range".to_owned()))
+}
+
 fn classify(error: &CandidatePublishError) -> &'static str {
     match error {
         CandidatePublishError::Git(_) => "transport",
@@ -842,6 +979,16 @@ mod tests {
     fn the_daemon_publishes_a_captured_unit_to_the_real_remote() {
         let mut fixture = fixture();
         let before = fixture.remote_head();
+        fixture
+            .store
+            .add_trusted_check(&TrustedCheck {
+                repository_id: fixture.repository_id,
+                id: "candidate-file-present".into(),
+                command: vec!["sh".into(), "-c".into(), "test -f feature.txt".into()],
+                timeout_seconds: 10,
+                enabled: true,
+            })
+            .unwrap();
 
         let request = fixture.request();
         let outcome = fixture
@@ -865,6 +1012,16 @@ mod tests {
             attempt.observed_remote_sha.as_deref(),
             Some(commit.as_str())
         );
+        let evidence = fixture
+            .store
+            .candidate_validation_evidence(attempt_id)
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].check_id, "candidate-file-present");
+        assert_eq!(evidence[0].base_commit, before);
+        assert_eq!(evidence[0].exit_code, Some(0));
+        assert!(!evidence[0].timed_out);
+        assert_eq!(evidence[0].environment_fingerprint.len(), 64);
 
         // The task the package delivers is published too.
         assert_eq!(
@@ -884,6 +1041,64 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_changed_candidate_base_invalidates_prior_check_evidence() {
+        let mut fixture = fixture();
+        fixture
+            .store
+            .add_trusted_check(&TrustedCheck {
+                repository_id: fixture.repository_id,
+                id: "always-fails".into(),
+                command: vec!["sh".into(), "-c".into(), "exit 7".into()],
+                timeout_seconds: 10,
+                enabled: true,
+            })
+            .unwrap();
+
+        let request = fixture.request();
+        let first = fixture
+            .worker
+            .release(&mut fixture.store, &request, 10)
+            .unwrap();
+        let ReleaseOutcome::Blocked {
+            attempt_id: first_attempt,
+            classification,
+            ..
+        } = first
+        else {
+            panic!("expected failed candidate validation");
+        };
+        assert_eq!(classification, "validation_failed");
+
+        // A different writer advances the target before the next candidate is prepared. The
+        // second attempt has to test the new combined result, not trust its predecessor.
+        let source = fixture._root.path().join("source");
+        fs::write(source.join("other.txt"), "new target base\n").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "--quiet", "-m", "advance target"]);
+        git(&source, &["push", "--quiet", "origin", "main"]);
+
+        let second = fixture
+            .worker
+            .release(&mut fixture.store, &request, 20)
+            .unwrap();
+        let ReleaseOutcome::Blocked { attempt_id, .. } = second else {
+            panic!("expected failed candidate validation");
+        };
+        assert_ne!(attempt_id, first_attempt);
+
+        let first_evidence = fixture
+            .store
+            .candidate_validation_evidence(first_attempt)
+            .unwrap();
+        assert_eq!(first_evidence.len(), 1);
+        assert_eq!(
+            first_evidence[0].invalidated_reason.as_deref(),
+            Some("candidate validation inputs changed")
+        );
+        assert!(first_evidence[0].invalidated_at_unix_ms.is_some());
     }
 
     #[test]

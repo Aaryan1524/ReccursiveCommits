@@ -8,10 +8,10 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use reccursive_protocol::{
-    ApiError, ApiErrorCode, CapturePackageRequest, Command, CreateWorkspaceRequest,
-    EnrollRepositoryRequest, EventSeverityView, EventView, FeatureId, FeaturePlan, LocalClient,
-    PackageId, PackageView, PlanView, PublicationMode, QueueAuditView, QueueExportView,
-    RepositoryView, ResponseData, Revision, TargetRef, TaskId, WorkspaceView,
+    ApiError, ApiErrorCode, CancelTaskRequest, CapturePackageRequest, Command,
+    CreateWorkspaceRequest, EnrollRepositoryRequest, EventSeverityView, EventView, FeatureId,
+    FeaturePlan, LocalClient, PackageId, PackageView, PlanView, PublicationMode, QueueAuditView,
+    QueueExportView, RepositoryView, ResponseData, Revision, TargetRef, TaskId, WorkspaceView,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -65,6 +65,11 @@ enum TopLevelCommand {
         #[command(subcommand)]
         command: PackageCommand,
     },
+    /// Cancel a task that has not reached publication.
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
     /// Inspect package recovery state or create a portable queue backup.
     Queue {
         #[command(subcommand)]
@@ -97,6 +102,20 @@ enum PackageCommand {
         package_id: PackageId,
         #[arg(long, value_parser = parse_revision, default_value = "1")]
         revision: Revision,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskCommand {
+    /// Cancel a task and block any plan tasks that depend on it.
+    Cancel {
+        feature_id: FeatureId,
+        #[arg(long, value_parser = parse_revision)]
+        revision: Revision,
+        #[arg(long = "task")]
+        task_id: TaskId,
+        #[arg(long)]
+        message: String,
     },
 }
 
@@ -369,6 +388,25 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 output_data(data, cli.json, stdout)
             }
         },
+        TopLevelCommand::Task { command } => match command {
+            TaskCommand::Cancel {
+                feature_id,
+                revision,
+                task_id,
+                message,
+            } => {
+                let data = send(
+                    &paths,
+                    Command::CancelTask(CancelTaskRequest {
+                        feature_id,
+                        plan_revision: revision,
+                        task_id,
+                        message,
+                    }),
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+        },
         TopLevelCommand::Queue { command } => match command {
             QueueCommand::Audit => {
                 let data = send(&paths, Command::AuditQueue)?;
@@ -628,6 +666,12 @@ fn output_data(
             writeln!(out, "Captured immutable package {}", package.package_id)
         }
         ResponseData::Package { package } => output_package(out, &package),
+        ResponseData::TaskCancelled { cancellation } => writeln!(
+            out,
+            "Cancelled {} and blocked {} dependent task(s)",
+            cancellation.task_id,
+            cancellation.blocked_dependents.len()
+        ),
         ResponseData::QueueAudit { audit } => output_queue_audit(out, &audit),
         ResponseData::QueueExported { export } => output_queue_export(out, &export),
     }

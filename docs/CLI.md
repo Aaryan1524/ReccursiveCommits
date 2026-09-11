@@ -25,6 +25,7 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state workspace create featu
 cargo run -p reccursive-cli -- --state-dir /path/to/state workspace show feature_<uuid> --revision 1
 cargo run -p reccursive-cli -- --state-dir /path/to/state package capture feature_<uuid> --revision 1 --task task_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state package show package_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state task cancel feature_<uuid> --revision 1 --task task_<uuid> --message "replaced by a newer approach"
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue audit
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue export /absolute/path/to/queue-backup
 ```
@@ -65,6 +66,12 @@ Capture also runs daemon-owned trusted checks in the isolated workspace. New
 repositories receive `git diff --check {base_commit}` with a 30-second limit;
 the command and its result are stored separately from agent output and package
 metadata. A failed or timed-out check blocks capture after recording evidence.
+
+`task cancel` is explicit and durable: it accepts a required human explanation,
+cancels a task that has not been published, blocks every dependent task, and
+invalidates affected validation evidence without deleting its audit trail. It
+never cancels published work or silently releases a dependent whose prerequisite
+will not arrive.
 
 `queue audit` reconciles crash evidence with durable state. A fully authenticated
 package that was written before its database row is re-registered, and a complete

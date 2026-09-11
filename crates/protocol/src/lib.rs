@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 pub use transport::{LocalClient, TransportError};
 
 /// Initial local API protocol version.
-pub const API_VERSION: u16 = 1;
+pub const API_VERSION: u16 = 2;
 
 /// Maximum encoded request or response size accepted by the local transport.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -76,6 +76,7 @@ impl RequestEnvelope {
             Command::EnrollRepository(request) => request.validate(),
             Command::CreateWorkspace(request) => request.validate(),
             Command::CapturePackage(request) => request.validate(),
+            Command::CancelTask(request) => request.validate(),
             Command::ExportQueue { destination }
                 if destination.is_empty() || destination.len() > 4_096 =>
             {
@@ -127,6 +128,8 @@ pub enum Command {
         revision: Revision,
     },
     CapturePackage(CapturePackageRequest),
+    /// Cancel one not-yet-published task and block its dependent tasks.
+    CancelTask(CancelTaskRequest),
     GetPackage {
         package_id: PackageId,
         revision: Revision,
@@ -146,6 +149,24 @@ pub struct CapturePackageRequest {
     pub feature_id: FeatureId,
     pub plan_revision: Revision,
     pub task_ids: BTreeSet<TaskId>,
+}
+
+/// A user-requested cancellation for one task in an immutable plan revision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CancelTaskRequest {
+    pub feature_id: FeatureId,
+    pub plan_revision: Revision,
+    pub task_id: TaskId,
+    pub message: String,
+}
+
+impl CancelTaskRequest {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.message.trim().is_empty() || self.message.len() > 1_024 {
+            return Err(ProtocolValidationError::InvalidLifecycleMessage);
+        }
+        Ok(())
+    }
 }
 
 impl CapturePackageRequest {
@@ -317,6 +338,16 @@ pub struct PackageView {
     pub created_at_unix_ms: i64,
 }
 
+/// Durable result of cancelling one task and propagating its dependency consequences.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskCancellationView {
+    pub feature_id: FeatureId,
+    pub plan_revision: Revision,
+    pub task_id: TaskId,
+    pub blocked_dependents: Vec<TaskId>,
+    pub invalidated_evidence: usize,
+}
+
 /// An unresolved package-storage issue retained for recovery and operator action.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueueRecoveryIssueView {
@@ -409,6 +440,9 @@ pub enum ResponseData {
     Package {
         package: PackageView,
     },
+    TaskCancelled {
+        cancellation: TaskCancellationView,
+    },
     QueueAudit {
         audit: QueueAuditView,
     },
@@ -478,6 +512,8 @@ pub enum ProtocolValidationError {
     InvalidPrerequisite(String),
     #[error("snapshot package must select between 1 and 1000 plan tasks")]
     InvalidPackageTasks,
+    #[error("cancellation message must contain 1-1024 non-whitespace bytes")]
+    InvalidLifecycleMessage,
     #[error("queue export destination must contain 1-4096 bytes")]
     InvalidExportDestination,
 }

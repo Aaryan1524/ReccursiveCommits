@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 11;
+pub const STORAGE_SCHEMA_VERSION: u32 = 12;
 
 struct Migration {
     version: u32,
@@ -456,6 +456,27 @@ const MIGRATIONS: &[Migration] = &[
 
         ALTER TABLE validation_evidence ADD COLUMN invalidated_reason TEXT
             CHECK (invalidated_reason IS NULL OR length(trim(invalidated_reason)) > 0);
+        "#,
+    },
+    Migration {
+        version: 12,
+        sql: r#"
+        -- A persisted candidate is not necessarily based on the package's original workspace
+        -- base: publication may first reconcile it onto a newer target. Keep that actual parent
+        -- with the push intent so restart recovery can tell an unlanded push from another writer.
+        ALTER TABLE release_attempts
+            ADD COLUMN candidate_parent_sha TEXT
+                CHECK (candidate_parent_sha IS NULL OR length(candidate_parent_sha) = 40);
+
+        -- The release worker never sleeps while it owns a lease. This timestamp is the hand-off
+        -- to the scheduler: a transport retry becomes eligible at a durable future instant.
+        ALTER TABLE release_attempts
+            ADD COLUMN retry_not_before_unix_ms INTEGER
+                CHECK (retry_not_before_unix_ms IS NULL OR retry_not_before_unix_ms >= 0);
+
+        CREATE INDEX idx_release_attempts_retry_due
+            ON release_attempts(retry_not_before_unix_ms)
+            WHERE retry_not_before_unix_ms IS NOT NULL;
         "#,
     },
 ];

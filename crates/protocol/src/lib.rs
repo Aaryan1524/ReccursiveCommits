@@ -12,8 +12,8 @@ pub use reccursive_core::{
 use serde::{Deserialize, Serialize};
 pub use transport::{LocalClient, TransportError};
 
-/// Initial local API protocol version.
-pub const API_VERSION: u16 = 2;
+/// Local API protocol version. Version 3 adds release control and attempt inspection.
+pub const API_VERSION: u16 = 3;
 
 /// Maximum encoded request or response size accepted by the local transport.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -77,6 +77,10 @@ impl RequestEnvelope {
             Command::CreateWorkspace(request) => request.validate(),
             Command::CapturePackage(request) => request.validate(),
             Command::CancelTask(request) => request.validate(),
+            Command::ReleasePackage(request) => request.validate(),
+            Command::ListReleaseAttempts { limit, .. } if !(1..=1_000).contains(limit) => {
+                Err(ProtocolValidationError::InvalidAttemptLimit)
+            }
             Command::ExportQueue { destination }
                 if destination.is_empty() || destination.len() > 4_096 =>
             {
@@ -95,6 +99,8 @@ impl RequestEnvelope {
             | Command::PlanHistory { .. }
             | Command::GetWorkspace { .. }
             | Command::GetPackage { .. }
+            | Command::GetReleaseAttempt { .. }
+            | Command::ListReleaseAttempts { .. }
             | Command::AuditQueue
             | Command::ExportQueue { .. }
             | Command::Status => Ok(()),
@@ -130,6 +136,17 @@ pub enum Command {
     CapturePackage(CapturePackageRequest),
     /// Cancel one not-yet-published task and block its dependent tasks.
     CancelTask(CancelTaskRequest),
+    /// Reconcile, validate, and publish one immutable package through the daemon-owned worker.
+    ReleasePackage(ReleasePackageRequest),
+    /// Inspect one durable publication attempt.
+    GetReleaseAttempt {
+        attempt_id: AttemptId,
+    },
+    /// List recent publication attempts, optionally restricted to one package.
+    ListReleaseAttempts {
+        package_id: Option<PackageId>,
+        limit: usize,
+    },
     GetPackage {
         package_id: PackageId,
         revision: Revision,
@@ -158,6 +175,31 @@ pub struct CancelTaskRequest {
     pub plan_revision: Revision,
     pub task_id: TaskId,
     pub message: String,
+}
+
+/// Explicit commit metadata for a daemon-owned publication attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReleasePackageRequest {
+    pub package_id: PackageId,
+    pub revision: Revision,
+    pub message: String,
+    pub author_name: String,
+    pub author_email: String,
+}
+
+impl ReleasePackageRequest {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        for (field, value, maximum) in [
+            ("release message", &self.message, 8_192),
+            ("author name", &self.author_name, 512),
+            ("author email", &self.author_email, 512),
+        ] {
+            if value.trim().is_empty() || value.len() > maximum || value.contains('\0') {
+                return Err(ProtocolValidationError::InvalidReleaseField(field));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl CancelTaskRequest {
@@ -348,6 +390,31 @@ pub struct TaskCancellationView {
     pub invalidated_evidence: usize,
 }
 
+/// Durable publication state returned to local clients without exposing credentials.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseAttemptView {
+    pub attempt_id: AttemptId,
+    pub repository_id: RepositoryId,
+    pub package_id: PackageId,
+    pub package_revision: Revision,
+    pub target_remote: String,
+    pub target: TargetRef,
+    pub base_commit: String,
+    pub candidate_sha: Option<String>,
+    pub candidate_parent_sha: Option<String>,
+    pub push_intent_at_unix_ms: Option<i64>,
+    pub observed_remote_sha: Option<String>,
+    pub failure_classification: Option<String>,
+    pub failed_attempts: u8,
+    pub retry_not_before_unix_ms: Option<i64>,
+    pub status: TaskStatus,
+    pub reason: Option<StateReason>,
+    pub blocked_from: Option<TaskStatus>,
+    pub lease_expires_at_unix_ms: i64,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
 /// An unresolved package-storage issue retained for recovery and operator action.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueueRecoveryIssueView {
@@ -443,6 +510,12 @@ pub enum ResponseData {
     TaskCancelled {
         cancellation: TaskCancellationView,
     },
+    ReleaseAttempt {
+        attempt: ReleaseAttemptView,
+    },
+    ReleaseAttempts {
+        attempts: Vec<ReleaseAttemptView>,
+    },
     QueueAudit {
         audit: QueueAuditView,
     },
@@ -514,6 +587,10 @@ pub enum ProtocolValidationError {
     InvalidPackageTasks,
     #[error("cancellation message must contain 1-1024 non-whitespace bytes")]
     InvalidLifecycleMessage,
+    #[error("{0} must contain non-whitespace text within its length limit and no NUL bytes")]
+    InvalidReleaseField(&'static str),
+    #[error("release attempt limit must be between 1 and 1000")]
+    InvalidAttemptLimit,
     #[error("queue export destination must contain 1-4096 bytes")]
     InvalidExportDestination,
 }
@@ -590,5 +667,39 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn release_requests_and_attempt_limits_are_validated() {
+        let token = AuthToken::new("a".repeat(32)).unwrap();
+        let invalid = RequestEnvelope::new(
+            token.clone(),
+            Command::ReleasePackage(ReleasePackageRequest {
+                package_id: PackageId::new(),
+                revision: Revision::FIRST,
+                message: " ".into(),
+                author_name: "Aaryan".into(),
+                author_email: "aaryan@example.invalid".into(),
+            }),
+        );
+        assert_eq!(
+            invalid.validate(),
+            Err(ProtocolValidationError::InvalidReleaseField(
+                "release message"
+            ))
+        );
+        for limit in [0, 1_001] {
+            let request = RequestEnvelope::new(
+                token.clone(),
+                Command::ListReleaseAttempts {
+                    package_id: None,
+                    limit,
+                },
+            );
+            assert_eq!(
+                request.validate(),
+                Err(ProtocolValidationError::InvalidAttemptLimit)
+            );
+        }
     }
 }

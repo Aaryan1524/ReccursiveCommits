@@ -20,9 +20,10 @@ use reccursive_protocol::{
     ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest, Command,
     CreateWorkspaceRequest, EnrollRepositoryRequest, EventSeverityView, EventView, PackageView,
     PlanView, ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView,
-    ReasonCode, RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId,
-    ResponseData, ResponseEnvelope, Revision, StateReason, TaskCancellationView, TaskStatus,
-    TransportError, WorkspacePrerequisiteView, WorkspaceView,
+    ReasonCode, ReleaseAttemptView, ReleasePackageRequest, RepositoryId, RepositoryPolicy,
+    RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision,
+    StateReason, TaskCancellationView, TaskStatus, TransportError, WorkspacePrerequisiteView,
+    WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -70,6 +71,7 @@ pub struct LocalService {
     store: Arc<Mutex<Store>>,
     managed_root: Arc<PathBuf>,
     workspace_root: Arc<PathBuf>,
+    release_root: Arc<PathBuf>,
     package_root: Arc<PathBuf>,
 }
 
@@ -81,6 +83,7 @@ impl LocalService {
         let state_root = fs::canonicalize(&owner.paths.state_dir)?;
         let managed_root = state_root.join("repositories");
         let workspace_root = state_root.join("workspaces");
+        let release_root = state_root.join("releases");
         let package_root = state_root.join("packages");
         reconcile_snapshot_storage(&mut store, &package_root)?;
         reconcile_interrupted_releases(&mut store, &managed_root, &state_root.join("releases"))?;
@@ -89,6 +92,7 @@ impl LocalService {
             store: Arc::new(Mutex::new(store)),
             managed_root: Arc::new(managed_root),
             workspace_root: Arc::new(workspace_root),
+            release_root: Arc::new(release_root),
             package_root: Arc::new(package_root),
         })
     }
@@ -101,6 +105,7 @@ impl LocalService {
             let store = Arc::clone(&self.store);
             let managed_root = Arc::clone(&self.managed_root);
             let workspace_root = Arc::clone(&self.workspace_root);
+            let release_root = Arc::clone(&self.release_root);
             let package_root = Arc::clone(&self.package_root);
             thread::spawn(move || {
                 let _ = handle_connection(
@@ -109,6 +114,7 @@ impl LocalService {
                     &store,
                     &managed_root,
                     &workspace_root,
+                    &release_root,
                     &package_root,
                 );
             });
@@ -125,6 +131,7 @@ impl LocalService {
             let store = Arc::clone(&self.store);
             let managed_root = Arc::clone(&self.managed_root);
             let workspace_root = Arc::clone(&self.workspace_root);
+            let release_root = Arc::clone(&self.release_root);
             let package_root = Arc::clone(&self.package_root);
             workers.push(thread::spawn(move || {
                 handle_connection(
@@ -133,6 +140,7 @@ impl LocalService {
                     &store,
                     &managed_root,
                     &workspace_root,
+                    &release_root,
                     &package_root,
                 )
             }));
@@ -261,6 +269,7 @@ fn handle_connection(
     store: &Mutex<Store>,
     managed_root: &Path,
     workspace_root: &Path,
+    release_root: &Path,
     package_root: &Path,
 ) -> Result<(), ServiceError> {
     let request = match read_message::<RequestEnvelope>(&mut stream) {
@@ -302,6 +311,7 @@ fn handle_connection(
             store,
             managed_root,
             workspace_root,
+            release_root,
             package_root,
         );
         match record_api_event(store, request_id, command_name, &result) {
@@ -321,6 +331,7 @@ fn dispatch(
     store: &Mutex<Store>,
     managed_root: &Path,
     workspace_root: &Path,
+    release_root: &Path,
     package_root: &Path,
 ) -> Result<ResponseData, ApiError> {
     match command {
@@ -396,6 +407,13 @@ fn dispatch(
         } => get_workspace(feature_id, revision, store),
         Command::CapturePackage(request) => capture_package(request, store, package_root),
         Command::CancelTask(request) => cancel_task(request, store),
+        Command::ReleasePackage(request) => {
+            release_package(request, store, managed_root, release_root)
+        }
+        Command::GetReleaseAttempt { attempt_id } => get_release_attempt(attempt_id, store),
+        Command::ListReleaseAttempts { package_id, limit } => {
+            list_release_attempts(package_id, limit, store)
+        }
         Command::GetPackage {
             package_id,
             revision,
@@ -419,6 +437,9 @@ fn command_name(command: &Command) -> &'static str {
         Command::GetWorkspace { .. } => "workspace.show",
         Command::CapturePackage(_) => "package.capture",
         Command::CancelTask(_) => "task.cancel",
+        Command::ReleasePackage(_) => "release.publish",
+        Command::GetReleaseAttempt { .. } => "release.attempt",
+        Command::ListReleaseAttempts { .. } => "release.attempts",
         Command::GetPackage { .. } => "package.show",
         Command::AuditQueue => "queue.audit",
         Command::ExportQueue { .. } => "queue.export",
@@ -463,6 +484,12 @@ fn record_api_event(
             Some("plan_task".into()),
             Some(cancellation.task_id.to_string()),
             Some(cancellation.plan_revision),
+        ),
+        Ok(ResponseData::ReleaseAttempt { attempt }) => (
+            Some(attempt.repository_id),
+            Some("release_attempt".into()),
+            Some(attempt.attempt_id.to_string()),
+            Some(attempt.package_revision),
         ),
         Ok(ResponseData::QueueExported { .. }) | Ok(ResponseData::QueueAudit { .. }) => {
             (None, Some("queue_storage".into()), None, None)
@@ -1436,6 +1463,118 @@ fn cancel_task(request: CancelTaskRequest, store: &Mutex<Store>) -> Result<Respo
     })
 }
 
+fn release_package(
+    request: ReleasePackageRequest,
+    store: &Mutex<Store>,
+    managed_root: &Path,
+    release_root: &Path,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let worker =
+        crate::release::ReleaseWorker::new(managed_root, release_root, crate::SERVICE_NAME);
+    let mut store = lock_store(store)?;
+    let outcome = worker
+        .release(
+            &mut store,
+            &crate::release::ReleaseRequest {
+                package_id: request.package_id,
+                package_revision: request.revision,
+                message: request.message,
+                author_name: request.author_name,
+                author_email: request.author_email,
+            },
+            now,
+        )
+        .map_err(release_api_error)?;
+    let attempt_id = match outcome {
+        crate::release::ReleaseOutcome::Published { attempt_id, .. }
+        | crate::release::ReleaseOutcome::Blocked { attempt_id, .. }
+        | crate::release::ReleaseOutcome::Deferred { attempt_id, .. } => attempt_id,
+    };
+    let attempt = store
+        .release_attempt(attempt_id)
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                "release worker completed without a durable attempt",
+                false,
+            )
+        })?;
+    Ok(ResponseData::ReleaseAttempt {
+        attempt: release_attempt_view(attempt),
+    })
+}
+
+fn get_release_attempt(
+    attempt_id: reccursive_protocol::AttemptId,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let attempt = lock_store(store)?
+        .release_attempt(attempt_id)
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotFound,
+                format!("release attempt {attempt_id} was not found"),
+                false,
+            )
+        })?;
+    Ok(ResponseData::ReleaseAttempt {
+        attempt: release_attempt_view(attempt),
+    })
+}
+
+fn list_release_attempts(
+    package_id: Option<reccursive_protocol::PackageId>,
+    limit: usize,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let attempts = lock_store(store)?
+        .release_attempts(package_id, limit)
+        .map_err(store_api_error)?
+        .into_iter()
+        .map(release_attempt_view)
+        .collect();
+    Ok(ResponseData::ReleaseAttempts { attempts })
+}
+
+fn release_attempt_view(attempt: reccursive_store::ReleaseAttempt) -> ReleaseAttemptView {
+    ReleaseAttemptView {
+        attempt_id: attempt.attempt_id,
+        repository_id: attempt.repository_id,
+        package_id: attempt.package_id,
+        package_revision: attempt.package_revision,
+        target_remote: attempt.remote,
+        target: attempt.target,
+        base_commit: attempt.base_commit,
+        candidate_sha: attempt.candidate_sha,
+        candidate_parent_sha: attempt.candidate_parent_sha,
+        push_intent_at_unix_ms: attempt.push_intent_at_unix_ms,
+        observed_remote_sha: attempt.observed_remote_sha,
+        failure_classification: attempt.failure_classification,
+        failed_attempts: attempt.failed_attempts,
+        retry_not_before_unix_ms: attempt.retry_not_before_unix_ms,
+        status: attempt.state.status(),
+        reason: attempt.state.reason().cloned(),
+        blocked_from: attempt.state.blocked_from(),
+        lease_expires_at_unix_ms: attempt.lease.expires_at_unix_ms,
+        created_at_unix_ms: attempt.created_at_unix_ms,
+        updated_at_unix_ms: attempt.updated_at_unix_ms,
+    }
+}
+
+fn release_api_error(error: crate::release::ReleaseError) -> ApiError {
+    match error {
+        crate::release::ReleaseError::Store(error) => store_api_error(error),
+        error => ApiError::new(
+            ApiErrorCode::TemporarilyUnavailable,
+            format!("release could not be started: {error}"),
+            true,
+        ),
+    }
+}
+
 fn run_trusted_check(
     check: &TrustedCheck,
     workspace: &WorkspaceRecord,
@@ -1760,8 +1899,8 @@ pub enum ServiceError {
 mod tests {
     use super::*;
     use reccursive_protocol::{
-        API_VERSION, AcceptanceCheck, FeaturePlan, LocalClient, PLAN_SCHEMA_VERSION, PlanPhase,
-        PlanTask, PublicationMode, ResponseData, TargetRef,
+        API_VERSION, AcceptanceCheck, AttemptId, FeaturePlan, LocalClient, PLAN_SCHEMA_VERSION,
+        PlanPhase, PlanTask, PublicationMode, ResponseData, TargetRef,
     };
     use std::collections::BTreeMap;
     use std::net::Shutdown;
@@ -1821,6 +1960,25 @@ mod tests {
                 ..
             })
         ));
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn attempt_inspection_is_available_over_the_authenticated_local_api() {
+        let directory = tempdir().unwrap();
+        let paths = ServicePaths::new(directory.path());
+        let service = LocalService::bind(paths.clone()).unwrap();
+        let worker = thread::spawn(move || service.serve_connections(1));
+        let response = LocalClient::from_token_file(&paths.auth_token)
+            .unwrap()
+            .send(
+                &paths.socket,
+                Command::GetReleaseAttempt {
+                    attempt_id: AttemptId::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(response.result.unwrap_err().code, ApiErrorCode::NotFound);
         worker.join().unwrap().unwrap();
     }
 

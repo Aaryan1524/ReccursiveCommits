@@ -370,6 +370,33 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// Lists most recently updated attempts, optionally restricted to a package.
+    pub fn release_attempts(
+        &self,
+        package_id: Option<PackageId>,
+        limit: usize,
+    ) -> Result<Vec<ReleaseAttempt>, StoreError> {
+        let limit = i64::try_from(limit)
+            .map_err(|_| StoreError::InvalidData("attempt list limit is too large".into()))?;
+        let query = format!(
+            "SELECT {ATTEMPT_COLUMNS} FROM release_attempts {} \
+             ORDER BY updated_at_unix_ms DESC, attempt_id DESC LIMIT ?1",
+            if package_id.is_some() {
+                "WHERE package_id = ?2"
+            } else {
+                ""
+            }
+        );
+        let mut statement = self.connection.prepare(&query)?;
+        let rows = match package_id {
+            Some(package_id) => {
+                statement.query_map(params![limit, package_id.to_string()], attempt_from_row)?
+            }
+            None => statement.query_map([limit], attempt_from_row)?,
+        };
+        rows.map(|row| row.map_err(StoreError::from)).collect()
+    }
+
     /// Records the candidate commit and the intent to push it, before the remote is contacted.
     ///
     /// This is the durable half of invariant 5: after this returns, a crash can still discover
@@ -875,6 +902,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reloaded, prepared);
+    }
+
+    #[test]
+    fn attempts_are_listed_by_recent_update_and_can_be_filtered_by_package() {
+        let mut fixture = fixture();
+        let first = fixture
+            .store
+            .open_release_attempt(&fixture.request("first", 10))
+            .unwrap();
+        fixture
+            .store
+            .advance_release_attempt(first.attempt_id, TaskStatus::Reconciling, None, 2)
+            .unwrap();
+        let all = fixture.store.release_attempts(None, 10).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].attempt_id, first.attempt_id);
+        let matching = fixture
+            .store
+            .release_attempts(Some(fixture.package_id), 1)
+            .unwrap();
+        assert_eq!(matching, all);
+        assert!(
+            fixture
+                .store
+                .release_attempts(Some(PackageId::new()), 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

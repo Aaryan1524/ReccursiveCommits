@@ -22,8 +22,8 @@ pub use policy::{
 pub use release::{ReleaseUnit, ReleaseUnitError};
 pub use revision::{Revision, RevisionError};
 pub use schedule::{
-    DailyReleaseRange, DailyTime, DailyWindow, IanaTimeZone, MissedWindowBehavior, SchedulePolicy,
-    SchedulePolicyError, SchedulePolicyOverride, Weekday,
+    DailyReleaseRange, DailyTime, DailyWindow, IanaTimeZone, MissedWindowBehavior, PlannedSlot,
+    SchedulePolicy, SchedulePolicyError, SchedulePolicyOverride, SlotGenerator, Weekday,
 };
 pub use task::{ReasonCode, StateReason, TaskState, TaskStatus, TransitionError};
 

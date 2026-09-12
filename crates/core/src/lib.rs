@@ -6,6 +6,7 @@ mod plan;
 mod policy;
 mod release;
 mod revision;
+mod schedule;
 mod task;
 
 pub use graph::{GraphError, TaskDefinition, TaskDefinitionError, TaskGraph};
@@ -20,6 +21,10 @@ pub use policy::{
 };
 pub use release::{ReleaseUnit, ReleaseUnitError};
 pub use revision::{Revision, RevisionError};
+pub use schedule::{
+    DailyReleaseRange, DailyTime, DailyWindow, IanaTimeZone, MissedWindowBehavior, SchedulePolicy,
+    SchedulePolicyError, SchedulePolicyOverride, Weekday,
+};
 pub use task::{ReasonCode, StateReason, TaskState, TaskStatus, TransitionError};
 
 /// Version of the in-process domain contract.

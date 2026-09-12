@@ -364,7 +364,17 @@ impl Store {
                )",
             params![task_id.to_string(), now_unix_ms, reason],
         )?;
-        Ok(changed)
+        let candidate_changed = self.connection.execute(
+            "UPDATE candidate_validation_evidence
+             SET invalidated_at_unix_ms = ?2, invalidated_reason = ?3
+             WHERE invalidated_at_unix_ms IS NULL
+               AND (package_id, package_revision) IN (
+                   SELECT package_id, package_revision FROM snapshot_package_tasks
+                   WHERE task_id = ?1
+               )",
+            params![task_id.to_string(), now_unix_ms, reason],
+        )?;
+        Ok(changed + candidate_changed)
     }
 }
 

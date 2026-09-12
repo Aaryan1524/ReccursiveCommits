@@ -20,7 +20,7 @@ use std::{
 };
 
 pub use attempts::{AttemptLease, NewReleaseAttempt, ReleaseAttempt};
-pub use checks::{TrustedCheck, ValidationEvidence};
+pub use checks::{CandidateValidationEvidence, TrustedCheck, ValidationEvidence};
 pub use events::{DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, StoredEvent};
 pub use migrations::STORAGE_SCHEMA_VERSION;
 pub use plans::StoredPlan;

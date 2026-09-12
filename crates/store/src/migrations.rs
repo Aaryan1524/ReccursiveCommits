@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 12;
+pub const STORAGE_SCHEMA_VERSION: u32 = 13;
 
 struct Migration {
     version: u32,
@@ -477,6 +477,40 @@ const MIGRATIONS: &[Migration] = &[
         CREATE INDEX idx_release_attempts_retry_due
             ON release_attempts(retry_not_before_unix_ms)
             WHERE retry_not_before_unix_ms IS NOT NULL;
+        "#,
+    },
+    Migration {
+        version: 13,
+        sql: r#"
+        -- Capture-time evidence describes the isolated workspace. Publication must re-run the
+        -- same checks against the reconciled candidate, where its parent and inherited process
+        -- environment may differ. Keep those runs distinct and auditable.
+        CREATE TABLE candidate_validation_evidence (
+            attempt_id TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            package_revision INTEGER NOT NULL CHECK (package_revision > 0),
+            check_id TEXT NOT NULL CHECK (length(trim(check_id)) > 0),
+            base_commit TEXT NOT NULL CHECK (length(base_commit) = 40),
+            package_content_hash TEXT NOT NULL CHECK (length(package_content_hash) = 64),
+            command_json TEXT NOT NULL CHECK (json_valid(command_json)),
+            environment_fingerprint TEXT NOT NULL CHECK (length(environment_fingerprint) = 64),
+            exit_code INTEGER,
+            timed_out INTEGER NOT NULL CHECK (timed_out IN (0, 1)),
+            output_summary TEXT NOT NULL,
+            executed_at_unix_ms INTEGER NOT NULL CHECK (executed_at_unix_ms >= 0),
+            invalidated_at_unix_ms INTEGER
+                CHECK (invalidated_at_unix_ms IS NULL OR invalidated_at_unix_ms >= 0),
+            invalidated_reason TEXT
+                CHECK (invalidated_reason IS NULL OR length(trim(invalidated_reason)) > 0),
+            PRIMARY KEY (attempt_id, check_id),
+            FOREIGN KEY (attempt_id) REFERENCES release_attempts(attempt_id) ON DELETE CASCADE,
+            FOREIGN KEY (package_id, package_revision)
+                REFERENCES snapshot_packages(package_id, revision) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_candidate_validation_current
+            ON candidate_validation_evidence(package_id, package_revision, check_id)
+            WHERE invalidated_at_unix_ms IS NULL;
         "#,
     },
 ];

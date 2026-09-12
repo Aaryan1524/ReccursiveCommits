@@ -11,7 +11,8 @@ use reccursive_protocol::{
     ApiError, ApiErrorCode, CancelTaskRequest, CapturePackageRequest, Command,
     CreateWorkspaceRequest, EnrollRepositoryRequest, EventSeverityView, EventView, FeatureId,
     FeaturePlan, LocalClient, PackageId, PackageView, PlanView, PublicationMode, QueueAuditView,
-    QueueExportView, RepositoryView, ResponseData, Revision, TargetRef, TaskId, WorkspaceView,
+    QueueExportView, ReleaseAttemptView, ReleasePackageRequest, RepositoryView, ResponseData,
+    Revision, TargetRef, TaskId, WorkspaceView,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -70,6 +71,11 @@ enum TopLevelCommand {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    /// Publish a verified package or inspect durable publication attempts.
+    Release {
+        #[command(subcommand)]
+        command: ReleaseCommand,
+    },
     /// Inspect package recovery state or create a portable queue backup.
     Queue {
         #[command(subcommand)]
@@ -116,6 +122,33 @@ enum TaskCommand {
         task_id: TaskId,
         #[arg(long)]
         message: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ReleaseCommand {
+    /// Reconcile, validate, and publish one immutable package.
+    Publish {
+        package_id: PackageId,
+        #[arg(long, value_parser = parse_revision, default_value = "1")]
+        revision: Revision,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        author_name: String,
+        #[arg(long)]
+        author_email: String,
+    },
+    /// Show one durable publication attempt.
+    Attempt {
+        attempt_id: reccursive_protocol::AttemptId,
+    },
+    /// List recent publication attempts.
+    Attempts {
+        #[arg(long)]
+        package_id: Option<PackageId>,
+        #[arg(long, default_value_t = 50, value_parser = parse_event_limit)]
+        limit: usize,
     },
 }
 
@@ -407,6 +440,35 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 output_data(data, cli.json, stdout)
             }
         },
+        TopLevelCommand::Release { command } => match command {
+            ReleaseCommand::Publish {
+                package_id,
+                revision,
+                message,
+                author_name,
+                author_email,
+            } => {
+                let data = send(
+                    &paths,
+                    Command::ReleasePackage(ReleasePackageRequest {
+                        package_id,
+                        revision,
+                        message,
+                        author_name,
+                        author_email,
+                    }),
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            ReleaseCommand::Attempt { attempt_id } => {
+                let data = send(&paths, Command::GetReleaseAttempt { attempt_id })?;
+                output_data(data, cli.json, stdout)
+            }
+            ReleaseCommand::Attempts { package_id, limit } => {
+                let data = send(&paths, Command::ListReleaseAttempts { package_id, limit })?;
+                output_data(data, cli.json, stdout)
+            }
+        },
         TopLevelCommand::Queue { command } => match command {
             QueueCommand::Audit => {
                 let data = send(&paths, Command::AuditQueue)?;
@@ -672,6 +734,8 @@ fn output_data(
             cancellation.task_id,
             cancellation.blocked_dependents.len()
         ),
+        ResponseData::ReleaseAttempt { attempt } => output_release_attempt(out, &attempt),
+        ResponseData::ReleaseAttempts { attempts } => output_release_attempts(out, &attempts),
         ResponseData::QueueAudit { audit } => output_queue_audit(out, &audit),
         ResponseData::QueueExported { export } => output_queue_export(out, &export),
     }
@@ -737,6 +801,53 @@ fn output_package(out: &mut impl Write, package: &PackageView) -> io::Result<()>
         package.content_hash,
         package.task_ids.len()
     )
+}
+
+fn output_release_attempt(out: &mut impl Write, attempt: &ReleaseAttemptView) -> io::Result<()> {
+    writeln!(
+        out,
+        "Attempt: {}\nPackage: {} revision {}\nStatus: {:?}\nTarget: {} {}\nCandidate: {}\nRemote observed: {}\nRetry after: {}\nFailure: {}",
+        attempt.attempt_id,
+        attempt.package_id,
+        attempt.package_revision.get(),
+        attempt.status,
+        attempt.target_remote,
+        attempt.target.as_str(),
+        attempt.candidate_sha.as_deref().unwrap_or("not prepared"),
+        attempt
+            .observed_remote_sha
+            .as_deref()
+            .unwrap_or("not yet observed"),
+        attempt
+            .retry_not_before_unix_ms
+            .map_or_else(|| "not scheduled".into(), |value| value.to_string()),
+        attempt.failure_classification.as_deref().unwrap_or("none"),
+    )?;
+    if let Some(reason) = &attempt.reason {
+        writeln!(out, "Reason: {:?}: {}", reason.code, reason.message)?;
+    }
+    Ok(())
+}
+
+fn output_release_attempts(
+    out: &mut impl Write,
+    attempts: &[ReleaseAttemptView],
+) -> io::Result<()> {
+    if attempts.is_empty() {
+        return writeln!(out, "No release attempts found.");
+    }
+    for attempt in attempts {
+        writeln!(
+            out,
+            "{}  {:?}  {}@{}  {}",
+            attempt.attempt_id,
+            attempt.status,
+            attempt.package_id,
+            attempt.package_revision.get(),
+            attempt.failure_classification.as_deref().unwrap_or("-")
+        )?;
+    }
+    Ok(())
 }
 
 fn output_queue_audit(out: &mut impl Write, audit: &QueueAuditView) -> io::Result<()> {
@@ -934,6 +1045,30 @@ mod tests {
         assert!(parse_event_limit("0").is_err());
         assert!(parse_event_limit("1001").is_err());
         assert!(parse_event_limit("many").is_err());
+    }
+
+    #[test]
+    fn release_attempt_listing_is_a_valid_cli_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = run(
+            [
+                "reccursive",
+                "--state-dir",
+                directory.path().to_str().unwrap(),
+                "release",
+                "attempts",
+            ],
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(
+            exit,
+            EXIT_UNAVAILABLE,
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
     }
 
     #[test]

@@ -86,6 +86,14 @@ const RELEASE_CONCURRENCY_LIMIT: usize = 4;
 pub struct LocalService {
     owner: ServiceOwner,
     store: Arc<Mutex<Store>>,
+    /// Serializes whole submissions.
+    ///
+    /// A submission reads durable state, captures, groups and schedules — four steps that each
+    /// take the store lock and release it. Two submissions of the same task interleaving in that
+    /// gap both find nothing captured and both capture, which is the one outcome this command
+    /// exists to prevent. Held across the sequence rather than inside it, and taken only by
+    /// submission, so nothing else waits on it and there is no second lock order to get wrong.
+    submission: Arc<Mutex<()>>,
     managed_root: Arc<PathBuf>,
     workspace_root: Arc<PathBuf>,
     release_root: Arc<PathBuf>,
@@ -109,6 +117,7 @@ impl LocalService {
         Ok(Self {
             owner,
             store: Arc::new(Mutex::new(store)),
+            submission: Arc::new(Mutex::new(())),
             managed_root: Arc::new(managed_root),
             workspace_root: Arc::new(workspace_root),
             release_root: Arc::new(release_root),
@@ -173,6 +182,7 @@ impl LocalService {
             let stream = connection?;
             let auth_token = self.owner.auth_token.clone();
             let store = Arc::clone(&self.store);
+            let submission = Arc::clone(&self.submission);
             let managed_root = Arc::clone(&self.managed_root);
             let workspace_root = Arc::clone(&self.workspace_root);
             let release_root = Arc::clone(&self.release_root);
@@ -182,10 +192,13 @@ impl LocalService {
                     stream,
                     &auth_token,
                     &store,
-                    &managed_root,
-                    &workspace_root,
-                    &release_root,
-                    &package_root,
+                    &submission,
+                    ServiceRoots {
+                        managed: &managed_root,
+                        workspace: &workspace_root,
+                        release: &release_root,
+                        package: &package_root,
+                    },
                 );
             });
         }
@@ -199,6 +212,7 @@ impl LocalService {
             let (stream, _) = self.owner.listener.accept()?;
             let auth_token = self.owner.auth_token.clone();
             let store = Arc::clone(&self.store);
+            let submission = Arc::clone(&self.submission);
             let managed_root = Arc::clone(&self.managed_root);
             let workspace_root = Arc::clone(&self.workspace_root);
             let release_root = Arc::clone(&self.release_root);
@@ -208,10 +222,13 @@ impl LocalService {
                     stream,
                     &auth_token,
                     &store,
-                    &managed_root,
-                    &workspace_root,
-                    &release_root,
-                    &package_root,
+                    &submission,
+                    ServiceRoots {
+                        managed: &managed_root,
+                        workspace: &workspace_root,
+                        release: &release_root,
+                        package: &package_root,
+                    },
                 )
             }));
         }
@@ -220,6 +237,15 @@ impl LocalService {
         }
         Ok(())
     }
+}
+
+/// The four directories the daemon owns, passed together because they always travel together.
+#[derive(Clone, Copy)]
+struct ServiceRoots<'a> {
+    managed: &'a Path,
+    workspace: &'a Path,
+    release: &'a Path,
+    package: &'a Path,
 }
 
 struct ServiceOwner {
@@ -337,10 +363,8 @@ fn handle_connection(
     mut stream: UnixStream,
     expected_auth_token: &AuthToken,
     store: &Mutex<Store>,
-    managed_root: &Path,
-    workspace_root: &Path,
-    release_root: &Path,
-    package_root: &Path,
+    submission: &Mutex<()>,
+    roots: ServiceRoots<'_>,
 ) -> Result<(), ServiceError> {
     let request = match read_message::<RequestEnvelope>(&mut stream) {
         Ok(request) => request,
@@ -383,10 +407,8 @@ fn handle_connection(
                 command_name,
             },
             store,
-            managed_root,
-            workspace_root,
-            release_root,
-            package_root,
+            submission,
+            roots,
         );
         match record_api_event(store, request_id, command_name, &result) {
             Ok(()) => match result {
@@ -416,10 +438,8 @@ fn execute_command(
     command: Command,
     request: KeyedRequest<'_>,
     store: &Mutex<Store>,
-    managed_root: &Path,
-    workspace_root: &Path,
-    release_root: &Path,
-    package_root: &Path,
+    submission: &Mutex<()>,
+    roots: ServiceRoots<'_>,
 ) -> Result<ResponseData, ApiError> {
     let KeyedRequest {
         idempotency_key,
@@ -428,14 +448,7 @@ fn execute_command(
     // A key on a query is accepted and ignored: repeating a question is already safe, and
     // recording its answer would freeze that answer for every later use of the key.
     let Some(key) = idempotency_key.filter(|_| command.changes_state()) else {
-        return dispatch(
-            command,
-            store,
-            managed_root,
-            workspace_root,
-            release_root,
-            package_root,
-        );
+        return dispatch(command, store, submission, roots);
     };
 
     let fingerprint = command.fingerprint();
@@ -470,14 +483,7 @@ fn execute_command(
         IdempotencyClaim::Claimed => {}
     }
 
-    let result = dispatch(
-        command,
-        store,
-        managed_root,
-        workspace_root,
-        release_root,
-        package_root,
-    );
+    let result = dispatch(command, store, submission, roots);
 
     // A failure that provably never left this machine gives the key back, so a real retry runs. A
     // failure anywhere a push could have reached the remote keeps it: the error alone does not say
@@ -521,10 +527,8 @@ fn replay_outcome(key: &IdempotencyKey, outcome: &str) -> Result<ResponseData, A
 fn dispatch(
     command: Command,
     store: &Mutex<Store>,
-    managed_root: &Path,
-    workspace_root: &Path,
-    release_root: &Path,
-    package_root: &Path,
+    submission: &Mutex<()>,
+    roots: ServiceRoots<'_>,
 ) -> Result<ResponseData, ApiError> {
     match command {
         Command::Ping => {
@@ -592,21 +596,21 @@ fn dispatch(
                 .collect();
             Ok(ResponseData::PlanHistory { plans })
         }
-        Command::CreateWorkspace(request) => create_workspace(request, store, workspace_root),
+        Command::CreateWorkspace(request) => create_workspace(request, store, roots.workspace),
         Command::GetWorkspace {
             feature_id,
             revision,
         } => get_workspace(feature_id, revision, store),
-        Command::CapturePackage(request) => capture_package(request, store, package_root),
+        Command::CapturePackage(request) => capture_package(request, store, roots.package),
         Command::CancelTask(request) => cancel_task(request, store),
-        Command::SubmitTask(request) => submit_task(request, store, package_root),
+        Command::SubmitTask(request) => submit_task(request, store, submission, roots.package),
         Command::SealPlan { feature_id } => seal_plan(feature_id, store),
         Command::GetFeatureStatus {
             feature_id,
             revision,
         } => get_feature_status(feature_id, revision, store),
         Command::ReleasePackage(request) => {
-            release_package(request, store, managed_root, release_root)
+            release_package(request, store, roots.managed, roots.release)
         }
         Command::CreateReleaseUnit(request) => create_release_unit(request, store),
         Command::GetReleaseUnit { release_unit_id } => get_release_unit(release_unit_id, store),
@@ -648,9 +652,9 @@ fn dispatch(
             package_id,
             revision,
         } => get_package(package_id, revision, store),
-        Command::AuditQueue => audit_queue(store, package_root),
-        Command::ExportQueue { destination } => export_queue(destination, store, package_root),
-        Command::EnrollRepository(request) => enroll_repository(request, store, managed_root),
+        Command::AuditQueue => audit_queue(store, roots.package),
+        Command::ExportQueue { destination } => export_queue(destination, store, roots.package),
+        Command::EnrollRepository(request) => enroll_repository(request, store, roots.managed),
     }
 }
 
@@ -1866,8 +1870,22 @@ fn get_feature_status(
 fn submit_task(
     request: reccursive_protocol::SubmitTaskRequest,
     store: &Mutex<Store>,
+    submission: &Mutex<()>,
     package_root: &Path,
 ) -> Result<ResponseData, ApiError> {
+    // Held for the whole sequence. The four steps below each take and release the store lock, and
+    // two submissions of the same task interleaving in one of those gaps would both find nothing
+    // captured and both capture it — producing the duplicate this command exists to prevent, plus
+    // a package no unit publishes. A poisoned lock means an earlier submission panicked partway;
+    // the state it left is not something a new submission should build on.
+    let _submitting = submission.lock().map_err(|_| {
+        ApiError::new(
+            ApiErrorCode::Internal,
+            "an earlier submission failed partway and left the service unable to accept another",
+            false,
+        )
+    })?;
+
     let (plan_revision, existing) = {
         let store = lock_store(store)?;
         let plan = store

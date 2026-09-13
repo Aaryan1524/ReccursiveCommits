@@ -175,4 +175,47 @@ grep -q '"created":true' <<<"$second_submission" || fail "a distinct task was no
 [[ "$(json_field unit_id <<<"$second_submission")" != "$first_unit" ]] || \
   fail "a distinct task was grouped into the first unit"
 
-printf 'PASS one unit submitted twice produced one package, one unit, and one release time\n'
+second_due="$(sed -E 's/.*"selected_at_unix_ms":([0-9]+).*/\1/' <<<"$second_submission")"
+[[ "$second_due" != "$first_due" ]] || \
+  fail "two units were given the same release time; spacing is not being applied"
+
+# Two submissions of the same task at the same moment. The steps each take and release the store
+# lock, so without serialization both would find nothing captured and both would capture — leaving
+# two packages, one of which no unit publishes.
+third_task="task_00000000-0000-4000-8000-000000000804"
+cat >"$fixture_root/plan-revision-3.json" <<JSON
+{
+  "schema_version": 1,
+  "feature_id": "$feature_id",
+  "revision": 3,
+  "repository_id": "$repository_id",
+  "goal": "Submit one unit twice",
+  "target": "refs/heads/main",
+  "sealed": true,
+  "phases": [{
+    "id": "delivery",
+    "name": "Delivery",
+    "tasks": [
+      {"id":"$third_task","name":"Raced unit","dependencies":{},"acceptance_checks":[{"id":"c","description":"present"}]}
+    ]
+  }]
+}
+JSON
+cli plan import "$fixture_root/plan-revision-3.json" >/dev/null
+raced_workspace="$(cli workspace create "$feature_id" --revision 3 | json_field path)"
+printf 'raced\n' >"$raced_workspace/raced.txt"
+packages_before="$(ls "$fixture_root/state/packages" | wc -l | tr -d ' ')"
+cli task submit "$feature_id" --revision 3 --task "$third_task" >"$fixture_root/race-a.json" 2>&1 &
+race_a=$!
+cli task submit "$feature_id" --revision 3 --task "$third_task" >"$fixture_root/race-b.json" 2>&1 &
+race_b=$!
+wait "$race_a" || fail "a concurrent submission failed: $(cat "$fixture_root/race-a.json")"
+wait "$race_b" || fail "a concurrent submission failed: $(cat "$fixture_root/race-b.json")"
+created_count="$(cat "$fixture_root/race-a.json" "$fixture_root/race-b.json" | grep -o '"created":true' | wc -l | tr -d ' ')"
+[[ "$created_count" == "1" ]] || \
+  fail "$created_count of two concurrent submissions reported creating work; exactly one should"
+packages_after="$(ls "$fixture_root/state/packages" | wc -l | tr -d ' ')"
+[[ "$((packages_after - packages_before))" == "1" ]] || \
+  fail "two concurrent submissions captured $((packages_after - packages_before)) packages instead of one"
+
+printf 'PASS one unit submitted twice — sequentially and concurrently — produced one package, one unit, and one release time\n'

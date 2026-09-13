@@ -70,6 +70,9 @@ than an incomplete result plus a separate error object.
 
 Run `reccursive --help` for a short start-here path, or use
 `reccursive <command> --help` to inspect a command group before making changes.
+Human-readable list commands use headed tables. Cells are kept to a bounded
+single line so one unusually long path or diagnostic does not hide neighboring
+rows; use `--json` when a caller needs complete, untruncated values.
 
 An agent driving the CLI should start from
 [`AGENT_HANDOFF.md`](AGENT_HANDOFF.md), which specifies the whole sequence.

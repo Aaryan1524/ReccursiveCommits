@@ -198,6 +198,14 @@ this is rejected at enrollment rather than surfacing later as a conflict. The li
 release lease is keyed on the remote and target themselves, not on the repository
 profile, for the same reason.
 
+Once a repository has a schedule policy and a release unit has a selected time, the
+installed service publishes it without any further command. The same maintenance
+pass that notices a slot is due acts on it: the commit message is the plan's task
+name, and the author is the identity the enrolled checkout already uses for its own
+commits, so a scheduled commit is attributed exactly as a manual one would be. A
+repository with no `user.name` and `user.email` configured is skipped rather than
+attributed to an invented author.
+
 `diagnose` answers whether one repository could publish right now, before a
 release is attempted rather than after it has been blocked. It checks the remote
 with a read-only `ls-remote`, which proves the stored credential is accepted

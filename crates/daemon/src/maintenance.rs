@@ -47,6 +47,71 @@ impl ShutdownSignal {
     }
 }
 
+/// How one pass's releases turned out.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReleaseTally {
+    pub published: usize,
+    pub blocked: usize,
+    pub deferred: usize,
+}
+
+/// Identity and message for a release nobody is present to describe.
+///
+/// An autonomous release still has to say who made the commit and why. The identity comes from the
+/// enrolled checkout's own Git configuration, so a scheduled commit is attributed exactly as a
+/// manual one from that repository would be. The message is derived from the plan task names,
+/// because the plan is the only description of the work that exists without asking someone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseAttribution {
+    pub author_name: String,
+    pub author_email: String,
+}
+
+impl ReleaseAttribution {
+    /// Reads the identity Git itself would use for a commit in this checkout.
+    pub fn from_checkout(checkout_path: &std::path::Path) -> Option<Self> {
+        let name = git_config(checkout_path, "user.name")?;
+        let email = git_config(checkout_path, "user.email")?;
+        Some(Self {
+            author_name: name,
+            author_email: email,
+        })
+    }
+}
+
+fn git_config(checkout_path: &std::path::Path, key: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout_path)
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Builds the commit message for a unit from the plan that described it.
+///
+/// Deliberately plain and derived only from what the plan already says. Inventing a summary would
+/// mean describing work nobody reviewed the description of.
+pub fn release_message(task_names: &[String]) -> String {
+    match task_names {
+        [] => "chore: publish scheduled release unit".to_owned(),
+        [single] => single.clone(),
+        many => format!(
+            "{}\n\n{}",
+            "Publish scheduled release unit",
+            many.iter()
+                .map(|name| format!("- {name}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    }
+}
+
 /// What one maintenance pass found and did.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MaintenanceReport {
@@ -56,6 +121,12 @@ pub struct MaintenanceReport {
     pub repositories_reconciled: usize,
     /// Repositories whose reconciliation failed and was recorded instead.
     pub repositories_failed: usize,
+    /// Units whose selected time had arrived and which were published.
+    pub units_published: usize,
+    /// Units that were attempted and stopped with a durable, explained block.
+    pub units_blocked: usize,
+    /// Units whose transport failed and which a later pass will retry.
+    pub units_deferred: usize,
 }
 
 /// Runs the daemon's periodic work.
@@ -134,6 +205,81 @@ impl Maintenance {
             }
         }
         Ok(report)
+    }
+
+    /// Publishes every unit whose selected time has arrived.
+    ///
+    /// This is what makes a schedule mean anything without someone at the keyboard: the pass that
+    /// notices a slot is due is the same one that acts on it.
+    ///
+    /// Shutdown is honoured *between* units rather than during one. A release that has begun owns
+    /// a durable attempt and a lease, and abandoning it partway would leave the remote's state to
+    /// be rediscovered later; letting it finish is both safer and quicker than recovering from it.
+    pub fn release_due_units(
+        &self,
+        store: &mut Store,
+        worker: &crate::release::ReleaseWorker,
+        now_unix_ms: i64,
+        concurrency_limit: usize,
+    ) -> Result<ReleaseTally, StoreError> {
+        let due = crate::scheduler::Scheduler::due_units(store, now_unix_ms, concurrency_limit)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let mut tally = ReleaseTally::default();
+
+        for unit in due {
+            if self.shutdown.is_requested() {
+                break;
+            }
+            let Some(repository) = store.repository(unit.repository_id)? else {
+                continue;
+            };
+            // No identity configured means no commit can be attributed. Refusing is the only
+            // honest option: inventing an author would put a name on work it did not do.
+            let Some(attribution) = ReleaseAttribution::from_checkout(std::path::Path::new(
+                &repository.registration.checkout_path,
+            )) else {
+                continue;
+            };
+            let task_names = store
+                .release_unit(unit.release_unit_id)?
+                .map(|release_unit| {
+                    release_unit
+                        .task_ids
+                        .iter()
+                        .filter_map(|task_id| {
+                            store
+                                .task(
+                                    release_unit.feature_id,
+                                    release_unit.plan_revision,
+                                    *task_id,
+                                )
+                                .ok()
+                                .flatten()
+                                .map(|task| task.name)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            let request = crate::release::ReleaseRequest {
+                package_id: unit.package_id,
+                package_revision: unit.package_revision,
+                message: release_message(&task_names),
+                author_name: attribution.author_name,
+                author_email: attribution.author_email,
+            };
+            match worker.release(store, &request, now_unix_ms) {
+                Ok(crate::release::ReleaseOutcome::Published { .. }) => tally.published += 1,
+                Ok(crate::release::ReleaseOutcome::Blocked { .. }) => tally.blocked += 1,
+                // A transport failure already carries its own retry time; it is waiting, not
+                // broken, and must not be reported as needing attention.
+                Ok(crate::release::ReleaseOutcome::Deferred { .. }) => tally.deferred += 1,
+                // The attempt records its own reason; a failure here must not stop the units
+                // behind it from being tried.
+                Err(_) => tally.blocked += 1,
+            }
+        }
+        Ok(tally)
     }
 
     /// Reports whether the loop should stop before its next pass.

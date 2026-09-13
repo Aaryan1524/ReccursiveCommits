@@ -193,7 +193,10 @@ impl DailyReleaseRange {
 
 /// How an overdue slot is handled after an offline period or missed timer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "max_releases")]
+// Internally tagged rather than adjacently tagged: with `content = "max_releases"` the catch-up
+// variant serialized as {"kind":"catch_up","max_releases":{"max_releases":5}}, nesting a field
+// inside a container of the same name. Tagging internally gives the shape a person would write.
+#[serde(rename_all = "snake_case", tag = "kind")]
 pub enum MissedWindowBehavior {
     /// Choose a later allowed slot; never backdate a commit or automatically burst work.
     RescheduleForward,

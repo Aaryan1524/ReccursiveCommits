@@ -26,6 +26,12 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state workspace show feature
 cargo run -p reccursive-cli -- --state-dir /path/to/state package capture feature_<uuid> --revision 1 --task task_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state package show package_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state task cancel feature_<uuid> --revision 1 --task task_<uuid> --message "replaced by a newer approach"
+cargo run -p reccursive-cli -- --state-dir /path/to/state release create-unit feature_<uuid> --revision 1 --task task_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state release show-unit unit_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule set-policy repo_<uuid> schedule-policy.json
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule show-policy repo_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule unit unit_<uuid> --package-id package_<uuid> --revision 1
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule show unit_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue audit
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue export /absolute/path/to/queue-backup
 ```
@@ -82,6 +88,23 @@ consistent SQLite backup, only immutable packages that pass verification, and an
 export manifest containing the database SHA-256. It excludes mutable workspaces, local API
 tokens, and publication credentials. Import/restore into another installation is a
 later workflow, so an export itself cannot enable a second publisher.
+
+`release create-unit` groups tasks that cannot independently leave the target
+usable into one release unit; a task whose only remaining dependency is that its
+prerequisite be *captured* is coupled into the same unit, while a task waiting for
+a prerequisite to be *published* stands on its own. `release show-unit` inspects a
+previously created unit.
+
+`schedule set-policy` validates and activates one scheduling-policy revision for a
+repository from the portable JSON contract documented in
+[`SCHEDULE_POLICY_FORMAT.md`](SCHEDULE_POLICY_FORMAT.md); activating a later
+revision changes future selection only. `schedule show-policy` inspects the active
+policy. `schedule unit` selects a durable future release time for one captured
+release unit against its repository's active policy, moving the unit's tasks from
+`queued` to `scheduled`; calling it again for the same unit returns the existing
+slot rather than drawing a new one, so a restart or a retry never redraws a
+selection already made. `schedule show` inspects a previously selected slot without
+drawing one.
 
 ## Exit codes
 

@@ -12,24 +12,26 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::scheduler::{Scheduler, SchedulerError};
 use reccursive_capture::{
     ContentValidationPolicy, OwnedWorkspace, PrerequisiteState, SnapshotError, SnapshotPackage,
     SnapshotRequest, WorkspaceError, WorkspaceRequest as CaptureWorkspaceRequest,
 };
 use reccursive_protocol::{
     ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest, Command,
-    CreateWorkspaceRequest, EnrollRepositoryRequest, EventSeverityView, EventView, PackageView,
-    PlanView, ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView,
-    ReasonCode, ReleaseAttemptView, ReleasePackageRequest, RepositoryId, RepositoryPolicy,
-    RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision,
-    StateReason, TaskCancellationView, TaskStatus, TransportError, WorkspacePrerequisiteView,
-    WorkspaceView,
+    CreateReleaseUnitRequest, CreateWorkspaceRequest, EnrollRepositoryRequest, EventSeverityView,
+    EventView, PackageView, PlanView, ProtocolValidationError, QueueAuditView, QueueExportView,
+    QueueRecoveryIssueView, ReasonCode, ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView,
+    RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData,
+    ResponseEnvelope, Revision, SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest,
+    SetSchedulePolicyRequest, StateReason, TaskCancellationView, TaskStatus, TransportError,
+    WorkspacePrerequisiteView, WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
     DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, RepositoryRegistration,
     SnapshotRecord, SnapshotRecoveryIssue, Store, StoreError, StoredEvent, StoredPlan,
-    StoredRepository, TrustedCheck, ValidationEvidence, WorkspaceRecord,
+    StoredRepository, StoredSchedulePolicy, TrustedCheck, ValidationEvidence, WorkspaceRecord,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -410,6 +412,12 @@ fn dispatch(
         Command::ReleasePackage(request) => {
             release_package(request, store, managed_root, release_root)
         }
+        Command::CreateReleaseUnit(request) => create_release_unit(request, store),
+        Command::GetReleaseUnit { release_unit_id } => get_release_unit(release_unit_id, store),
+        Command::SetSchedulePolicy(request) => set_schedule_policy(request, store),
+        Command::GetSchedulePolicy { repository_id } => get_schedule_policy(repository_id, store),
+        Command::ScheduleUnit(request) => schedule_unit(request, store),
+        Command::GetScheduleSlot { release_unit_id } => get_schedule_slot(release_unit_id, store),
         Command::GetReleaseAttempt { attempt_id } => get_release_attempt(attempt_id, store),
         Command::ListReleaseAttempts { package_id, limit } => {
             list_release_attempts(package_id, limit, store)
@@ -438,6 +446,12 @@ fn command_name(command: &Command) -> &'static str {
         Command::CapturePackage(_) => "package.capture",
         Command::CancelTask(_) => "task.cancel",
         Command::ReleasePackage(_) => "release.publish",
+        Command::CreateReleaseUnit(_) => "release.unit.create",
+        Command::GetReleaseUnit { .. } => "release.unit.show",
+        Command::SetSchedulePolicy(_) => "schedule.policy.set",
+        Command::GetSchedulePolicy { .. } => "schedule.policy.show",
+        Command::ScheduleUnit(_) => "schedule.unit",
+        Command::GetScheduleSlot { .. } => "schedule.slot.show",
         Command::GetReleaseAttempt { .. } => "release.attempt",
         Command::ListReleaseAttempts { .. } => "release.attempts",
         Command::GetPackage { .. } => "package.show",
@@ -1504,6 +1518,201 @@ fn release_package(
     Ok(ResponseData::ReleaseAttempt {
         attempt: release_attempt_view(attempt),
     })
+}
+
+fn create_release_unit(
+    request: CreateReleaseUnitRequest,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let unit = lock_store(store)?
+        .create_release_unit(
+            request.release_unit_id,
+            request.feature_id,
+            request.plan_revision,
+            request.task_ids,
+            request.required_checks,
+            now,
+        )
+        .map_err(store_api_error)?;
+    Ok(ResponseData::ReleaseUnitCreated {
+        unit: release_unit_view(unit),
+    })
+}
+
+fn get_release_unit(
+    release_unit_id: reccursive_protocol::ReleaseUnitId,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let unit = lock_store(store)?
+        .release_unit(release_unit_id)
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotFound,
+                format!("release unit {release_unit_id} was not found"),
+                false,
+            )
+        })?;
+    Ok(ResponseData::ReleaseUnit {
+        unit: release_unit_view(unit),
+    })
+}
+
+fn release_unit_view(unit: reccursive_store::ReleaseUnitRecord) -> ReleaseUnitView {
+    ReleaseUnitView {
+        unit_id: unit.unit_id,
+        feature_id: unit.feature_id,
+        plan_revision: unit.plan_revision,
+        task_ids: unit.task_ids,
+        required_checks: unit.required_checks,
+        created_at_unix_ms: unit.created_at_unix_ms,
+    }
+}
+
+fn set_schedule_policy(
+    request: SetSchedulePolicyRequest,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let mut store = lock_store(store)?;
+    let next_revision = store
+        .schedule_policy(request.repository_id)
+        .map_err(store_api_error)?
+        .map_or(Revision::FIRST, |current| {
+            current.revision.next().unwrap_or(current.revision)
+        });
+    store
+        .activate_schedule_policy(&StoredSchedulePolicy {
+            repository_id: request.repository_id,
+            revision: next_revision,
+            policy: request.policy,
+            created_at_unix_ms: now,
+        })
+        .map_err(store_api_error)?;
+    let activated = store
+        .schedule_policy(request.repository_id)
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::Internal,
+                "activated schedule policy could not be read back",
+                false,
+            )
+        })?;
+    Ok(ResponseData::SchedulePolicyActivated {
+        policy: schedule_policy_view(activated),
+    })
+}
+
+fn get_schedule_policy(
+    repository_id: RepositoryId,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let policy = lock_store(store)?
+        .schedule_policy(repository_id)
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotFound,
+                format!("repository {repository_id} has no active schedule policy"),
+                false,
+            )
+        })?;
+    Ok(ResponseData::SchedulePolicy {
+        policy: schedule_policy_view(policy),
+    })
+}
+
+fn schedule_policy_view(policy: StoredSchedulePolicy) -> SchedulePolicyView {
+    SchedulePolicyView {
+        repository_id: policy.repository_id,
+        revision: policy.revision,
+        policy: policy.policy,
+        created_at_unix_ms: policy.created_at_unix_ms,
+    }
+}
+
+fn schedule_unit(
+    request: ScheduleUnitRequest,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let mut store = lock_store(store)?;
+    let slot = Scheduler::schedule(
+        &mut store,
+        request.release_unit_id,
+        request.package_id,
+        request.package_revision,
+        request.seed,
+        now,
+    )
+    .map_err(scheduler_api_error)?;
+    Ok(ResponseData::ScheduleSlot {
+        slot: schedule_slot_view(slot),
+    })
+}
+
+fn get_schedule_slot(
+    release_unit_id: reccursive_protocol::ReleaseUnitId,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let slot = lock_store(store)?
+        .schedule_slot(release_unit_id)
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotFound,
+                format!("release unit {release_unit_id} has no durable schedule slot"),
+                false,
+            )
+        })?;
+    Ok(ResponseData::ScheduleSlot {
+        slot: schedule_slot_view(slot),
+    })
+}
+
+fn schedule_slot_view(slot: reccursive_store::ScheduleSlot) -> ScheduleSlotView {
+    ScheduleSlotView {
+        release_unit_id: slot.release_unit_id,
+        repository_id: slot.repository_id,
+        package_id: slot.package_id,
+        package_revision: slot.package_revision,
+        policy_revision: slot.policy_revision,
+        timezone: slot.timezone.as_str().to_owned(),
+        eligible_at_unix_ms: slot.eligible_at_unix_ms,
+        selected_at_unix_ms: slot.selected_at_unix_ms,
+        created_at_unix_ms: slot.created_at_unix_ms,
+    }
+}
+
+fn scheduler_api_error(error: SchedulerError) -> ApiError {
+    match error {
+        SchedulerError::Store(error) => store_api_error(error),
+        SchedulerError::Policy(error) => {
+            ApiError::new(ApiErrorCode::InvalidRequest, error.to_string(), false)
+        }
+        SchedulerError::MissingReleaseUnit(id) => ApiError::new(
+            ApiErrorCode::NotFound,
+            format!("release unit {id} was not found"),
+            false,
+        ),
+        SchedulerError::MissingPlan => ApiError::new(
+            ApiErrorCode::NotFound,
+            "release unit plan was not found",
+            false,
+        ),
+        SchedulerError::MissingPolicy(repository_id) => ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            format!("repository {repository_id} has no active schedule policy"),
+            false,
+        ),
+        SchedulerError::NoSelectableSlot => ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            "the active schedule policy selected no future release slot",
+            false,
+        ),
+    }
 }
 
 fn get_release_attempt(

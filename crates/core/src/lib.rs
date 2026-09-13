@@ -5,6 +5,7 @@ mod ids;
 mod plan;
 mod policy;
 mod release;
+mod remote;
 mod revision;
 mod schedule;
 mod task;
@@ -20,6 +21,7 @@ pub use policy::{
     TargetMilestone, TargetRef,
 };
 pub use release::{ReleaseUnit, ReleaseUnitError};
+pub use remote::RemoteIdentity;
 pub use revision::{Revision, RevisionError};
 pub use schedule::{
     DailyReleaseRange, DailyTime, DailyWindow, IanaTimeZone, MissedWindowBehavior, PlannedSlot,

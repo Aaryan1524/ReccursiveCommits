@@ -109,7 +109,12 @@ impl Scheduler {
                 // A unit is claimable only while every one of its tasks is still merely scheduled.
                 // Anything further along is already owned by an attempt, and handing it out again
                 // would be a second publisher for the same work.
-                if !Self::is_claimable(store, slot.release_unit_id)? {
+                if !Self::is_claimable(
+                    store,
+                    slot.release_unit_id,
+                    slot.package_id,
+                    slot.package_revision,
+                )? {
                     continue;
                 }
                 due.push(DueUnit {
@@ -147,8 +152,26 @@ impl Scheduler {
         Ok(claimed)
     }
 
-    /// Reports whether every task in a unit is still waiting at its selected time.
-    fn is_claimable(store: &Store, release_unit_id: ReleaseUnitId) -> Result<bool, SchedulerError> {
+    /// Reports whether a unit is genuinely free to be picked up for release.
+    ///
+    /// Two independent things have to be true, because they move independently. The unit's tasks
+    /// must still be waiting at their selected time — anything further along is finished, blocked,
+    /// or cancelled. And no attempt may already be publishing this package: the release worker
+    /// advances the *attempt* through its stages and leaves the tasks at `scheduled` for the whole
+    /// flight, so task state alone would happily offer work that is already on its way to the
+    /// remote.
+    fn is_claimable(
+        store: &Store,
+        release_unit_id: ReleaseUnitId,
+        package_id: PackageId,
+        package_revision: Revision,
+    ) -> Result<bool, SchedulerError> {
+        if store
+            .live_attempt_for_package(package_id, package_revision)?
+            .is_some()
+        {
+            return Ok(false);
+        }
         let Some(unit) = store.release_unit(release_unit_id)? else {
             return Ok(false);
         };
@@ -684,43 +707,84 @@ mod tests {
 
     #[test]
     fn pausing_stops_new_work_without_disturbing_a_transmitted_push() {
+        use reccursive_store::{AttemptLease, NewReleaseAttempt};
+
         let now = 1_800_000_000_000;
         let (mut store, repository_id, units, feature_id, tasks) =
             overdue_fixture(MissedWindowBehavior::RescheduleForward, 2, now);
 
-        // One unit's push is already on the wire: its outcome exists on the remote whether or not
-        // anyone pauses anything, and it must keep its own recovery path.
+        // A real in-flight push, produced the way the release worker produces one: the attempt
+        // advances, the unit's tasks stay `scheduled`.
+        let slot = store.schedule_slot(units[0]).unwrap().unwrap();
+        let attempt = store
+            .open_release_attempt(&NewReleaseAttempt {
+                attempt_id: reccursive_core::AttemptId::new(),
+                repository_id,
+                package_id: slot.package_id,
+                package_revision: slot.package_revision,
+                remote: "ssh://git@example.invalid/missed.git".into(),
+                target: reccursive_core::TargetRef::new("refs/heads/main").unwrap(),
+                base_commit: object_id('a'),
+                lease: AttemptLease {
+                    owner: "worker".into(),
+                    expires_at_unix_ms: now + 300_000,
+                },
+                created_at_unix_ms: now,
+            })
+            .unwrap();
         for status in [
             TaskStatus::Reconciling,
             TaskStatus::Verifying,
             TaskStatus::CommitPrepared,
-            TaskStatus::PushPending,
         ] {
             store
-                .advance_task(feature_id, Revision::FIRST, tasks[0], status, None, now)
+                .advance_release_attempt(attempt.attempt_id, status, None, now)
                 .unwrap();
         }
+        store
+            .record_push_intent(attempt.attempt_id, &object_id('f'), &object_id('a'), now)
+            .unwrap();
+        store
+            .advance_release_attempt(attempt.attempt_id, TaskStatus::PushPending, None, now)
+            .unwrap();
         assert!(
             store
-                .task(feature_id, Revision::FIRST, tasks[0])
+                .release_attempt(attempt.attempt_id)
                 .unwrap()
                 .unwrap()
                 .state
                 .status()
-                .may_have_reached_remote()
+                .may_have_reached_remote(),
+            "this attempt's push is on the wire"
         );
 
+        // Only the second unit is free; the first is already being published.
         assert_eq!(Scheduler::due_units(&store, now, 10).unwrap().len(), 1);
+
         store
             .pause_repository(repository_id, "investigating a failure", now)
             .unwrap();
-
-        // Paused: nothing new is handed out.
         assert!(
             Scheduler::due_units(&store, now, 10).unwrap().is_empty(),
             "a paused repository must not hand out new work"
         );
-        // The transmitted push is untouched, not rolled back or re-queued.
+
+        // The transmitted push keeps its own state and its own recovery path. Pausing governs what
+        // starts, and this one already started.
+        let during_pause = store.release_attempt(attempt.attempt_id).unwrap().unwrap();
+        assert_eq!(during_pause.state.status(), TaskStatus::PushPending);
+        assert_eq!(
+            during_pause.candidate_sha.as_deref(),
+            Some(object_id('f').as_str())
+        );
+        assert_eq!(
+            store
+                .release_attempts_awaiting_remote_resolution()
+                .unwrap()
+                .len(),
+            1,
+            "an in-flight push must still be resolved against the remote despite the pause"
+        );
         assert_eq!(
             store
                 .task(feature_id, Revision::FIRST, tasks[0])
@@ -728,18 +792,9 @@ mod tests {
                 .unwrap()
                 .state
                 .status(),
-            TaskStatus::PushPending
-        );
-        assert_eq!(
-            store
-                .repository_pause(repository_id)
-                .unwrap()
-                .unwrap()
-                .reason,
-            "investigating a failure"
+            TaskStatus::Scheduled
         );
 
-        // Resuming restores exactly what was pending before.
         assert!(store.resume_repository(repository_id).unwrap());
         let resumed = Scheduler::due_units(&store, now, 10).unwrap();
         assert_eq!(resumed.len(), 1);
@@ -778,6 +833,49 @@ mod tests {
         assert!(
             refused.is_err(),
             "release-now must not bypass the eligibility rules: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_unit_whose_attempt_is_already_running_is_not_offered_again() {
+        use reccursive_store::{AttemptLease, NewReleaseAttempt};
+
+        let now = 1_800_000_000_000;
+        let (mut store, repository_id, units, _, _) =
+            overdue_fixture(MissedWindowBehavior::RescheduleForward, 2, now);
+
+        let first = store.schedule_slot(units[0]).unwrap().unwrap();
+        // Exactly what the release worker does when it picks work up: it opens an attempt and
+        // advances *the attempt*. The unit's tasks stay `scheduled` for the whole flight.
+        let attempt = store
+            .open_release_attempt(&NewReleaseAttempt {
+                attempt_id: reccursive_core::AttemptId::new(),
+                repository_id,
+                package_id: first.package_id,
+                package_revision: first.package_revision,
+                remote: "ssh://git@example.invalid/missed.git".into(),
+                target: reccursive_core::TargetRef::new("refs/heads/main").unwrap(),
+                base_commit: object_id('a'),
+                lease: AttemptLease {
+                    owner: "worker".into(),
+                    expires_at_unix_ms: now + 300_000,
+                },
+                created_at_unix_ms: now,
+            })
+            .unwrap();
+        store
+            .advance_release_attempt(attempt.attempt_id, TaskStatus::Reconciling, None, now)
+            .unwrap();
+
+        let due = Scheduler::due_units(&store, now, 10).unwrap();
+
+        assert!(
+            !due.iter().any(|unit| unit.release_unit_id == units[0]),
+            "a unit already being published must not be offered for release again"
+        );
+        assert!(
+            due.iter().any(|unit| unit.release_unit_id == units[1]),
+            "the untouched unit should still be offered"
         );
     }
 

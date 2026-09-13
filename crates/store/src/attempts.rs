@@ -336,15 +336,18 @@ impl Store {
             .execute(
                 "INSERT INTO release_attempts (
                     attempt_id, repository_id, package_id, package_revision, target_remote,
-                    target_ref, base_commit, status, lease_owner, lease_expires_at_unix_ms,
-                    created_at_unix_ms, updated_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'scheduled', ?8, ?9, ?10, ?10)",
+                    target_remote_identity, target_ref, base_commit, status, lease_owner,
+                    lease_expires_at_unix_ms, created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'scheduled', ?9, ?10, ?11, ?11)",
                 params![
                     request.attempt_id.to_string(),
                     request.repository_id.to_string(),
                     request.package_id.to_string(),
                     request.package_revision.get(),
                     request.remote,
+                    // The lease is held against the repository's identity, so a second profile
+                    // reaching the same repository by a different address cannot take it too.
+                    reccursive_core::RemoteIdentity::of(&request.remote).as_str(),
                     request.target.as_str(),
                     request.base_commit,
                     request.lease.owner,
@@ -633,6 +636,31 @@ impl Store {
     }
 
     /// Returns the attempt currently holding a remote and target, if any.
+    /// Returns the attempt currently publishing one package revision, if any.
+    ///
+    /// The release worker advances the *attempt* through its stages and leaves the unit's tasks at
+    /// `scheduled` for the whole flight, so task state cannot answer "is this already being
+    /// published?". This can.
+    pub fn live_attempt_for_package(
+        &self,
+        package_id: PackageId,
+        package_revision: Revision,
+    ) -> Result<Option<ReleaseAttempt>, StoreError> {
+        self.connection
+            .query_row(
+                &format!(
+                    "SELECT {ATTEMPT_COLUMNS} FROM release_attempts
+                     WHERE package_id = ?1 AND package_revision = ?2
+                       AND status NOT IN ('published', 'cancelled', 'superseded')
+                     ORDER BY updated_at_unix_ms DESC LIMIT 1"
+                ),
+                params![package_id.to_string(), package_revision.get()],
+                attempt_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     pub fn live_release_attempt(
         &self,
         repository_id: RepositoryId,

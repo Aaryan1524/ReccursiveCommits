@@ -65,6 +65,7 @@ impl Store {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         migrations::apply(&mut connection)?;
+        backfill_remote_identities(&mut connection)?;
         Self::verify_integrity(&connection)?;
         Ok(Self { connection })
     }
@@ -141,6 +142,47 @@ impl Store {
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
     }
+}
+
+/// Derives the remote identity for any row still carrying the empty default.
+///
+/// Deriving an identity means parsing a URL, which SQL cannot do, so this runs immediately after
+/// migration and before anything reads these columns. It is idempotent: rows that already have an
+/// identity are left alone, so it costs nothing on an already-migrated database.
+fn backfill_remote_identities(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction()?;
+    let pending: Vec<(String, String)> = {
+        let mut statement = transaction
+            .prepare("SELECT id, canonical_remote FROM repositories WHERE remote_identity = ''")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (id, address) in pending {
+        transaction.execute(
+            "UPDATE repositories SET remote_identity = ?2 WHERE id = ?1",
+            rusqlite::params![id, reccursive_core::RemoteIdentity::of(&address).as_str()],
+        )?;
+    }
+
+    let attempts: Vec<(String, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT attempt_id, target_remote FROM release_attempts
+             WHERE target_remote_identity = ''",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (attempt_id, address) in attempts {
+        transaction.execute(
+            "UPDATE release_attempts SET target_remote_identity = ?2 WHERE attempt_id = ?1",
+            rusqlite::params![
+                attempt_id,
+                reccursive_core::RemoteIdentity::of(&address).as_str()
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 /// Storage, migration, and recovery errors.

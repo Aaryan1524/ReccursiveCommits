@@ -6,13 +6,14 @@
 
 use std::collections::BTreeSet;
 
-use jiff::tz::TimeZone;
+use jiff::{Timestamp, tz::TimeZone};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Upper bound that keeps a daily policy useful without permitting accidental release bursts.
 const MAX_DAILY_RELEASES: u8 = 24;
 const MAX_WINDOWS: usize = 32;
+const MAX_SCHEDULING_HORIZON_DAYS: usize = 366;
 
 /// A named IANA time zone validated against the system/bundled time-zone database.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -346,6 +347,209 @@ pub struct SchedulePolicyOverride {
     pub missed_window_behavior: Option<MissedWindowBehavior>,
 }
 
+/// A future release instant selected from a policy's civil-time windows.
+///
+/// The local date is stored alongside the absolute UTC instant so an operator can explain why a
+/// slot was chosen even after a daylight-saving transition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlannedSlot {
+    pub selected_at_unix_ms: i64,
+    pub local_date: String,
+    pub timezone: IanaTimeZone,
+}
+
+/// Deterministic pseudo-random slot selector.
+///
+/// The seed is provided by the daemon in production and fixed in tests. This is intentionally not
+/// a security primitive: its purpose is a reproducible, varied distribution within a policy's
+/// permitted windows, not secrecy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlotGenerator {
+    state: u64,
+}
+
+impl SlotGenerator {
+    #[must_use]
+    pub const fn seeded(seed: u64) -> Self {
+        // XorShift's all-zero state is absorbing, so map it to a fixed non-zero state.
+        Self {
+            state: if seed == 0 {
+                0x9E37_79B9_7F4A_7C15
+            } else {
+                seed
+            },
+        }
+    }
+
+    /// Selects `requested_slots` future instants without exceeding a policy's daily maximum or
+    /// minimum spacing. Existing slots are retained and count against the day they already occupy.
+    ///
+    /// A daily minimum is applied where queued work exists; it never creates artificial empty work
+    /// simply to fill a calendar. The returned values are sorted chronologically.
+    pub fn select(
+        &mut self,
+        policy: &SchedulePolicy,
+        not_before_unix_ms: i64,
+        requested_slots: usize,
+        existing_slots_unix_ms: &[i64],
+    ) -> Result<Vec<PlannedSlot>, SchedulePolicyError> {
+        if requested_slots == 0 {
+            return Ok(Vec::new());
+        }
+        if not_before_unix_ms < 0 {
+            return Err(SchedulePolicyError::InvalidSchedulingTimestamp(
+                not_before_unix_ms,
+            ));
+        }
+        let timezone = policy.timezone.as_str();
+        let start = Timestamp::from_millisecond(not_before_unix_ms)
+            .map_err(|_| SchedulePolicyError::InvalidSchedulingTimestamp(not_before_unix_ms))?
+            .in_tz(timezone)
+            .map_err(|_| SchedulePolicyError::InvalidTimeZone(timezone.to_owned()))?;
+        let mut date = start.date();
+        let spacing_ms = i64::from(policy.minimum_spacing_minutes) * 60_000;
+        let mut selected = Vec::with_capacity(requested_slots);
+        let mut occupied = existing_slots_unix_ms.to_vec();
+
+        for _ in 0..MAX_SCHEDULING_HORIZON_DAYS {
+            if selected.len() == requested_slots {
+                break;
+            }
+            if policy
+                .allowed_days
+                .contains(&weekday_from_jiff(date.weekday()))
+            {
+                let existing_today = occupied
+                    .iter()
+                    .filter(|instant| {
+                        local_date(**instant, timezone).is_ok_and(|value| value == date)
+                    })
+                    .count();
+                let remaining_capacity =
+                    usize::from(policy.daily_releases.maximum).saturating_sub(existing_today);
+                if remaining_capacity > 0 {
+                    let remaining = requested_slots - selected.len();
+                    let daily_minimum =
+                        usize::from(policy.daily_releases.minimum).saturating_sub(existing_today);
+                    let daily_maximum = remaining_capacity.min(remaining);
+                    let wanted = if remaining <= daily_minimum {
+                        remaining
+                    } else {
+                        let lower = daily_minimum.min(daily_maximum);
+                        lower + self.next_index(daily_maximum - lower + 1)
+                    };
+                    let mut candidates = candidates_for_date(
+                        policy,
+                        date,
+                        not_before_unix_ms,
+                        &occupied,
+                        spacing_ms,
+                    )?;
+                    let count = wanted.min(candidates.len());
+                    for _ in 0..count {
+                        let index = self.next_index(candidates.len());
+                        let instant = candidates.swap_remove(index);
+                        occupied.push(instant);
+                        candidates.retain(|candidate| (candidate - instant).abs() >= spacing_ms);
+                        selected.push(PlannedSlot {
+                            selected_at_unix_ms: instant,
+                            local_date: date.to_string(),
+                            timezone: policy.timezone.clone(),
+                        });
+                    }
+                }
+            }
+            date = date
+                .tomorrow()
+                .map_err(|_| SchedulePolicyError::SchedulingHorizonExceeded)?;
+        }
+        if selected.len() != requested_slots {
+            return Err(SchedulePolicyError::InsufficientSchedulingCapacity {
+                requested: requested_slots,
+                selected: selected.len(),
+            });
+        }
+        selected.sort_unstable_by_key(|slot| slot.selected_at_unix_ms);
+        Ok(selected)
+    }
+
+    fn next_index(&mut self, upper_bound: usize) -> usize {
+        debug_assert!(upper_bound > 0);
+        // xorshift64*; sufficient here because this is a scheduling preference, not entropy.
+        self.state ^= self.state >> 12;
+        self.state ^= self.state << 25;
+        self.state ^= self.state >> 27;
+        let value = self.state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        (value as usize) % upper_bound
+    }
+}
+
+fn candidates_for_date(
+    policy: &SchedulePolicy,
+    date: jiff::civil::Date,
+    not_before_unix_ms: i64,
+    occupied: &[i64],
+    spacing_ms: i64,
+) -> Result<Vec<i64>, SchedulePolicyError> {
+    let mut candidates = Vec::new();
+    for window in &policy.windows {
+        // Jiff's compatible conversion handles a daylight-saving gap by selecting the first
+        // valid local instant after it, and a fold by selecting the earlier offset.
+        let start = date
+            .at(window.start.hour as i8, window.start.minute as i8, 0, 0)
+            .in_tz(policy.timezone.as_str())
+            .map_err(|_| SchedulePolicyError::SchedulingHorizonExceeded)?
+            .timestamp()
+            .as_millisecond();
+        let end = date
+            .at(window.end.hour as i8, window.end.minute as i8, 0, 0)
+            .in_tz(policy.timezone.as_str())
+            .map_err(|_| SchedulePolicyError::SchedulingHorizonExceeded)?
+            .timestamp()
+            .as_millisecond();
+        let first = start.max(not_before_unix_ms).div_euclid(60_000) * 60_000
+            + if start.max(not_before_unix_ms).rem_euclid(60_000) == 0 {
+                0
+            } else {
+                60_000
+            };
+        let mut candidate = first;
+        while candidate < end {
+            if occupied
+                .iter()
+                .all(|existing| (candidate - existing).abs() >= spacing_ms)
+            {
+                candidates.push(candidate);
+            }
+            candidate += 60_000;
+        }
+    }
+    Ok(candidates)
+}
+
+fn local_date(
+    instant_unix_ms: i64,
+    timezone: &str,
+) -> Result<jiff::civil::Date, SchedulePolicyError> {
+    Timestamp::from_millisecond(instant_unix_ms)
+        .map_err(|_| SchedulePolicyError::InvalidSchedulingTimestamp(instant_unix_ms))?
+        .in_tz(timezone)
+        .map(|zoned| zoned.date())
+        .map_err(|_| SchedulePolicyError::InvalidTimeZone(timezone.to_owned()))
+}
+
+fn weekday_from_jiff(weekday: jiff::civil::Weekday) -> Weekday {
+    match weekday {
+        jiff::civil::Weekday::Monday => Weekday::Monday,
+        jiff::civil::Weekday::Tuesday => Weekday::Tuesday,
+        jiff::civil::Weekday::Wednesday => Weekday::Wednesday,
+        jiff::civil::Weekday::Thursday => Weekday::Thursday,
+        jiff::civil::Weekday::Friday => Weekday::Friday,
+        jiff::civil::Weekday::Saturday => Weekday::Saturday,
+        jiff::civil::Weekday::Sunday => Weekday::Sunday,
+    }
+}
+
 fn slot_capacity(windows: &[DailyWindow], spacing: u16) -> usize {
     let spacing = u32::from(spacing);
     let mut next = None;
@@ -388,6 +592,14 @@ pub enum SchedulePolicyError {
     DailyLimitExceedsWindowCapacity { maximum: u8, capacity: usize },
     #[error("catch-up limit must be between 1 and {MAX_DAILY_RELEASES}, got {0}")]
     InvalidCatchUpLimit(u8),
+    #[error("scheduling timestamp {0} is outside the supported range")]
+    InvalidSchedulingTimestamp(i64),
+    #[error(
+        "not enough eligible future schedule capacity: requested {requested}, selected {selected}"
+    )]
+    InsufficientSchedulingCapacity { requested: usize, selected: usize },
+    #[error("the scheduling horizon exceeded {MAX_SCHEDULING_HORIZON_DAYS} days")]
+    SchedulingHorizonExceeded,
 }
 
 #[cfg(test)]
@@ -497,5 +709,57 @@ mod tests {
             "missed_window_behavior": { "kind": "reschedule_forward" }
         });
         assert!(serde_json::from_value::<SchedulePolicy>(invalid_policy).is_err());
+    }
+
+    fn unix_ms(value: &str) -> i64 {
+        value.parse::<Timestamp>().unwrap().as_millisecond()
+    }
+
+    #[test]
+    fn seeded_generation_is_repeatable_and_honors_daily_limits_and_spacing() {
+        let not_before = unix_ms("2026-01-05T13:00:00Z"); // Monday 08:00 in New York.
+        let mut first = SlotGenerator::seeded(41);
+        let mut second = SlotGenerator::seeded(41);
+        let selected = first.select(&policy(), not_before, 5, &[]).unwrap();
+        assert_eq!(
+            selected,
+            second.select(&policy(), not_before, 5, &[]).unwrap()
+        );
+        assert_eq!(selected.len(), 5);
+        assert!(selected.windows(2).all(|pair| {
+            pair[1].selected_at_unix_ms - pair[0].selected_at_unix_ms >= 90 * 60_000
+        }));
+        let monday = selected
+            .iter()
+            .filter(|slot| slot.local_date == "2026-01-05")
+            .count();
+        assert!((1..=3).contains(&monday));
+        assert!(
+            selected
+                .iter()
+                .all(|slot| slot.selected_at_unix_ms >= not_before)
+        );
+    }
+
+    #[test]
+    fn existing_slots_are_never_redrawn_or_crowded() {
+        let not_before = unix_ms("2026-01-05T13:00:00Z");
+        let existing = unix_ms("2026-01-05T15:00:00Z"); // 10:00 in New York.
+        let selected = SlotGenerator::seeded(99)
+            .select(&policy(), not_before, 3, &[existing])
+            .unwrap();
+        assert!(
+            selected
+                .iter()
+                .all(|slot| { (slot.selected_at_unix_ms - existing).abs() >= 90 * 60_000 })
+        );
+        let monday = selected
+            .iter()
+            .filter(|slot| slot.local_date == "2026-01-05")
+            .count();
+        assert!(
+            monday <= 2,
+            "the existing Monday slot consumes daily capacity"
+        );
     }
 }

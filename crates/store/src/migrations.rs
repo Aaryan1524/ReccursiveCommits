@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 13;
+pub const STORAGE_SCHEMA_VERSION: u32 = 14;
 
 struct Migration {
     version: u32,
@@ -511,6 +511,34 @@ const MIGRATIONS: &[Migration] = &[
         CREATE INDEX idx_candidate_validation_current
             ON candidate_validation_evidence(package_id, package_revision, check_id)
             WHERE invalidated_at_unix_ms IS NULL;
+        "#,
+    },
+    Migration {
+        version: 14,
+        sql: r#"
+        -- A selected time is durable queue state, not a timer implementation detail. Keeping the
+        -- unit, immutable package, policy revision, civil zone and UTC instant together lets a
+        -- restart retain the exact decision instead of drawing another time.
+        CREATE TABLE schedule_slots (
+            release_unit_id TEXT PRIMARY KEY,
+            repository_id TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            package_revision INTEGER NOT NULL CHECK (package_revision > 0),
+            policy_revision INTEGER NOT NULL CHECK (policy_revision > 0),
+            timezone TEXT NOT NULL CHECK (length(trim(timezone)) > 0),
+            eligible_at_unix_ms INTEGER NOT NULL CHECK (eligible_at_unix_ms >= 0),
+            selected_at_unix_ms INTEGER NOT NULL
+                CHECK (selected_at_unix_ms >= eligible_at_unix_ms),
+            created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+            FOREIGN KEY (release_unit_id) REFERENCES release_units(unit_id) ON DELETE RESTRICT,
+            FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+            FOREIGN KEY (package_id, package_revision)
+                REFERENCES snapshot_packages(package_id, revision) ON DELETE RESTRICT,
+            UNIQUE (package_id, package_revision)
+        );
+
+        CREATE INDEX idx_schedule_slots_due
+            ON schedule_slots(repository_id, selected_at_unix_ms);
         "#,
     },
 ];

@@ -1039,3 +1039,235 @@ mod recalculation_tests {
         );
     }
 }
+
+/// Simultaneous-client behaviour, exercised through two independent connections to one database
+/// rather than one handle used twice. These are the races the leases and partial unique indexes
+/// exist for: the guarantee is that a loser is told it lost, never that both sides quietly win.
+#[cfg(test)]
+mod concurrency_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use reccursive_core::{
+        AcceptanceCheck, AttemptId, FeatureId, FeaturePlan, IanaTimeZone, PLAN_SCHEMA_VERSION,
+        PackageId, PlanPhase, PlanTask, PublicationMode, RepositoryId, RepositoryPolicy, TargetRef,
+        TaskId,
+    };
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::{
+        AttemptLease, NewReleaseAttempt, RepositoryRegistration, SnapshotRecord, WorkspaceRecord,
+    };
+
+    fn object_id(byte: char) -> String {
+        std::iter::repeat_n(byte, 40).collect()
+    }
+
+    /// Seeds a database on disk and returns the identifiers two clients will contend over.
+    fn seed(path: &std::path::Path) -> (RepositoryId, ReleaseUnitId, PackageId, TargetRef) {
+        let mut store = Store::open(path).unwrap();
+        let repository_id = RepositoryId::new();
+        let target = TargetRef::new("refs/heads/main").unwrap();
+        store
+            .enroll_repository(
+                &RepositoryRegistration::new(
+                    repository_id,
+                    "/tmp/race-source",
+                    "ssh://git@example.invalid/race.git",
+                    "/tmp/race-managed.git",
+                    1,
+                )
+                .unwrap(),
+                &RepositoryPolicy::new(
+                    repository_id,
+                    Revision::FIRST,
+                    PublicationMode::ScheduledCreation,
+                    target.clone(),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let feature_id = FeatureId::new();
+        let task_id = TaskId::new();
+        store
+            .import_plan(
+                &FeaturePlan {
+                    schema_version: PLAN_SCHEMA_VERSION,
+                    feature_id,
+                    revision: Revision::FIRST,
+                    repository_id,
+                    goal: "Contended work".into(),
+                    target: target.clone(),
+                    sealed: true,
+                    phases: vec![PlanPhase {
+                        id: "delivery".into(),
+                        name: "Delivery".into(),
+                        tasks: vec![PlanTask {
+                            id: task_id,
+                            name: "The task".into(),
+                            dependencies: BTreeMap::new(),
+                            acceptance_checks: vec![AcceptanceCheck {
+                                id: "done".into(),
+                                description: "ready".into(),
+                            }],
+                        }],
+                    }],
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .record_workspace(&WorkspaceRecord {
+                feature_id,
+                revision: Revision::FIRST,
+                path: "/tmp/race-workspace".into(),
+                base_commit: object_id('a'),
+                prerequisites: json!([]),
+                created_at_unix_ms: 1,
+            })
+            .unwrap();
+        let package_id = PackageId::new();
+        store
+            .record_snapshot(&SnapshotRecord {
+                package_id,
+                revision: Revision::FIRST,
+                feature_id,
+                plan_revision: Revision::FIRST,
+                path: "/tmp/race-package".into(),
+                base_tree: object_id('a'),
+                result_tree: object_id('b'),
+                content_hash: std::iter::repeat_n('c', 64).collect(),
+                parent_package_id: None,
+                manifest: json!({"paths": []}),
+                created_at_unix_ms: 2,
+            })
+            .unwrap();
+        store
+            .record_package_tasks(package_id, Revision::FIRST, [task_id])
+            .unwrap();
+        store
+            .advance_task_to(feature_id, Revision::FIRST, task_id, TaskStatus::Queued, 3)
+            .unwrap();
+        let unit_id = ReleaseUnitId::new();
+        store
+            .create_release_unit(
+                unit_id,
+                feature_id,
+                Revision::FIRST,
+                BTreeSet::from([task_id]),
+                BTreeSet::new(),
+                4,
+            )
+            .unwrap();
+        (repository_id, unit_id, package_id, target)
+    }
+
+    fn slot(unit_id: ReleaseUnitId, package_id: PackageId, selected: i64) -> NewScheduleSlot {
+        NewScheduleSlot {
+            release_unit_id: unit_id,
+            package_id,
+            package_revision: Revision::FIRST,
+            policy_revision: Revision::FIRST,
+            timezone: IanaTimeZone::new("UTC").unwrap(),
+            eligible_at_unix_ms: 10,
+            selected_at_unix_ms: selected,
+            created_at_unix_ms: 10,
+        }
+    }
+
+    #[test]
+    fn two_clients_scheduling_one_unit_produce_exactly_one_release_time() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("queue.sqlite");
+        let (repository_id, unit_id, package_id, _) = seed(&database);
+
+        let mut first = Store::open(&database).unwrap();
+        let mut second = Store::open(&database).unwrap();
+
+        // Both clients believe they are scheduling this unit, and each proposes a different time.
+        let a = first
+            .persist_schedule_slot(&slot(unit_id, package_id, 1_000))
+            .unwrap();
+        let b = second
+            .persist_schedule_slot(&slot(unit_id, package_id, 9_999))
+            .unwrap();
+
+        // One selection exists and both clients are told the same thing. The second proposal does
+        // not win, and does not silently create a rival slot.
+        assert_eq!(a, b);
+        assert_eq!(a.selected_at_unix_ms, 1_000);
+        assert_eq!(first.schedule_slots(repository_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn two_clients_claiming_one_target_cannot_both_hold_a_release_lease() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("queue.sqlite");
+        let (repository_id, unit_id, package_id, target) = seed(&database);
+
+        let mut first = Store::open(&database).unwrap();
+        let mut second = Store::open(&database).unwrap();
+        first
+            .persist_schedule_slot(&slot(unit_id, package_id, 1_000))
+            .unwrap();
+
+        let request = |owner: &str| NewReleaseAttempt {
+            attempt_id: AttemptId::new(),
+            repository_id,
+            package_id,
+            package_revision: Revision::FIRST,
+            remote: "ssh://git@example.invalid/race.git".into(),
+            target: target.clone(),
+            base_commit: object_id('a'),
+            lease: AttemptLease {
+                owner: owner.into(),
+                expires_at_unix_ms: 100_000,
+            },
+            created_at_unix_ms: 10,
+        };
+
+        first.open_release_attempt(&request("client-a")).unwrap();
+        let contended = second.open_release_attempt(&request("client-b"));
+
+        assert!(
+            matches!(contended, Err(StoreError::Conflict(_))),
+            "a second client must be refused the same remote and target, not allowed to race \
+             for it: {contended:?}"
+        );
+    }
+
+    #[test]
+    fn two_clients_withdrawing_one_selection_do_not_both_report_success() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("queue.sqlite");
+        let (_, unit_id, package_id, _) = seed(&database);
+
+        let mut first = Store::open(&database).unwrap();
+        let mut second = Store::open(&database).unwrap();
+        first
+            .persist_schedule_slot(&slot(unit_id, package_id, 1_000))
+            .unwrap();
+
+        let a = first
+            .invalidate_schedule_slot(unit_id, "first client", 50)
+            .unwrap();
+        let b = second
+            .invalidate_schedule_slot(unit_id, "second client", 50)
+            .unwrap();
+
+        assert!(a.is_some(), "the first withdrawal should take effect");
+        assert!(
+            b.is_none(),
+            "the second client must observe that there is nothing left to withdraw"
+        );
+        // Exactly one withdrawal is recorded, with the reason that actually applied.
+        let history = second.schedule_slot_history(unit_id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].invalidated_reason.as_deref(),
+            Some("first client")
+        );
+    }
+}

@@ -127,6 +127,29 @@ repositories receive `git diff --check {base_commit}` with a 30-second limit;
 the command and its result are stored separately from agent output and package
 metadata. A failed or timed-out check blocks capture after recording evidence.
 
+`task submit` is the whole submission in one step: it captures the task's work,
+groups it into a release unit, and selects its durable release time. Every step is
+one the caller could take separately; what submitting adds is that *repeating* it is
+harmless with no idempotency key at all. Each step already answers a repeat with
+what it produced the first time, so the composition does too — an agent that cannot
+tell whether its submission landed simply submits again, and `created: false` says
+which it was. A task already captured in a package carrying *different* work is a
+conflict, not a repeat.
+
+`feature status` reports every task of one plan revision with the package, release
+unit, and release time attached to it. It reports each task's status verbatim rather
+than a ready flag: only the caller knows what it is waiting for, and `blocked` and
+`cancelled` have to be distinguishable from "not yet", which a boolean cannot do. A
+blocked task also reports the status it was blocked out of, because blocked before a
+push and blocked after one are different situations.
+
+`plan seal` fixes a feature's scope by appending a sealed copy of its newest
+revision. Sealing appends rather than edits: packages, units, and attempts all name a
+plan revision, so a stored revision has to mean one thing forever. The response
+carries the new revision number, and an agent must carry it forward — the revision it
+drafted against is not the revision it works against. Sealing an already-sealed plan
+is a conflict.
+
 `task cancel` is explicit and durable: it accepts a required human explanation,
 cancels a task that has not been published, blocks every dependent task, and
 invalidates affected validation evidence without deleting its audit trail. It

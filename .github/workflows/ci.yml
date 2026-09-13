@@ -41,3 +41,4 @@ jobs:
       - run: ./tests/scenarios/phase4_schedule_cli.sh
       - run: ./tests/scenarios/phase5_autonomous_release.sh
       - run: ./tests/scenarios/phase6_idempotent_handoff.sh
+      - run: ./tests/scenarios/phase6_agent_submit.sh

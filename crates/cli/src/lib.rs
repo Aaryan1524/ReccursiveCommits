@@ -15,8 +15,8 @@ use reccursive_protocol::{
     LocalClient, PackageId, PackageView, PlanView, PublicationMode, QueueAuditView,
     QueueExportView, ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitId, ReleaseUnitView,
     RepositoryId, RepositoryView, ResponseData, Revision, SchedulePolicy, SchedulePolicyOverride,
-    SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest, TargetRef,
-    TaskId, WorkspaceView,
+    SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest,
+    SubmissionView, SubmitTaskRequest, TargetRef, TaskId, TaskProgressView, WorkspaceView,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -77,10 +77,15 @@ enum TopLevelCommand {
         #[command(subcommand)]
         command: PackageCommand,
     },
-    /// Cancel a task that has not reached publication.
+    /// Submit completed task work, or cancel a task that has not reached publication.
     Task {
         #[command(subcommand)]
         command: TaskCommand,
+    },
+    /// Report every task of a feature revision and the durable work attached to it.
+    Feature {
+        #[command(subcommand)]
+        command: FeatureCommand,
     },
     /// Publish a verified package or inspect durable publication attempts.
     Release {
@@ -137,7 +142,33 @@ enum PackageCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum FeatureCommand {
+    /// Show each task's durable state and the package, unit, and release time attached to it.
+    Status {
+        feature_id: FeatureId,
+        /// Plan revision; defaults to the newest stored revision.
+        #[arg(long, value_parser = parse_revision)]
+        revision: Option<Revision>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum TaskCommand {
+    /// Capture, group, and schedule one task's completed work in a single step.
+    Submit {
+        feature_id: FeatureId,
+        /// Plan revision; defaults to the newest stored revision.
+        #[arg(long, value_parser = parse_revision)]
+        revision: Option<Revision>,
+        #[arg(long = "task", required = true)]
+        task_ids: Vec<TaskId>,
+        /// Checks the release must pass before publication.
+        #[arg(long = "check")]
+        required_checks: Vec<String>,
+        /// Seed for the deterministic release-time selection.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
     /// Cancel a task and block any plan tasks that depend on it.
     Cancel {
         feature_id: FeatureId,
@@ -320,6 +351,8 @@ enum PlanCommand {
     },
     /// List all stored revisions for a feature.
     History { feature_id: FeatureId },
+    /// Fix a feature's scope by appending a sealed copy of its newest revision.
+    Seal { feature_id: FeatureId },
 }
 
 #[derive(Debug, Subcommand)]
@@ -500,6 +533,25 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 let data = send(&session, Command::PlanHistory { feature_id })?;
                 output_data(data, cli.json, stdout)
             }
+            PlanCommand::Seal { feature_id } => {
+                let data = send(&session, Command::SealPlan { feature_id })?;
+                output_data(data, cli.json, stdout)
+            }
+        },
+        TopLevelCommand::Feature { command } => match command {
+            FeatureCommand::Status {
+                feature_id,
+                revision,
+            } => {
+                let data = send(
+                    &session,
+                    Command::GetFeatureStatus {
+                        feature_id,
+                        revision,
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
         },
         TopLevelCommand::Workspace { command } => match command {
             WorkspaceCommand::Create {
@@ -562,6 +614,25 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             }
         },
         TopLevelCommand::Task { command } => match command {
+            TaskCommand::Submit {
+                feature_id,
+                revision,
+                task_ids,
+                required_checks,
+                seed,
+            } => {
+                let data = send(
+                    &session,
+                    Command::SubmitTask(SubmitTaskRequest {
+                        feature_id,
+                        plan_revision: revision,
+                        task_ids: task_ids.into_iter().collect(),
+                        required_checks: required_checks.into_iter().collect(),
+                        seed,
+                    }),
+                )?;
+                output_data(data, cli.json, stdout)
+            }
             TaskCommand::Cancel {
                 feature_id,
                 revision,
@@ -1152,6 +1223,69 @@ fn branch_ref(value: &str) -> Result<TargetRef, CliFailure> {
         .map_err(|error| CliFailure::new(EXIT_ACTION_REQUIRED, "invalid_branch", error.to_string()))
 }
 
+fn output_feature_status(
+    out: &mut impl Write,
+    status: &reccursive_protocol::FeatureStatusView,
+) -> Result<(), CliFailure> {
+    writeln!(
+        out,
+        "{} revision {} · {} · {}",
+        status.feature_id,
+        status.plan_revision.get(),
+        if status.sealed { "sealed" } else { "draft" },
+        status.goal
+    )
+    .map_err(output_error)?;
+    if status.tasks.is_empty() {
+        return writeln!(out, "  (no tasks)").map_err(output_error);
+    }
+    for task in &status.tasks {
+        output_task_progress(out, task)?;
+    }
+    Ok(())
+}
+
+fn output_task_progress(out: &mut impl Write, task: &TaskProgressView) -> Result<(), CliFailure> {
+    // The status is printed verbatim rather than collapsed into ready/not-ready, because
+    // "blocked" and "cancelled" are answers a caller has to act on differently from "not yet".
+    writeln!(
+        out,
+        "  {} · {:?} · {}",
+        task.task_id, task.status, task.name
+    )
+    .map_err(output_error)?;
+    if let Some(blocked_from) = task.blocked_from {
+        writeln!(out, "      blocked out of: {blocked_from:?}").map_err(output_error)?;
+    }
+    if let Some(package_id) = task.package_id {
+        writeln!(out, "      package: {package_id}").map_err(output_error)?;
+    }
+    if let Some(unit_id) = task.release_unit_id {
+        writeln!(out, "      unit:    {unit_id}").map_err(output_error)?;
+    }
+    if let Some(selected) = task.selected_at_unix_ms {
+        writeln!(out, "      due:     {selected} (unix ms)").map_err(output_error)?;
+    }
+    Ok(())
+}
+
+fn output_submission(out: &mut impl Write, submission: &SubmissionView) -> Result<(), CliFailure> {
+    writeln!(
+        out,
+        "{} {}\n  package: {}\n  unit:    {}\n  due:     {} (unix ms)",
+        if submission.created {
+            "Submitted"
+        } else {
+            "Already submitted"
+        },
+        submission.unit.unit_id,
+        submission.package.package_id,
+        submission.unit.unit_id,
+        submission.slot.selected_at_unix_ms
+    )
+    .map_err(output_error)
+}
+
 fn output_data(
     data: ResponseData,
     json_output: bool,
@@ -1185,6 +1319,20 @@ fn output_data(
         }
         ResponseData::Repositories { repositories } => output_repositories(out, &repositories),
         ResponseData::Events { events } => output_events(out, &events),
+        ResponseData::PlanSealed { plan } => {
+            writeln!(
+                out,
+                "Sealed {} as revision {}",
+                plan.plan.feature_id,
+                plan.plan.revision.get()
+            )
+        }
+        ResponseData::FeatureStatus { status } => {
+            return output_feature_status(out, &status);
+        }
+        ResponseData::TaskSubmitted { submission } => {
+            return output_submission(out, &submission);
+        }
         ResponseData::PlanImported { plan } => {
             writeln!(
                 out,

@@ -17,7 +17,7 @@ this replaces.
 **Versioned.** Every request carries `api_version`, and the daemon refuses a
 version it does not implement rather than interpreting an unfamiliar payload. The
 CLI surfaces that as exit code 13, which an agent should treat as "upgrade", not
-"retry". The current version is 11.
+"retry". The current version is 12.
 
 **Idempotent.** Any step that changes state accepts `--idempotency-key`, which
 makes a repeat of that step return the first result instead of acting again. See
@@ -45,6 +45,19 @@ is [`PLAN_FORMAT.md`](PLAN_FORMAT.md). Imports are append-only — revision 1, t
 each next revision for the same feature and repository — so an agent that revises
 its intent leaves the earlier intent inspectable rather than overwriting it. A
 sealed plan is one the agent is declaring complete in scope.
+
+A plan may be imported as a draft (`"sealed": false`) while the agent is still
+deciding scope; nothing can be worked on until it is sealed, because an owned
+workspace requires a sealed revision. Seal it with:
+
+```sh
+reccursive --json plan seal feature_<uuid>
+```
+
+This **appends** a sealed copy as revision N+1 rather than editing the draft, because
+packages, units, and attempts all name a plan revision and a stored revision has to
+mean one thing forever. The response carries the new number, and every later step
+must use it.
 
 Read it back with `plan show` (exact revision with `--revision`, newest by
 default) or `plan history`.
@@ -88,10 +101,17 @@ repository-relative path, never the matched content.
 ### 4. Validation status
 
 ```sh
+reccursive --json feature status feature_<uuid>
 reccursive --json package show package_<uuid>
 reccursive --json release attempts --package-id package_<uuid> --limit 10
 reccursive --json release attempt attempt_<uuid>
 ```
+
+`feature status` is the one to poll: every task of a plan revision with its durable
+status, and the package, unit, and release time attached to it. Statuses are reported
+verbatim rather than as a ready flag, because only the caller knows what it is waiting
+for — and `blocked` and `cancelled` have to be distinguishable from "not yet". A
+blocked task also reports the status it was blocked *out of*.
 
 `package show` recalculates the bundle and manifest hashes before answering, so a
 corrupted package is an error rather than a stale success. `release attempt` and
@@ -101,6 +121,25 @@ survive the process that created them, which is what lets an agent that was
 restarted find out what happened without re-running anything.
 
 ### 5. Task completion and queueing
+
+The whole submission is one command:
+
+```sh
+reccursive --json task submit feature_<uuid> --revision 2 --task task_<uuid>
+```
+
+It captures, groups, and schedules in one step, and returns all three results with
+`created` saying whether this call produced them or found them already there.
+**Repeating it is safe with no idempotency key**, which is the point: an agent that
+cannot tell whether its submission landed submits again and gets the same package,
+the same unit, and the same release time. Use a key on top of this only when you also
+want a dropped-connection retry to replay the exact response.
+
+From here the agent is finished. Nothing it does causes the publication: the daemon's
+own maintenance pass acts on the schedule, including after the machine has been
+asleep.
+
+The three steps are also available individually, which is what `task submit` calls:
 
 ```sh
 reccursive --idempotency-key "<agent>/unit/task_<uuid>" --json \
@@ -115,11 +154,9 @@ own.
 
 `schedule unit` selects the durable release time against the repository's active
 policy. Calling it again for the same unit returns the existing slot rather than
-drawing a new one, so this step is safe to repeat even without a key.
-
-From here the agent is finished. Nothing it does causes the publication: the
-daemon's own maintenance pass acts on the schedule, including after the machine
-has been asleep.
+drawing a new one. `release create-unit` behaves the same way: grouping the same work
+again returns the group it is already in. A request that overlaps an existing unit
+without matching it is a different grouping of grouped work, and is refused.
 
 ### 6. Reading the outcome
 

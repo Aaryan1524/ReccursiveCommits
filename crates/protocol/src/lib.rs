@@ -7,14 +7,14 @@ use std::{collections::BTreeSet, fmt};
 pub use reccursive_core::{
     AcceptanceCheck, AttemptId, EventId, FeatureId, FeaturePlan, PLAN_SCHEMA_VERSION, PackageId,
     PlanPhase, PlanTask, PublicationMode, ReasonCode, ReleaseUnitId, RepositoryId,
-    RepositoryPolicy, RequestId, Revision, SchedulePolicy, StateReason, TargetMilestone, TargetRef,
-    TaskId, TaskStatus,
+    RepositoryPolicy, RequestId, Revision, SchedulePolicy, SchedulePolicyOverride, StateReason,
+    TargetMilestone, TargetRef, TaskId, TaskStatus,
 };
 use serde::{Deserialize, Serialize};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 6 adds missed-window reconciliation.
-pub const API_VERSION: u16 = 6;
+/// Local API protocol version. Version 7 adds repository overrides and fair due-unit listing.
+pub const API_VERSION: u16 = 7;
 
 /// Maximum encoded request or response size accepted by the local transport.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -83,6 +83,12 @@ impl RequestEnvelope {
             Command::ListReleaseAttempts { limit, .. } if !(1..=1_000).contains(limit) => {
                 Err(ProtocolValidationError::InvalidAttemptLimit)
             }
+            Command::ListDueUnits { concurrency_limit }
+                if !(1..=1_000).contains(concurrency_limit) =>
+            {
+                Err(ProtocolValidationError::InvalidConcurrencyLimit)
+            }
+            Command::ListDueUnits { .. } => Ok(()),
             Command::ExportQueue { destination }
                 if destination.is_empty() || destination.len() > 4_096 =>
             {
@@ -109,6 +115,7 @@ impl RequestEnvelope {
             | Command::WithdrawScheduleSlot { .. }
             | Command::RecalculateSchedule { .. }
             | Command::ReconcileMissedWindows { .. }
+            | Command::SetScheduleOverride { .. }
             | Command::GetReleaseAttempt { .. }
             | Command::ListReleaseAttempts { .. }
             | Command::AuditQueue
@@ -180,6 +187,16 @@ pub enum Command {
     ReconcileMissedWindows {
         repository_id: RepositoryId,
         seed: u64,
+    },
+    /// Refine one repository's scheduling without changing the policy it shares.
+    SetScheduleOverride {
+        repository_id: RepositoryId,
+        #[serde(rename = "override")]
+        override_policy: SchedulePolicyOverride,
+    },
+    /// List units due for release now, fairly across repositories and within a global limit.
+    ListDueUnits {
+        concurrency_limit: usize,
     },
     /// Inspect one durable publication attempt.
     GetReleaseAttempt {
@@ -500,6 +517,16 @@ pub struct SchedulePolicyView {
     pub created_at_unix_ms: i64,
 }
 
+/// One unit whose selected release time has arrived.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DueUnitView {
+    pub release_unit_id: ReleaseUnitId,
+    pub repository_id: RepositoryId,
+    pub package_id: PackageId,
+    pub package_revision: Revision,
+    pub selected_at_unix_ms: i64,
+}
+
 /// What applying a missed-window policy did to release times that had already passed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MissedWindowView {
@@ -681,6 +708,13 @@ pub enum ResponseData {
     MissedWindowsReconciled {
         outcome: MissedWindowView,
     },
+    ScheduleOverrideActivated {
+        repository_id: RepositoryId,
+        revision: Revision,
+    },
+    DueUnits {
+        units: Vec<DueUnitView>,
+    },
     QueueAudit {
         audit: QueueAuditView,
     },
@@ -756,6 +790,8 @@ pub enum ProtocolValidationError {
     InvalidReleaseField(&'static str),
     #[error("release attempt limit must be between 1 and 1000")]
     InvalidAttemptLimit,
+    #[error("release concurrency limit must be between 1 and 1000")]
+    InvalidConcurrencyLimit,
     #[error("release unit must select between 1 and 1000 plan tasks")]
     InvalidReleaseUnitTasks,
     #[error(

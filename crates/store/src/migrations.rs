@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 16;
+pub const STORAGE_SCHEMA_VERSION: u32 = 17;
 
 struct Migration {
     version: u32,
@@ -631,6 +631,38 @@ const MIGRATIONS: &[Migration] = &[
 
         CREATE INDEX idx_schedule_slots_unit_history
             ON schedule_slots(release_unit_id, created_at_unix_ms DESC);
+        "#,
+    },
+    Migration {
+        version: 17,
+        sql: r#"
+        -- The live-attempt lock was keyed on (repository_id, remote, target), so two repository
+        -- profiles pointing at the same remote and branch could each hold a live attempt and race
+        -- to publish to it. The remote and target alone identify the thing being written to, so
+        -- that is what the lock must be keyed on.
+        DROP INDEX IF EXISTS idx_release_attempts_live_target;
+
+        CREATE UNIQUE INDEX idx_release_attempts_live_target
+            ON release_attempts(target_remote, target_ref)
+            WHERE status IN ('scheduled', 'reconciling', 'verifying', 'commit_prepared',
+                             'push_pending', 'remote_confirmed')
+               OR (status = 'blocked'
+                   AND blocked_from IN ('push_pending', 'remote_confirmed'));
+
+        -- Per-repository scheduling overrides, resolved against the repository's active policy.
+        -- Stored as one immutable revision per change, like the policies they refine.
+        CREATE TABLE repository_schedule_overrides (
+            repository_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision > 0),
+            override_json TEXT NOT NULL CHECK (json_valid(override_json)),
+            created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            PRIMARY KEY (repository_id, revision),
+            FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+        );
+
+        CREATE UNIQUE INDEX idx_repository_schedule_overrides_active
+            ON repository_schedule_overrides(repository_id) WHERE active = 1;
         "#,
     },
 ];

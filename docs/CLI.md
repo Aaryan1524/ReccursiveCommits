@@ -38,6 +38,8 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state schedule show unit_<uu
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule withdraw unit_<uuid> --reason "policy under review"
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule recalculate repo_<uuid> --reason "policy revised"
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule catch-up repo_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule set-override repo_<uuid> schedule-override.json
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule due --concurrency-limit 10
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue audit
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue export /absolute/path/to/queue-backup
 ```
@@ -148,6 +150,25 @@ given a new future time, so a multi-day gap cannot turn into a burst. Under
 release, oldest first, and the rest still move forward. A replacement time is
 always drawn from the present moment onward, so an offline gap can never produce a
 commit dated earlier than the moment it was actually made.
+
+`schedule set-override` refines one repository's scheduling without changing the
+policy it shares — any subset of the policy's fields, in the same JSON shape. The
+override is stored unresolved and combined with whatever policy is active at the
+moment a selection is made, and the combination is validated as a whole, so an
+override cannot quietly produce an invalid effective policy.
+
+`schedule due` lists units whose release time has arrived, taken fairly across
+repositories rather than draining one at a time: each repository gets a turn before
+any repository gets a second, so a repository with a deep queue, or one that keeps
+failing and retrying, delays only itself. `--concurrency-limit` bounds how much work
+is listed at once, which is what keeps a large backlog from becoming a burst of
+simultaneous pushes.
+
+Enrollment refuses a second checkout of the same canonical remote that targets the
+same branch. Two checkouts publishing to one ref are two writers racing for it, so
+this is rejected at enrollment rather than surfacing later as a conflict. The live
+release lease is keyed on the remote and target themselves, not on the repository
+profile, for the same reason.
 
 ## Exit codes
 

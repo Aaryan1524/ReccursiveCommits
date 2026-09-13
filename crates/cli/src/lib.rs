@@ -9,12 +9,13 @@ use std::{
 use clap::{Parser, Subcommand, ValueEnum};
 use reccursive_protocol::{
     ApiError, ApiErrorCode, CancelTaskRequest, CapturePackageRequest, Command,
-    CreateReleaseUnitRequest, CreateWorkspaceRequest, EnrollRepositoryRequest, EventSeverityView,
-    EventView, FeatureId, FeaturePlan, LocalClient, PackageId, PackageView, PlanView,
-    PublicationMode, QueueAuditView, QueueExportView, ReleaseAttemptView, ReleasePackageRequest,
-    ReleaseUnitId, ReleaseUnitView, RepositoryId, RepositoryView, ResponseData, Revision,
-    SchedulePolicy, SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest,
-    SetSchedulePolicyRequest, TargetRef, TaskId, WorkspaceView,
+    CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
+    EventSeverityView, EventView, FeatureId, FeaturePlan, LocalClient, PackageId, PackageView,
+    PlanView, PublicationMode, QueueAuditView, QueueExportView, ReleaseAttemptView,
+    ReleasePackageRequest, ReleaseUnitId, ReleaseUnitView, RepositoryId, RepositoryView,
+    ResponseData, Revision, SchedulePolicy, SchedulePolicyOverride, SchedulePolicyView,
+    ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest, TargetRef, TaskId,
+    WorkspaceView,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -212,6 +213,17 @@ enum ScheduleCommand {
         /// Deterministic selection seed; a random one is used when omitted.
         #[arg(long)]
         seed: Option<u64>,
+    },
+    /// Refine one repository's scheduling without changing the policy it shares.
+    SetOverride {
+        repository_id: RepositoryId,
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// List units due for release now, fairly across repositories and within a global limit.
+    Due {
+        #[arg(long, default_value_t = 10, value_parser = parse_event_limit)]
+        concurrency_limit: usize,
     },
 }
 
@@ -608,6 +620,24 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 )?;
                 output_data(data, cli.json, stdout)
             }
+            ScheduleCommand::SetOverride {
+                repository_id,
+                file,
+            } => {
+                let override_policy = load_schedule_override(&file)?;
+                let data = send(
+                    &paths,
+                    Command::SetScheduleOverride {
+                        repository_id,
+                        override_policy,
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::Due { concurrency_limit } => {
+                let data = send(&paths, Command::ListDueUnits { concurrency_limit })?;
+                output_data(data, cli.json, stdout)
+            }
             ScheduleCommand::CatchUp {
                 repository_id,
                 seed,
@@ -690,6 +720,26 @@ fn load_plan(path: &Path) -> Result<FeaturePlan, CliFailure> {
         CliFailure::new(EXIT_ACTION_REQUIRED, "invalid_plan", error.to_string())
     })?;
     Ok(plan)
+}
+
+fn load_schedule_override(path: &Path) -> Result<SchedulePolicyOverride, CliFailure> {
+    let bytes = fs::read(path).map_err(|error| {
+        CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "schedule_override_unreadable",
+            format!("cannot read {}: {error}", path.display()),
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "invalid_schedule_override",
+            format!(
+                "{} is not a valid schedule override: {error}",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn load_schedule_policy(path: &Path) -> Result<SchedulePolicy, CliFailure> {
@@ -947,6 +997,15 @@ fn output_data(
         ),
         ResponseData::SchedulePolicy { policy } => output_schedule_policy(out, &policy),
         ResponseData::ScheduleSlot { slot } => output_schedule_slot(out, &slot),
+        ResponseData::ScheduleOverrideActivated {
+            repository_id,
+            revision,
+        } => writeln!(
+            out,
+            "Activated schedule override revision {} for repository {repository_id}",
+            revision.get()
+        ),
+        ResponseData::DueUnits { units } => output_due_units(out, &units),
         ResponseData::MissedWindowsReconciled { outcome } => writeln!(
             out,
             "Released {} overdue unit(s) now, moved {} forward, left {} in flight",
@@ -1069,6 +1128,20 @@ fn output_schedule_policy(out: &mut impl Write, policy: &SchedulePolicyView) -> 
         policy.policy.daily_releases.maximum,
         policy.policy.minimum_spacing_minutes,
     )
+}
+
+fn output_due_units(out: &mut impl Write, units: &[DueUnitView]) -> io::Result<()> {
+    if units.is_empty() {
+        return writeln!(out, "No units are due for release.");
+    }
+    for unit in units {
+        writeln!(
+            out,
+            "{} · repository {} · package {} · due {}",
+            unit.release_unit_id, unit.repository_id, unit.package_id, unit.selected_at_unix_ms
+        )?;
+    }
+    Ok(())
 }
 
 fn output_schedule_slot(out: &mut impl Write, slot: &ScheduleSlotView) -> io::Result<()> {

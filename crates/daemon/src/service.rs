@@ -19,13 +19,14 @@ use reccursive_capture::{
 };
 use reccursive_protocol::{
     ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest, Command,
-    CreateReleaseUnitRequest, CreateWorkspaceRequest, EnrollRepositoryRequest, EventSeverityView,
-    EventView, MissedWindowView, PackageView, PlanView, ProtocolValidationError, QueueAuditView,
-    QueueExportView, QueueRecoveryIssueView, ReasonCode, ReleaseAttemptView, ReleasePackageRequest,
-    ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId,
-    ResponseData, ResponseEnvelope, Revision, SchedulePolicyView, ScheduleRecalculationView,
-    ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest, StateReason,
-    TaskCancellationView, TaskStatus, TransportError, WorkspacePrerequisiteView, WorkspaceView,
+    CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
+    EventSeverityView, EventView, MissedWindowView, PackageView, PlanView, ProtocolValidationError,
+    QueueAuditView, QueueExportView, QueueRecoveryIssueView, ReasonCode, ReleaseAttemptView,
+    ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryView,
+    RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision, SchedulePolicyView,
+    ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest,
+    StateReason, TaskCancellationView, TaskStatus, TransportError, WorkspacePrerequisiteView,
+    WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -430,6 +431,11 @@ fn dispatch(
             repository_id,
             seed,
         } => reconcile_missed_windows(repository_id, seed, store),
+        Command::SetScheduleOverride {
+            repository_id,
+            override_policy,
+        } => set_schedule_override(repository_id, &override_policy, store),
+        Command::ListDueUnits { concurrency_limit } => list_due_units(concurrency_limit, store),
         Command::GetReleaseAttempt { attempt_id } => get_release_attempt(attempt_id, store),
         Command::ListReleaseAttempts { package_id, limit } => {
             list_release_attempts(package_id, limit, store)
@@ -467,6 +473,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::WithdrawScheduleSlot { .. } => "schedule.withdraw",
         Command::RecalculateSchedule { .. } => "schedule.recalculate",
         Command::ReconcileMissedWindows { .. } => "schedule.missed_windows",
+        Command::SetScheduleOverride { .. } => "schedule.override.set",
+        Command::ListDueUnits { .. } => "schedule.due",
         Command::GetReleaseAttempt { .. } => "release.attempt",
         Command::ListReleaseAttempts { .. } => "release.attempts",
         Command::GetPackage { .. } => "package.show",
@@ -1739,6 +1747,41 @@ fn reconcile_missed_windows(
             retained: outcome.retained,
         },
     })
+}
+
+fn set_schedule_override(
+    repository_id: RepositoryId,
+    override_policy: &reccursive_protocol::SchedulePolicyOverride,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let revision = lock_store(store)?
+        .activate_schedule_override(repository_id, override_policy, now)
+        .map_err(store_api_error)?;
+    Ok(ResponseData::ScheduleOverrideActivated {
+        repository_id,
+        revision,
+    })
+}
+
+fn list_due_units(
+    concurrency_limit: usize,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let store = lock_store(store)?;
+    let units = Scheduler::due_units(&store, now, concurrency_limit)
+        .map_err(scheduler_api_error)?
+        .into_iter()
+        .map(|unit| DueUnitView {
+            release_unit_id: unit.release_unit_id,
+            repository_id: unit.repository_id,
+            package_id: unit.package_id,
+            package_revision: unit.package_revision,
+            selected_at_unix_ms: unit.selected_at_unix_ms,
+        })
+        .collect();
+    Ok(ResponseData::DueUnits { units })
 }
 
 fn schedule_slot_view(slot: reccursive_store::ScheduleSlot) -> ScheduleSlotView {

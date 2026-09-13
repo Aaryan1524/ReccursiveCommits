@@ -69,6 +69,12 @@ impl ServicePaths {
 }
 
 /// Bound local API and exclusive owner of mutable service state.
+/// How often the daemon performs its periodic pass.
+///
+/// Coarse on purpose: scheduling resolution is minutes, and an idle daemon that wakes constantly to
+/// ask a question whose answer is almost always "nothing" costs battery for no benefit.
+const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct LocalService {
     owner: ServiceOwner,
     store: Arc<Mutex<Store>>,
@@ -76,6 +82,7 @@ pub struct LocalService {
     workspace_root: Arc<PathBuf>,
     release_root: Arc<PathBuf>,
     package_root: Arc<PathBuf>,
+    shutdown: crate::maintenance::ShutdownSignal,
 }
 
 impl LocalService {
@@ -98,11 +105,46 @@ impl LocalService {
             workspace_root: Arc::new(workspace_root),
             release_root: Arc::new(release_root),
             package_root: Arc::new(package_root),
+            shutdown: crate::maintenance::ShutdownSignal::new(),
+        })
+    }
+
+    /// Starts the periodic maintenance pass.
+    ///
+    /// Kept coarse on purpose. A slot whose time arrives between two passes is simply overdue at
+    /// the next one, which is the same state a slot reaches after a sleep and is handled by the
+    /// same path — so nothing depends on a pass landing at any particular moment, and the daemon
+    /// can stay cheap while idle instead of polling.
+    fn spawn_maintenance(&self) -> thread::JoinHandle<()> {
+        let store = Arc::clone(&self.store);
+        let shutdown = self.shutdown.clone();
+        let interval = MAINTENANCE_INTERVAL;
+        let mut maintenance = crate::maintenance::Maintenance::new(
+            shutdown.clone(),
+            interval,
+            std::time::Instant::now(),
+            current_unix_ms().map_or(0, |now| now),
+        );
+        thread::spawn(move || {
+            while !shutdown.is_requested() {
+                thread::sleep(interval);
+                if shutdown.is_requested() {
+                    break;
+                }
+                let Ok(now) = current_unix_ms() else { continue };
+                let seed = u64::from(Uuid::new_v4().as_fields().0);
+                if let Ok(mut store) = store.lock() {
+                    // A maintenance failure is never fatal: the next pass tries again, and the
+                    // state it would have written is still discoverable from what is durable.
+                    let _ = maintenance.tick(&mut store, std::time::Instant::now(), now, seed);
+                }
+            }
         })
     }
 
     /// Serves forever, creating one worker thread per accepted local connection.
     pub fn serve_forever(self) -> Result<(), ServiceError> {
+        let _maintenance = self.spawn_maintenance();
         for connection in self.owner.listener.incoming() {
             let stream = connection?;
             let auth_token = self.owner.auth_token.clone();

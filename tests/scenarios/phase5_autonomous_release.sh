@@ -125,7 +125,8 @@ cli schedule unit "$unit_id" --package-id "$package_id" --revision 1 >/dev/null
 # Bring the selection forward so it is due now. From here on nothing issues a release command:
 # whatever happens next is the daemon acting on its own schedule.
 cli schedule release-now "$unit_id" >/dev/null
-cli schedule due --concurrency-limit 10 | grep -q "$unit_id" || \
+due_now="$(cli schedule due --concurrency-limit 10)"
+grep -q "$unit_id" <<<"$due_now" || \
   fail "the unit did not become due after release-now"
 
 # The maintenance pass runs on its own interval; wait for it rather than prompting it.
@@ -158,7 +159,8 @@ author="$(git -C "$fixture_root/verification" log -1 --format='%an <%ae>')"
 # No attempt is left unresolved, and nothing is still reported as due.
 attempts="$(cli release attempts --limit 10)"
 grep -q '"status":"published"' <<<"$attempts" || fail "no published attempt was recorded"
-cli schedule due --concurrency-limit 10 | grep -q '"units":\[\]' || \
+due_after="$(cli schedule due --concurrency-limit 10)"
+grep -q '"units":\[\]' <<<"$due_after" || \
   fail "the unit is still reported as due after being published"
 
 printf 'PASS the daemon published a due unit on its own, with the plan task name and the checkout identity\n'

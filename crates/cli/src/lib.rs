@@ -1341,6 +1341,16 @@ fn output_data(
                 repository.target.as_str()
             )
         }
+        ResponseData::RepositoryInitialized {
+            repository,
+            schedule_policy,
+        } => writeln!(
+            out,
+            "Initialized {}\nTarget: {}\nSchedule policy revision: {}",
+            repository.id,
+            repository.target.as_str(),
+            schedule_policy.revision.get(),
+        ),
         ResponseData::Repositories { repositories } => output_repositories(out, &repositories),
         ResponseData::Events { events } => output_events(out, &events),
         ResponseData::PlanSealed { plan } => {
@@ -1487,17 +1497,25 @@ fn output_plan_history(out: &mut impl Write, plans: &[PlanView]) -> io::Result<(
     if plans.is_empty() {
         return writeln!(out, "No revisions found.");
     }
-    for plan in plans {
-        writeln!(
-            out,
-            "{}  revision {}  {}  {}",
-            plan.plan.feature_id,
-            plan.plan.revision.get(),
-            if plan.plan.sealed { "sealed" } else { "draft" },
-            plan.plan.goal
-        )?;
-    }
-    Ok(())
+    output_table(
+        out,
+        &["FEATURE", "REVISION", "STATE", "GOAL"],
+        plans
+            .iter()
+            .map(|plan| {
+                vec![
+                    plan.plan.feature_id.to_string(),
+                    plan.plan.revision.get().to_string(),
+                    if plan.plan.sealed {
+                        "sealed".into()
+                    } else {
+                        "draft".into()
+                    },
+                    plan.plan.goal.clone(),
+                ]
+            })
+            .collect(),
+    )
 }
 
 fn output_workspace(out: &mut impl Write, workspace: &WorkspaceView) -> io::Result<()> {
@@ -1572,14 +1590,21 @@ fn output_schedule_preview(
     if slots.is_empty() {
         return writeln!(out, "No release times are scheduled.");
     }
-    for slot in slots {
-        writeln!(
-            out,
-            "{} · package {} · {} ({})",
-            slot.release_unit_id, slot.package_id, slot.selected_at_unix_ms, slot.timezone
-        )?;
-    }
-    Ok(())
+    output_table(
+        out,
+        &["UNIT", "PACKAGE", "RELEASE TIME", "TIME ZONE"],
+        slots
+            .iter()
+            .map(|slot| {
+                vec![
+                    slot.release_unit_id.to_string(),
+                    slot.package_id.to_string(),
+                    slot.selected_at_unix_ms.to_string(),
+                    slot.timezone.clone(),
+                ]
+            })
+            .collect(),
+    )
 }
 
 fn output_integration_health(
@@ -1589,37 +1614,55 @@ fn output_integration_health(
     if integrations.is_empty() {
         return writeln!(out, "All integrations are healthy.");
     }
-    for health in integrations {
-        let next = match health.next_attempt_at_unix_ms {
-            Some(at) => format!("retry after {at}"),
-            // Deliberately explicit: this will not clear on its own.
-            None => "needs attention; no retry scheduled".to_owned(),
-        };
-        writeln!(
-            out,
-            "{:?} · {} · {:?} after {} failure(s) · {next}\n  {}",
-            health.integration,
-            health.scope,
-            health.fault,
-            health.consecutive_failures,
-            health.detail
-        )?;
-    }
-    Ok(())
+    output_table(
+        out,
+        &[
+            "INTEGRATION",
+            "SCOPE",
+            "FAULT",
+            "FAILURES",
+            "NEXT ACTION",
+            "DETAIL",
+        ],
+        integrations
+            .iter()
+            .map(|health| {
+                vec![
+                    format!("{:?}", health.integration),
+                    health.scope.clone(),
+                    format!("{:?}", health.fault),
+                    health.consecutive_failures.to_string(),
+                    match health.next_attempt_at_unix_ms {
+                        Some(at) => format!("retry after {at}"),
+                        // Deliberately explicit: this will not clear on its own.
+                        None => "needs attention; no retry scheduled".to_owned(),
+                    },
+                    health.detail.clone(),
+                ]
+            })
+            .collect(),
+    )
 }
 
 fn output_due_units(out: &mut impl Write, units: &[DueUnitView]) -> io::Result<()> {
     if units.is_empty() {
         return writeln!(out, "No units are due for release.");
     }
-    for unit in units {
-        writeln!(
-            out,
-            "{} · repository {} · package {} · due {}",
-            unit.release_unit_id, unit.repository_id, unit.package_id, unit.selected_at_unix_ms
-        )?;
-    }
-    Ok(())
+    output_table(
+        out,
+        &["UNIT", "REPOSITORY", "PACKAGE", "DUE"],
+        units
+            .iter()
+            .map(|unit| {
+                vec![
+                    unit.release_unit_id.to_string(),
+                    unit.repository_id.to_string(),
+                    unit.package_id.to_string(),
+                    unit.selected_at_unix_ms.to_string(),
+                ]
+            })
+            .collect(),
+    )
 }
 
 fn output_schedule_slot(out: &mut impl Write, slot: &ScheduleSlotView) -> io::Result<()> {
@@ -1668,18 +1711,24 @@ fn output_release_attempts(
     if attempts.is_empty() {
         return writeln!(out, "No release attempts found.");
     }
-    for attempt in attempts {
-        writeln!(
-            out,
-            "{}  {:?}  {}@{}  {}",
-            attempt.attempt_id,
-            attempt.status,
-            attempt.package_id,
-            attempt.package_revision.get(),
-            attempt.failure_classification.as_deref().unwrap_or("-")
-        )?;
-    }
-    Ok(())
+    output_table(
+        out,
+        &["ATTEMPT", "STATUS", "PACKAGE", "FAILURE"],
+        attempts
+            .iter()
+            .map(|attempt| {
+                vec![
+                    attempt.attempt_id.to_string(),
+                    format!("{:?}", attempt.status),
+                    format!("{}@{}", attempt.package_id, attempt.package_revision.get()),
+                    attempt
+                        .failure_classification
+                        .clone()
+                        .unwrap_or_else(|| "-".into()),
+                ]
+            })
+            .collect(),
+    )
 }
 
 fn output_queue_audit(out: &mut impl Write, audit: &QueueAuditView) -> io::Result<()> {
@@ -1710,40 +1759,118 @@ fn output_events(out: &mut impl Write, events: &[EventView]) -> io::Result<()> {
     if events.is_empty() {
         return writeln!(out, "No diagnostic events have been recorded.");
     }
-    for event in events {
-        let severity = match event.severity {
-            EventSeverityView::Debug => "DEBUG",
-            EventSeverityView::Info => "INFO",
-            EventSeverityView::Warning => "WARN",
-            EventSeverityView::Error => "ERROR",
-        };
-        let request_id = event
-            .request_id
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "-".to_owned());
-        writeln!(
-            out,
-            "#{:<6} {:<5} {:<24} {}  {}",
-            event.sequence, severity, event.kind, request_id, event.message
-        )?;
-    }
-    Ok(())
+    output_table(
+        out,
+        &["#", "SEVERITY", "KIND", "REQUEST", "MESSAGE"],
+        events
+            .iter()
+            .map(|event| {
+                vec![
+                    event.sequence.to_string(),
+                    match event.severity {
+                        EventSeverityView::Debug => "DEBUG",
+                        EventSeverityView::Info => "INFO",
+                        EventSeverityView::Warning => "WARN",
+                        EventSeverityView::Error => "ERROR",
+                    }
+                    .into(),
+                    event.kind.clone(),
+                    event
+                        .request_id
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    event.message.clone(),
+                ]
+            })
+            .collect(),
+    )
 }
 
 fn output_repositories(out: &mut impl Write, repositories: &[RepositoryView]) -> io::Result<()> {
     if repositories.is_empty() {
         return writeln!(out, "No repositories are registered.");
     }
-    for repository in repositories {
-        writeln!(
-            out,
-            "{}  {}  {}",
-            repository.id,
-            repository.target.as_str(),
-            repository.checkout_path
-        )?;
+    output_table(
+        out,
+        &["REPOSITORY", "TARGET", "MODE", "CHECKOUT"],
+        repositories
+            .iter()
+            .map(|repository| {
+                vec![
+                    repository.id.to_string(),
+                    repository.target.as_str().into(),
+                    format!("{:?}", repository.publication_mode),
+                    repository.checkout_path.clone(),
+                ]
+            })
+            .collect(),
+    )
+}
+
+const MAX_TABLE_CELL_WIDTH: usize = 48;
+
+fn output_table(out: &mut impl Write, headings: &[&str], rows: Vec<Vec<String>>) -> io::Result<()> {
+    debug_assert!(rows.iter().all(|row| row.len() == headings.len()));
+    let rows = rows
+        .into_iter()
+        .map(|row| row.into_iter().map(table_cell).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let widths = headings
+        .iter()
+        .enumerate()
+        .map(|(index, heading)| {
+            rows.iter()
+                .map(|row| row[index].chars().count())
+                .max()
+                .unwrap_or_default()
+                .max(heading.chars().count())
+        })
+        .collect::<Vec<_>>();
+
+    output_table_row(out, headings.iter().copied(), &widths)?;
+    let separators = widths
+        .iter()
+        .map(|width| "-".repeat(*width))
+        .collect::<Vec<_>>();
+    output_table_row(out, separators.iter().map(String::as_str), &widths)?;
+    for row in &rows {
+        output_table_row(out, row.iter().map(String::as_str), &widths)?;
     }
     Ok(())
+}
+
+fn output_table_row<'a>(
+    out: &mut impl Write,
+    cells: impl IntoIterator<Item = &'a str>,
+    widths: &[usize],
+) -> io::Result<()> {
+    for (index, (cell, width)) in cells.into_iter().zip(widths).enumerate() {
+        if index > 0 {
+            write!(out, " | ")?;
+        }
+        write!(out, "{cell:<width$}")?;
+    }
+    writeln!(out)
+}
+
+fn table_cell(value: String) -> String {
+    let value = value.replace(['\n', '\r'], " ");
+    let mut characters = value.chars();
+    let shortened = characters
+        .by_ref()
+        .take(MAX_TABLE_CELL_WIDTH)
+        .collect::<String>();
+    if characters.next().is_some() {
+        format!(
+            "{}…",
+            shortened
+                .chars()
+                .take(MAX_TABLE_CELL_WIDTH - 1)
+                .collect::<String>()
+        )
+    } else {
+        shortened
+    }
 }
 
 fn doctor(session: &Session, json_output: bool, out: &mut impl Write) -> Result<(), CliFailure> {
@@ -1972,6 +2099,23 @@ mod tests {
         let help = String::from_utf8(stdout).unwrap();
         assert!(help.contains("Start here:"));
         assert!(help.contains("For stable automation output, pass --json."));
+    }
+
+    #[test]
+    fn tables_have_headings_and_bound_untrusted_cell_width() {
+        let mut output = Vec::new();
+        output_table(
+            &mut output,
+            &["NAME", "DETAIL"],
+            vec![vec!["first\nline".into(), "x".repeat(60)]],
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("NAME"));
+        assert!(lines[2].contains("first line"));
+        assert!(lines[2].ends_with('…'));
     }
 
     #[test]

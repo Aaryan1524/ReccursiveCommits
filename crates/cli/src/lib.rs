@@ -11,10 +11,10 @@ use install::{InstallError, ServiceInstallation};
 use reccursive_protocol::{
     ApiError, ApiErrorCode, CancelTaskRequest, CapturePackageRequest, Command,
     CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
-    EventSeverityView, EventView, FeatureId, FeaturePlan, IntegrationHealthView, LocalClient,
-    PackageId, PackageView, PlanView, PublicationMode, QueueAuditView, QueueExportView,
-    ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitId, ReleaseUnitView, RepositoryId,
-    RepositoryView, ResponseData, Revision, SchedulePolicy, SchedulePolicyOverride,
+    EventSeverityView, EventView, FeatureId, FeaturePlan, IdempotencyKey, IntegrationHealthView,
+    LocalClient, PackageId, PackageView, PlanView, PublicationMode, QueueAuditView,
+    QueueExportView, ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitId, ReleaseUnitView,
+    RepositoryId, RepositoryView, ResponseData, Revision, SchedulePolicy, SchedulePolicyOverride,
     SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest, TargetRef,
     TaskId, WorkspaceView,
 };
@@ -45,6 +45,11 @@ struct Cli {
     /// Emit stable JSON without interactive formatting.
     #[arg(long, global = true)]
     json: bool,
+
+    /// Name this invocation's intent so a repeat of it returns the first result instead of
+    /// acting again. Intended for agents, which retry after a dropped connection.
+    #[arg(long, global = true, value_name = "KEY", value_parser = parse_idempotency_key)]
+    idempotency_key: Option<IdempotencyKey>,
 
     #[command(subcommand)]
     command: TopLevelCommand,
@@ -346,19 +351,25 @@ enum PublicationModeArgument {
     Immediate,
 }
 
+/// One CLI invocation's connection to the local service.
 #[derive(Debug)]
-struct ClientPaths {
+struct Session {
     state_dir: PathBuf,
     socket: PathBuf,
     auth_token: PathBuf,
+    /// Set when the caller named this invocation's intent, which makes a repeat of it return the
+    /// first result rather than act a second time. Absent by default: a person typing a command
+    /// has no dropped connection to recover from, and would only be naming keys for the sake of it.
+    idempotency_key: Option<IdempotencyKey>,
 }
 
-impl ClientPaths {
-    fn new(state_dir: PathBuf) -> Self {
+impl Session {
+    fn new(state_dir: PathBuf, idempotency_key: Option<IdempotencyKey>) -> Self {
         Self {
             socket: state_dir.join("service.sock"),
             auth_token: state_dir.join("auth.token"),
             state_dir,
+            idempotency_key,
         }
     }
 }
@@ -444,30 +455,32 @@ where
 
 fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
     let state_dir = resolve_state_dir(cli.state_dir)?;
-    let paths = ClientPaths::new(state_dir);
+    let session = Session::new(state_dir, cli.idempotency_key);
     match cli.command {
-        TopLevelCommand::Doctor => doctor(&paths, cli.json, stdout),
+        TopLevelCommand::Doctor => doctor(&session, cli.json, stdout),
         TopLevelCommand::Diagnose { repository_id } => {
-            let data = send(&paths, Command::DiagnoseRepository { repository_id })?;
+            let data = send(&session, Command::DiagnoseRepository { repository_id })?;
             output_data(data, cli.json, stdout)
         }
         TopLevelCommand::Integrations => {
-            let data = send(&paths, Command::ListIntegrationHealth)?;
+            let data = send(&session, Command::ListIntegrationHealth)?;
             output_data(data, cli.json, stdout)
         }
-        TopLevelCommand::Service { command } => service_command(command, &paths, cli.json, stdout),
+        TopLevelCommand::Service { command } => {
+            service_command(command, &session, cli.json, stdout)
+        }
         TopLevelCommand::Status => {
-            let data = send(&paths, Command::Status)?;
+            let data = send(&session, Command::Status)?;
             output_data(data, cli.json, stdout)
         }
         TopLevelCommand::Logs { limit } => {
-            let data = send(&paths, Command::ListEvents { limit })?;
+            let data = send(&session, Command::ListEvents { limit })?;
             output_data(data, cli.json, stdout)
         }
         TopLevelCommand::Plan { command } => match command {
             PlanCommand::Import { file } => {
                 let plan = load_plan(&file)?;
-                let data = send(&paths, Command::ImportPlan { plan })?;
+                let data = send(&session, Command::ImportPlan { plan })?;
                 output_data(data, cli.json, stdout)
             }
             PlanCommand::Show {
@@ -475,7 +488,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 revision,
             } => {
                 let data = send(
-                    &paths,
+                    &session,
                     Command::GetPlan {
                         feature_id,
                         revision,
@@ -484,7 +497,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 output_data(data, cli.json, stdout)
             }
             PlanCommand::History { feature_id } => {
-                let data = send(&paths, Command::PlanHistory { feature_id })?;
+                let data = send(&session, Command::PlanHistory { feature_id })?;
                 output_data(data, cli.json, stdout)
             }
         },
@@ -495,7 +508,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 prerequisites,
             } => {
                 let data = send(
-                    &paths,
+                    &session,
                     Command::CreateWorkspace(CreateWorkspaceRequest {
                         feature_id,
                         revision,
@@ -509,7 +522,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 revision,
             } => {
                 let data = send(
-                    &paths,
+                    &session,
                     Command::GetWorkspace {
                         feature_id,
                         revision,
@@ -525,7 +538,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 task_ids,
             } => {
                 let data = send(
-                    &paths,
+                    &session,
                     Command::CapturePackage(CapturePackageRequest {
                         feature_id,
                         plan_revision: revision,
@@ -539,7 +552,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 revision,
             } => {
                 let data = send(
-                    &paths,
+                    &session,
                     Command::GetPackage {
                         package_id,
                         revision,
@@ -556,7 +569,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 message,
             } => {
                 let data = send(
-                    &paths,
+                    &session,
                     Command::CancelTask(CancelTaskRequest {
                         feature_id,
                         plan_revision: revision,
@@ -576,7 +589,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 author_email,
             } => {
                 let data = send(
-                    &paths,
+                    &session,
                     Command::ReleasePackage(ReleasePackageRequest {
                         package_id,
                         revision,
@@ -588,11 +601,11 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 output_data(data, cli.json, stdout)
             }
             ReleaseCommand::Attempt { attempt_id } => {
-                let data = send(&paths, Command::GetReleaseAttempt { attempt_id })?;
+                let data = send(&session, Command::GetReleaseAttempt { attempt_id })?;
                 output_data(data, cli.json, stdout)
             }
             ReleaseCommand::Attempts { package_id, limit } => {
-                let data = send(&paths, Command::ListReleaseAttempts { package_id, limit })?;
+                let data = send(&session, Command::ListReleaseAttempts { package_id, limit })?;
                 output_data(data, cli.json, stdout)
             }
             ReleaseCommand::CreateUnit {
@@ -602,7 +615,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 required_checks,
             } => {
                 let data = send(
-                    &paths,
+                    &session,
                     Command::CreateReleaseUnit(CreateReleaseUnitRequest {
                         release_unit_id: ReleaseUnitId::new(),
                         feature_id,
@@ -614,7 +627,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 output_data(data, cli.json, stdout)
             }
             ReleaseCommand::ShowUnit { release_unit_id } => {
-                let data = send(&paths, Command::GetReleaseUnit { release_unit_id })?;
+                let data = send(&session, Command::GetReleaseUnit { release_unit_id })?;
                 output_data(data, cli.json, stdout)
             }
         },
@@ -625,7 +638,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             } => {
                 let policy = load_schedule_policy(&file)?;
                 let data = send(
-                    &paths,
+                    &session,
                     Command::SetSchedulePolicy(SetSchedulePolicyRequest {
                         repository_id,
                         policy,
@@ -634,7 +647,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 output_data(data, cli.json, stdout)
             }
             ScheduleCommand::ShowPolicy { repository_id } => {
-                let data = send(&paths, Command::GetSchedulePolicy { repository_id })?;
+                let data = send(&session, Command::GetSchedulePolicy { repository_id })?;
                 output_data(data, cli.json, stdout)
             }
             ScheduleCommand::Unit {
@@ -645,7 +658,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             } => {
                 let seed = seed.unwrap_or_else(random_seed);
                 let data = send(
-                    &paths,
+                    &session,
                     Command::ScheduleUnit(ScheduleUnitRequest {
                         release_unit_id,
                         package_id,
@@ -656,7 +669,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 output_data(data, cli.json, stdout)
             }
             ScheduleCommand::Show { release_unit_id } => {
-                let data = send(&paths, Command::GetScheduleSlot { release_unit_id })?;
+                let data = send(&session, Command::GetScheduleSlot { release_unit_id })?;
                 output_data(data, cli.json, stdout)
             }
             ScheduleCommand::Withdraw {
@@ -664,7 +677,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 reason,
             } => {
                 let data = send(
-                    &paths,
+                    &session,
                     Command::WithdrawScheduleSlot {
                         release_unit_id,
                         reason,
@@ -677,7 +690,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 reason,
             } => {
                 let data = send(
-                    &paths,
+                    &session,
                     Command::PauseRepository {
                         repository_id,
                         reason,
@@ -686,15 +699,15 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 output_data(data, cli.json, stdout)
             }
             ScheduleCommand::Resume { repository_id } => {
-                let data = send(&paths, Command::ResumeRepository { repository_id })?;
+                let data = send(&session, Command::ResumeRepository { repository_id })?;
                 output_data(data, cli.json, stdout)
             }
             ScheduleCommand::ReleaseNow { release_unit_id } => {
-                let data = send(&paths, Command::ReleaseUnitNow { release_unit_id })?;
+                let data = send(&session, Command::ReleaseUnitNow { release_unit_id })?;
                 output_data(data, cli.json, stdout)
             }
             ScheduleCommand::Preview { repository_id } => {
-                let data = send(&paths, Command::PreviewSchedule { repository_id })?;
+                let data = send(&session, Command::PreviewSchedule { repository_id })?;
                 output_data(data, cli.json, stdout)
             }
             ScheduleCommand::SetOverride {
@@ -703,7 +716,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             } => {
                 let override_policy = load_schedule_override(&file)?;
                 let data = send(
-                    &paths,
+                    &session,
                     Command::SetScheduleOverride {
                         repository_id,
                         override_policy,
@@ -712,7 +725,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 output_data(data, cli.json, stdout)
             }
             ScheduleCommand::Due { concurrency_limit } => {
-                let data = send(&paths, Command::ListDueUnits { concurrency_limit })?;
+                let data = send(&session, Command::ListDueUnits { concurrency_limit })?;
                 output_data(data, cli.json, stdout)
             }
             ScheduleCommand::CatchUp {
@@ -721,7 +734,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             } => {
                 let seed = seed.unwrap_or_else(random_seed);
                 let data = send(
-                    &paths,
+                    &session,
                     Command::ReconcileMissedWindows {
                         repository_id,
                         seed,
@@ -734,7 +747,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 reason,
             } => {
                 let data = send(
-                    &paths,
+                    &session,
                     Command::RecalculateSchedule {
                         repository_id,
                         reason,
@@ -745,12 +758,12 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
         },
         TopLevelCommand::Queue { command } => match command {
             QueueCommand::Audit => {
-                let data = send(&paths, Command::AuditQueue)?;
+                let data = send(&session, Command::AuditQueue)?;
                 output_data(data, cli.json, stdout)
             }
             QueueCommand::Export { destination } => {
                 let data = send(
-                    &paths,
+                    &session,
                     Command::ExportQueue {
                         destination: destination.to_string_lossy().into_owned(),
                     },
@@ -760,7 +773,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
         },
         TopLevelCommand::Repository { command } => match command {
             RepositoryCommand::List => {
-                let data = send(&paths, Command::ListRepositories)?;
+                let data = send(&session, Command::ListRepositories)?;
                 output_data(data, cli.json, stdout)
             }
             RepositoryCommand::Add {
@@ -771,7 +784,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 development_target,
             } => {
                 let request = enrollment_request(path, remote, target, mode, development_target)?;
-                let data = send(&paths, Command::EnrollRepository(request))?;
+                let data = send(&session, Command::EnrollRepository(request))?;
                 output_data(data, cli.json, stdout)
             }
         },
@@ -805,7 +818,7 @@ fn load_plan(path: &Path) -> Result<FeaturePlan, CliFailure> {
 /// arranges for the daemon to exist in the first place, so it must work when nothing is running.
 fn service_command(
     command: ServiceCommand,
-    paths: &ClientPaths,
+    session: &Session,
     json_output: bool,
     out: &mut impl Write,
 ) -> Result<(), CliFailure> {
@@ -826,24 +839,24 @@ fn service_command(
     match command {
         ServiceCommand::Show { program } => {
             let installation =
-                ServiceInstallation::describe(resolve(program)?, &paths.state_dir, &home);
+                ServiceInstallation::describe(resolve(program)?, &session.state_dir, &home);
             write!(out, "{}", installation.plist()).map_err(output_error)
         }
         ServiceCommand::Install { program } => {
             let installation =
-                ServiceInstallation::describe(resolve(program)?, &paths.state_dir, &home);
+                ServiceInstallation::describe(resolve(program)?, &session.state_dir, &home);
             installation.install().map_err(install_failure)?;
             report_service(out, json_output, &installation, true, "installed")
         }
         ServiceCommand::Uninstall => {
             let installation =
-                ServiceInstallation::describe(default_daemon_program()?, &paths.state_dir, &home);
+                ServiceInstallation::describe(default_daemon_program()?, &session.state_dir, &home);
             installation.uninstall().map_err(install_failure)?;
             report_service(out, json_output, &installation, false, "removed")
         }
         ServiceCommand::Status => {
             let installation =
-                ServiceInstallation::describe(default_daemon_program()?, &paths.state_dir, &home);
+                ServiceInstallation::describe(default_daemon_program()?, &session.state_dir, &home);
             let loaded = installation.is_loaded();
             report_service(
                 out,
@@ -988,6 +1001,10 @@ fn parse_revision(value: &str) -> Result<Revision, String> {
     Revision::new(value).map_err(|error| error.to_string())
 }
 
+fn parse_idempotency_key(value: &str) -> Result<IdempotencyKey, String> {
+    IdempotencyKey::new(value).map_err(|error| error.to_string())
+}
+
 fn parse_event_limit(value: &str) -> Result<usize, String> {
     let limit = value
         .parse::<usize>()
@@ -999,21 +1016,23 @@ fn parse_event_limit(value: &str) -> Result<usize, String> {
     }
 }
 
-fn send(paths: &ClientPaths, command: Command) -> Result<ResponseData, CliFailure> {
-    let client = LocalClient::from_token_file(&paths.auth_token).map_err(|error| {
+fn send(session: &Session, command: Command) -> Result<ResponseData, CliFailure> {
+    let client = LocalClient::from_token_file(&session.auth_token).map_err(|error| {
         CliFailure::new(
             EXIT_UNAVAILABLE,
             "service_unavailable",
             format!("cannot read local service credentials: {error}"),
         )
     })?;
-    let response = client.send(&paths.socket, command).map_err(|error| {
-        CliFailure::new(
-            EXIT_UNAVAILABLE,
-            "service_unavailable",
-            format!("cannot reach local service: {error}"),
-        )
-    })?;
+    let response = client
+        .send_with_key(&session.socket, command, session.idempotency_key.clone())
+        .map_err(|error| {
+            CliFailure::new(
+                EXIT_UNAVAILABLE,
+                "service_unavailable",
+                format!("cannot reach local service: {error}"),
+            )
+        })?;
     response.result.map_err(api_failure)
 }
 
@@ -1564,7 +1583,7 @@ fn output_repositories(out: &mut impl Write, repositories: &[RepositoryView]) ->
     Ok(())
 }
 
-fn doctor(paths: &ClientPaths, json_output: bool, out: &mut impl Write) -> Result<(), CliFailure> {
+fn doctor(session: &Session, json_output: bool, out: &mut impl Write) -> Result<(), CliFailure> {
     let mut checks = Vec::new();
     let git = ProcessCommand::new("git").arg("--version").output();
     match git {
@@ -1580,7 +1599,7 @@ fn doctor(paths: &ClientPaths, json_output: bool, out: &mut impl Write) -> Resul
         }),
     }
 
-    let state_ready = fs::metadata(&paths.state_dir)
+    let state_ready = fs::metadata(&session.state_dir)
         .map(|metadata| metadata.is_dir() && metadata.permissions().mode() & 0o077 == 0)
         .unwrap_or(false);
     checks.push(DoctorCheck {
@@ -1591,13 +1610,16 @@ fn doctor(paths: &ClientPaths, json_output: bool, out: &mut impl Write) -> Resul
             "action_required"
         },
         detail: if state_ready {
-            format!("{} is owner-only", paths.state_dir.display())
+            format!("{} is owner-only", session.state_dir.display())
         } else {
-            format!("{} is missing or not owner-only", paths.state_dir.display())
+            format!(
+                "{} is missing or not owner-only",
+                session.state_dir.display()
+            )
         },
     });
 
-    let service_result = send(paths, Command::Ping);
+    let service_result = send(session, Command::Ping);
     checks.push(DoctorCheck {
         name: "service",
         status: if service_result.is_ok() {

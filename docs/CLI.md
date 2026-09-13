@@ -57,6 +57,42 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state queue export /absolute
 Pass `--json` for a stable JSON envelope with no prompts or spinners. The
 `RECCURSIVE_STATE_DIR` environment variable can replace `--state-dir`.
 
+An agent driving the CLI should start from
+[`AGENT_HANDOFF.md`](AGENT_HANDOFF.md), which specifies the whole sequence.
+
+## Repeating a request safely
+
+`--idempotency-key KEY` names what an invocation is *for*, so repeating it returns
+the first result instead of acting again:
+
+```sh
+reccursive --idempotency-key "agent-7/capture/task_<uuid>" \
+  package capture feature_<uuid> --revision 1 --task task_<uuid>
+```
+
+This exists for callers that retry — an agent whose connection drops cannot tell a
+request that never arrived from one that arrived, acted, and answered. A person
+typing a command has no dropped connection to recover from and can leave the flag
+alone.
+
+The key is claimed before the command runs, not after it succeeds, because the
+window in which a retry is dangerous is exactly the window in which the first
+attempt is still running. Within that window a second request carrying the same key
+is told the original is still running and to retry, rather than being allowed to act
+alongside it. Afterwards it is handed the original outcome, success or failure,
+unchanged.
+
+Reusing one key for a genuinely different request is a conflict, not a cache hit:
+the daemon compares a digest of the request and refuses rather than answering with
+something the caller did not ask for. Keys on read-only commands are accepted and
+ignored, since repeating a query is already safe and recording its answer would
+freeze state that has since moved.
+
+A failure that provably never left the machine gives the key back, so a real retry
+runs. A failure anywhere a push could already have reached the remote keeps it and
+replays the recorded failure: the error alone does not say whether the remote moved,
+and `release attempt` is where that is settled.
+
 `logs` returns the newest structured daemon events first. Every authenticated API
 request is correlated by request ID, stored with a stable event kind and severity,
 and scrubbed for common credential formats before persistence. The installation

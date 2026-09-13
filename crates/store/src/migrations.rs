@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 15;
+pub const STORAGE_SCHEMA_VERSION: u32 = 16;
 
 struct Migration {
     version: u32,
@@ -559,6 +559,78 @@ const MIGRATIONS: &[Migration] = &[
 
         CREATE UNIQUE INDEX idx_repository_schedule_policy_active
             ON repository_schedule_policies(repository_id) WHERE active = 1;
+        "#,
+    },
+    Migration {
+        version: 16,
+        sql: r#"
+        -- A slot is never deleted when work it belongs to changes. Marking it invalidated keeps
+        -- the record of what was once selected and why it stopped being valid, which is what makes
+        -- "only affected future work moved" auditable after the fact rather than merely asserted.
+        ALTER TABLE schedule_slots ADD COLUMN invalidated_at_unix_ms INTEGER
+            CHECK (invalidated_at_unix_ms IS NULL OR invalidated_at_unix_ms >= 0);
+
+        ALTER TABLE schedule_slots ADD COLUMN invalidated_reason TEXT
+            CHECK (invalidated_reason IS NULL OR length(trim(invalidated_reason)) > 0);
+
+        -- The UNIQUE (package_id, package_revision) constraint from v13 bound one package to one
+        -- slot for all time, which would stop an invalidated unit from ever being rescheduled.
+        -- Rebuild the table so that uniqueness applies only among live slots.
+        CREATE TABLE schedule_slots_rebuilt (
+            -- A surrogate key, because a unit may hold several selections over time: the live one
+            -- plus every withdrawn selection retained as evidence. Liveness is enforced by the
+            -- partial unique indexes below, not by the primary key.
+            slot_id INTEGER PRIMARY KEY,
+            release_unit_id TEXT NOT NULL,
+            repository_id TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            package_revision INTEGER NOT NULL CHECK (package_revision > 0),
+            policy_revision INTEGER NOT NULL CHECK (policy_revision > 0),
+            timezone TEXT NOT NULL CHECK (length(trim(timezone)) > 0),
+            eligible_at_unix_ms INTEGER NOT NULL CHECK (eligible_at_unix_ms >= 0),
+            selected_at_unix_ms INTEGER NOT NULL
+                CHECK (selected_at_unix_ms >= eligible_at_unix_ms),
+            created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+            invalidated_at_unix_ms INTEGER
+                CHECK (invalidated_at_unix_ms IS NULL OR invalidated_at_unix_ms >= 0),
+            invalidated_reason TEXT
+                CHECK (invalidated_reason IS NULL OR length(trim(invalidated_reason)) > 0),
+            CHECK ((invalidated_at_unix_ms IS NULL) = (invalidated_reason IS NULL)),
+            FOREIGN KEY (release_unit_id) REFERENCES release_units(unit_id) ON DELETE RESTRICT,
+            FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+            FOREIGN KEY (package_id, package_revision)
+                REFERENCES snapshot_packages(package_id, revision) ON DELETE RESTRICT
+        );
+
+        INSERT INTO schedule_slots_rebuilt (
+            release_unit_id, repository_id, package_id, package_revision, policy_revision,
+            timezone, eligible_at_unix_ms, selected_at_unix_ms, created_at_unix_ms,
+            invalidated_at_unix_ms, invalidated_reason
+        )
+        SELECT release_unit_id, repository_id, package_id, package_revision, policy_revision,
+               timezone, eligible_at_unix_ms, selected_at_unix_ms, created_at_unix_ms,
+               invalidated_at_unix_ms, invalidated_reason
+        FROM schedule_slots;
+
+        DROP TABLE schedule_slots;
+        ALTER TABLE schedule_slots_rebuilt RENAME TO schedule_slots;
+
+        CREATE INDEX idx_schedule_slots_due
+            ON schedule_slots(repository_id, selected_at_unix_ms)
+            WHERE invalidated_at_unix_ms IS NULL;
+
+        -- One live slot per unit and per package revision; withdrawn selections accumulate behind
+        -- them as history rather than blocking a fresh selection.
+        CREATE UNIQUE INDEX idx_schedule_slots_live_unit
+            ON schedule_slots(release_unit_id)
+            WHERE invalidated_at_unix_ms IS NULL;
+
+        CREATE UNIQUE INDEX idx_schedule_slots_live_package
+            ON schedule_slots(package_id, package_revision)
+            WHERE invalidated_at_unix_ms IS NULL;
+
+        CREATE INDEX idx_schedule_slots_unit_history
+            ON schedule_slots(release_unit_id, created_at_unix_ms DESC);
         "#,
     },
 ];

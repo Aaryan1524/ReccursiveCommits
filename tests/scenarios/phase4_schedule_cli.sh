@@ -162,4 +162,26 @@ repeat_selected_at="$(json_number selected_at_unix_ms <<<"$repeat_json")"
 unit_show="$(cli release show-unit "$unit_id")"
 grep -q "\"unit_id\":\"$unit_id\"" <<<"$unit_show" || fail "release unit inspection returned the wrong unit"
 
-printf 'PASS release-unit creation, policy activation, deterministic scheduling, and restart-stable slots\n'
+# Adaptive recalculation: withdrawing a selection returns the work to the queue, and a fresh
+# selection can then be made. The withdrawn time must not simply reappear.
+withdraw_json="$(cli schedule withdraw "$unit_id" --reason "policy under review")"
+grep -q '"type":"schedule_recalculated"' <<<"$withdraw_json" || \
+  fail "withdrawing a slot did not return a recalculation"
+if cli schedule show "$unit_id" >/dev/null 2>&1; then
+  fail "a withdrawn unit must not still report a live release time"
+fi
+
+rescheduled_json="$(cli schedule unit "$unit_id" --package-id "$package_id" --revision 1 --seed 4242)"
+grep -q '"type":"schedule_slot"' <<<"$rescheduled_json" || \
+  fail "a withdrawn unit could not be scheduled again"
+rescheduled_at="$(json_number selected_at_unix_ms <<<"$rescheduled_json")"
+[[ -n "$rescheduled_at" ]] || fail "rescheduled slot did not record a selected time"
+
+# A repository-wide recalculation reports what it moved rather than moving things silently.
+recalculated_json="$(cli schedule recalculate "$repository_id" --reason "policy revised")"
+grep -q '"type":"schedule_recalculated"' <<<"$recalculated_json" || \
+  fail "repository recalculation did not return the expected payload"
+grep -q "\"withdrawn\":\[\"$unit_id\"\]" <<<"$recalculated_json" || \
+  fail "repository recalculation did not report the withdrawn unit: $recalculated_json"
+
+printf 'PASS release-unit creation, policy activation, deterministic scheduling, restart-stable slots, and adaptive recalculation\n'

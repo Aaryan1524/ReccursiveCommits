@@ -23,9 +23,9 @@ use reccursive_protocol::{
     EventView, PackageView, PlanView, ProtocolValidationError, QueueAuditView, QueueExportView,
     QueueRecoveryIssueView, ReasonCode, ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView,
     RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData,
-    ResponseEnvelope, Revision, SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest,
-    SetSchedulePolicyRequest, StateReason, TaskCancellationView, TaskStatus, TransportError,
-    WorkspacePrerequisiteView, WorkspaceView,
+    ResponseEnvelope, Revision, SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView,
+    ScheduleUnitRequest, SetSchedulePolicyRequest, StateReason, TaskCancellationView, TaskStatus,
+    TransportError, WorkspacePrerequisiteView, WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -418,6 +418,14 @@ fn dispatch(
         Command::GetSchedulePolicy { repository_id } => get_schedule_policy(repository_id, store),
         Command::ScheduleUnit(request) => schedule_unit(request, store),
         Command::GetScheduleSlot { release_unit_id } => get_schedule_slot(release_unit_id, store),
+        Command::WithdrawScheduleSlot {
+            release_unit_id,
+            reason,
+        } => withdraw_schedule_slot(release_unit_id, &reason, store),
+        Command::RecalculateSchedule {
+            repository_id,
+            reason,
+        } => recalculate_schedule(repository_id, &reason, store),
         Command::GetReleaseAttempt { attempt_id } => get_release_attempt(attempt_id, store),
         Command::ListReleaseAttempts { package_id, limit } => {
             list_release_attempts(package_id, limit, store)
@@ -452,6 +460,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::GetSchedulePolicy { .. } => "schedule.policy.show",
         Command::ScheduleUnit(_) => "schedule.unit",
         Command::GetScheduleSlot { .. } => "schedule.slot.show",
+        Command::WithdrawScheduleSlot { .. } => "schedule.withdraw",
+        Command::RecalculateSchedule { .. } => "schedule.recalculate",
         Command::GetReleaseAttempt { .. } => "release.attempt",
         Command::ListReleaseAttempts { .. } => "release.attempts",
         Command::GetPackage { .. } => "package.show",
@@ -1669,6 +1679,42 @@ fn get_schedule_slot(
         })?;
     Ok(ResponseData::ScheduleSlot {
         slot: schedule_slot_view(slot),
+    })
+}
+
+fn withdraw_schedule_slot(
+    release_unit_id: reccursive_protocol::ReleaseUnitId,
+    reason: &str,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let withdrawn = lock_store(store)?
+        .invalidate_schedule_slot(release_unit_id, reason, now)
+        .map_err(store_api_error)?;
+    // Reported as a recalculation rather than a slot, because after this call there is no live
+    // slot to return: the unit is back in the queue awaiting a fresh selection.
+    Ok(ResponseData::ScheduleRecalculated {
+        recalculation: ScheduleRecalculationView {
+            withdrawn: withdrawn.map(|_| vec![release_unit_id]).unwrap_or_default(),
+            retained: Vec::new(),
+        },
+    })
+}
+
+fn recalculate_schedule(
+    repository_id: RepositoryId,
+    reason: &str,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let outcome = lock_store(store)?
+        .invalidate_repository_schedule(repository_id, reason, now)
+        .map_err(store_api_error)?;
+    Ok(ResponseData::ScheduleRecalculated {
+        recalculation: ScheduleRecalculationView {
+            withdrawn: outcome.withdrawn,
+            retained: outcome.retained,
+        },
     })
 }
 

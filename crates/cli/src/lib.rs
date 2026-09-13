@@ -194,6 +194,18 @@ enum ScheduleCommand {
     },
     /// Show the durable slot previously selected for a release unit.
     Show { release_unit_id: ReleaseUnitId },
+    /// Withdraw one unit's release time so it returns to the queue for a fresh selection.
+    Withdraw {
+        release_unit_id: ReleaseUnitId,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Withdraw every live selection for a repository after changing its policy.
+    Recalculate {
+        repository_id: RepositoryId,
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -576,6 +588,32 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 let data = send(&paths, Command::GetScheduleSlot { release_unit_id })?;
                 output_data(data, cli.json, stdout)
             }
+            ScheduleCommand::Withdraw {
+                release_unit_id,
+                reason,
+            } => {
+                let data = send(
+                    &paths,
+                    Command::WithdrawScheduleSlot {
+                        release_unit_id,
+                        reason,
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::Recalculate {
+                repository_id,
+                reason,
+            } => {
+                let data = send(
+                    &paths,
+                    Command::RecalculateSchedule {
+                        repository_id,
+                        reason,
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
         },
         TopLevelCommand::Queue { command } => match command {
             QueueCommand::Audit => {
@@ -888,6 +926,12 @@ fn output_data(
         ),
         ResponseData::SchedulePolicy { policy } => output_schedule_policy(out, &policy),
         ResponseData::ScheduleSlot { slot } => output_schedule_slot(out, &slot),
+        ResponseData::ScheduleRecalculated { recalculation } => writeln!(
+            out,
+            "Withdrew {} release time(s); left {} in-flight unit(s) untouched",
+            recalculation.withdrawn.len(),
+            recalculation.retained.len()
+        ),
         ResponseData::QueueAudit { audit } => output_queue_audit(out, &audit),
         ResponseData::QueueExported { export } => output_queue_export(out, &export),
     }

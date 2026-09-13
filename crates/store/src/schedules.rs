@@ -28,6 +28,23 @@ pub struct ScheduleSlot {
     pub created_at_unix_ms: i64,
 }
 
+/// What an adaptive recalculation actually changed.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleRecalculation {
+    /// Units whose selected time was withdrawn and which are queued for a fresh selection.
+    pub withdrawn: Vec<ReleaseUnitId>,
+    /// Units left untouched because an attempt already owns them.
+    pub retained: Vec<ReleaseUnitId>,
+}
+
+/// One previously selected time and, if it is no longer live, why it was withdrawn.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WithdrawnSlot {
+    pub selected_at_unix_ms: i64,
+    pub invalidated_at_unix_ms: Option<i64>,
+    pub invalidated_reason: Option<String>,
+}
+
 /// Values required to record one previously selected slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewScheduleSlot {
@@ -52,7 +69,8 @@ impl Store {
                 "SELECT release_unit_id, repository_id, package_id, package_revision,
                         policy_revision, timezone, eligible_at_unix_ms, selected_at_unix_ms,
                         created_at_unix_ms
-                 FROM schedule_slots WHERE release_unit_id = ?1",
+                 FROM schedule_slots
+                 WHERE release_unit_id = ?1 AND invalidated_at_unix_ms IS NULL",
                 [release_unit_id.to_string()],
                 RawScheduleSlot::from_row,
             )
@@ -70,7 +88,8 @@ impl Store {
             "SELECT release_unit_id, repository_id, package_id, package_revision,
                     policy_revision, timezone, eligible_at_unix_ms, selected_at_unix_ms,
                     created_at_unix_ms
-             FROM schedule_slots WHERE repository_id = ?1
+             FROM schedule_slots
+             WHERE repository_id = ?1 AND invalidated_at_unix_ms IS NULL
              ORDER BY selected_at_unix_ms, release_unit_id",
         )?;
         statement
@@ -161,6 +180,137 @@ impl Store {
         self.schedule_slot(slot.release_unit_id)?.ok_or_else(|| {
             StoreError::Conflict("schedule slot disappeared after it was committed".into())
         })
+    }
+
+    /// Withdraws a unit's selected time so the work returns to the queue for a fresh selection.
+    ///
+    /// The slot row is kept and marked, never deleted: what was selected and why it stopped being
+    /// valid is exactly the evidence that makes an adaptive reschedule auditable.
+    ///
+    /// Refused once any task in the unit has moved past `scheduled`. At that point an attempt owns
+    /// the work and its identity, and a schedule change must not reach in and discard it.
+    pub fn invalidate_schedule_slot(
+        &mut self,
+        release_unit_id: ReleaseUnitId,
+        reason: &str,
+        now_unix_ms: i64,
+    ) -> Result<Option<ScheduleSlot>, StoreError> {
+        if reason.trim().is_empty() || reason.len() > 256 {
+            return Err(StoreError::InvalidData(
+                "schedule invalidation reason must be a short non-empty explanation".into(),
+            ));
+        }
+        let Some(slot) = self.schedule_slot(release_unit_id)? else {
+            return Ok(None);
+        };
+        let unit = self
+            .release_unit(release_unit_id)?
+            .ok_or_else(|| StoreError::InvalidData("release unit is not stored".into()))?;
+
+        let mut withdrawn = Vec::new();
+        for task_id in &unit.task_ids {
+            let task = self
+                .task(unit.feature_id, unit.plan_revision, *task_id)?
+                .ok_or_else(|| {
+                    StoreError::InvalidData(format!("release-unit task {task_id} is missing"))
+                })?;
+            match task.state.status() {
+                TaskStatus::Scheduled => {
+                    let mut state = task.state.clone();
+                    state
+                        .withdraw_schedule()
+                        .map_err(|error| StoreError::Conflict(error.to_string()))?;
+                    withdrawn.push(*task_id);
+                }
+                // Terminal work keeps its outcome, and blocked work keeps the reason it stopped;
+                // neither is future work a reschedule should disturb.
+                status if status.is_terminal() || status == TaskStatus::Blocked => {}
+                status => {
+                    return Err(StoreError::Conflict(format!(
+                        "task {task_id} is {status:?}; a live attempt owns this unit and its \
+                         schedule cannot be withdrawn"
+                    )));
+                }
+            }
+        }
+
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE schedule_slots
+             SET invalidated_at_unix_ms = ?2, invalidated_reason = ?3
+             WHERE release_unit_id = ?1 AND invalidated_at_unix_ms IS NULL",
+            params![release_unit_id.to_string(), now_unix_ms, reason],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(
+                "schedule slot changed concurrently; re-read it before retrying".into(),
+            ));
+        }
+        for task_id in &withdrawn {
+            let updated = transaction.execute(
+                "UPDATE plan_tasks
+                 SET status = 'queued', updated_at_unix_ms = ?4
+                 WHERE feature_id = ?1 AND plan_revision = ?2 AND task_id = ?3
+                   AND status = 'scheduled'",
+                params![
+                    unit.feature_id.to_string(),
+                    unit.plan_revision.get(),
+                    task_id.to_string(),
+                    now_unix_ms,
+                ],
+            )?;
+            if updated != 1 {
+                return Err(StoreError::Conflict(format!(
+                    "task {task_id} left the scheduled state while its slot was being withdrawn"
+                )));
+            }
+        }
+        transaction.commit()?;
+        Ok(Some(slot))
+    }
+
+    /// Withdraws every live slot for a repository, for use when its policy changes.
+    ///
+    /// Units with a live attempt are left alone and reported, rather than failing the whole
+    /// recalculation: a settings change must not be able to disturb work already in flight.
+    pub fn invalidate_repository_schedule(
+        &mut self,
+        repository_id: reccursive_core::RepositoryId,
+        reason: &str,
+        now_unix_ms: i64,
+    ) -> Result<ScheduleRecalculation, StoreError> {
+        let mut outcome = ScheduleRecalculation::default();
+        for slot in self.schedule_slots(repository_id)? {
+            match self.invalidate_schedule_slot(slot.release_unit_id, reason, now_unix_ms) {
+                Ok(Some(_)) => outcome.withdrawn.push(slot.release_unit_id),
+                Ok(None) => {}
+                Err(StoreError::Conflict(_)) => outcome.retained.push(slot.release_unit_id),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Lists every slot ever selected for a unit, including withdrawn ones, newest first.
+    pub fn schedule_slot_history(
+        &self,
+        release_unit_id: ReleaseUnitId,
+    ) -> Result<Vec<WithdrawnSlot>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT selected_at_unix_ms, invalidated_at_unix_ms, invalidated_reason
+             FROM schedule_slots WHERE release_unit_id = ?1
+             ORDER BY created_at_unix_ms DESC",
+        )?;
+        statement
+            .query_map([release_unit_id.to_string()], |row| {
+                Ok(WithdrawnSlot {
+                    selected_at_unix_ms: row.get(0)?,
+                    invalidated_at_unix_ms: row.get(1)?,
+                    invalidated_reason: row.get(2)?,
+                })
+            })?
+            .map(|row| row.map_err(StoreError::from))
+            .collect()
     }
 
     fn ensure_unit_is_eligible(
@@ -469,6 +619,302 @@ mod tests {
                 .state
                 .status(),
             TaskStatus::Scheduled
+        );
+    }
+}
+
+#[cfg(test)]
+mod recalculation_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use reccursive_core::{
+        AcceptanceCheck, FeatureId, FeaturePlan, IanaTimeZone, PLAN_SCHEMA_VERSION, PackageId,
+        PlanPhase, PlanTask, PublicationMode, RepositoryId, RepositoryPolicy, TargetRef, TaskId,
+    };
+    use serde_json::json;
+
+    use super::*;
+    use crate::{RepositoryRegistration, SnapshotRecord, WorkspaceRecord};
+
+    struct Fixture {
+        store: Store,
+        repository_id: RepositoryId,
+        feature_id: FeatureId,
+        units: Vec<(ReleaseUnitId, PackageId, TaskId)>,
+    }
+
+    fn object_id(byte: char) -> String {
+        std::iter::repeat_n(byte, 40).collect()
+    }
+
+    /// Two independent units in one repository, both scheduled. Independence is the point: it is
+    /// what makes "only affected future work moved" a testable claim rather than an assertion.
+    fn fixture() -> Fixture {
+        let mut store = Store::open_in_memory().unwrap();
+        let repository_id = RepositoryId::new();
+        let target = TargetRef::new("refs/heads/main").unwrap();
+        store
+            .enroll_repository(
+                &RepositoryRegistration::new(
+                    repository_id,
+                    "/tmp/recalc-source",
+                    "ssh://git@example.invalid/recalc.git",
+                    "/tmp/recalc-managed.git",
+                    1,
+                )
+                .unwrap(),
+                &RepositoryPolicy::new(
+                    repository_id,
+                    Revision::FIRST,
+                    PublicationMode::ScheduledCreation,
+                    target.clone(),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let feature_id = FeatureId::new();
+        let task_ids: Vec<TaskId> = (0..2).map(|_| TaskId::new()).collect();
+        store
+            .import_plan(
+                &FeaturePlan {
+                    schema_version: PLAN_SCHEMA_VERSION,
+                    feature_id,
+                    revision: Revision::FIRST,
+                    repository_id,
+                    goal: "Two independent units".into(),
+                    target,
+                    sealed: true,
+                    phases: vec![PlanPhase {
+                        id: "delivery".into(),
+                        name: "Delivery".into(),
+                        tasks: task_ids
+                            .iter()
+                            .enumerate()
+                            .map(|(index, id)| PlanTask {
+                                id: *id,
+                                name: format!("Task {index}"),
+                                dependencies: BTreeMap::new(),
+                                acceptance_checks: vec![AcceptanceCheck {
+                                    id: "done".into(),
+                                    description: "ready".into(),
+                                }],
+                            })
+                            .collect(),
+                    }],
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .record_workspace(&WorkspaceRecord {
+                feature_id,
+                revision: Revision::FIRST,
+                path: "/tmp/recalc-workspace".into(),
+                base_commit: object_id('a'),
+                prerequisites: json!([]),
+                created_at_unix_ms: 1,
+            })
+            .unwrap();
+
+        let mut units = Vec::new();
+        for (index, task_id) in task_ids.iter().enumerate() {
+            let name = char::from(b'b' + u8::try_from(index).unwrap());
+            let package_id = PackageId::new();
+            store
+                .record_snapshot(&SnapshotRecord {
+                    package_id,
+                    revision: Revision::FIRST,
+                    feature_id,
+                    plan_revision: Revision::FIRST,
+                    path: std::path::PathBuf::from(format!("/tmp/recalc-package-{name}")),
+                    base_tree: object_id('a'),
+                    result_tree: object_id(name),
+                    content_hash: std::iter::repeat_n(name, 64).collect(),
+                    parent_package_id: None,
+                    manifest: json!({"paths": []}),
+                    created_at_unix_ms: 2,
+                })
+                .unwrap();
+            store
+                .record_package_tasks(package_id, Revision::FIRST, [*task_id])
+                .unwrap();
+            store
+                .advance_task_to(feature_id, Revision::FIRST, *task_id, TaskStatus::Queued, 3)
+                .unwrap();
+            let unit_id = ReleaseUnitId::new();
+            store
+                .create_release_unit(
+                    unit_id,
+                    feature_id,
+                    Revision::FIRST,
+                    BTreeSet::from([*task_id]),
+                    BTreeSet::new(),
+                    4,
+                )
+                .unwrap();
+            store
+                .persist_schedule_slot(&NewScheduleSlot {
+                    release_unit_id: unit_id,
+                    package_id,
+                    package_revision: Revision::FIRST,
+                    policy_revision: Revision::FIRST,
+                    timezone: IanaTimeZone::new("UTC").unwrap(),
+                    eligible_at_unix_ms: 10,
+                    selected_at_unix_ms: 100 + i64::try_from(index).unwrap(),
+                    created_at_unix_ms: 10,
+                })
+                .unwrap();
+            units.push((unit_id, package_id, *task_id));
+        }
+
+        Fixture {
+            store,
+            repository_id,
+            feature_id,
+            units,
+        }
+    }
+
+    #[test]
+    fn cancelling_a_task_withdraws_only_its_own_units_schedule() {
+        let mut fixture = fixture();
+        let (first_unit, _, first_task) = fixture.units[0];
+        let (second_unit, _, second_task) = fixture.units[1];
+        let untouched_before = fixture
+            .store
+            .schedule_slot(second_unit)
+            .unwrap()
+            .unwrap()
+            .selected_at_unix_ms;
+
+        let outcome = fixture
+            .store
+            .cancel_task(
+                fixture.feature_id,
+                Revision::FIRST,
+                first_task,
+                "no longer needed",
+                50,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.withdrawn_schedules, vec![first_unit]);
+        assert!(
+            fixture.store.schedule_slot(first_unit).unwrap().is_none(),
+            "a cancelled unit must not keep a live release time"
+        );
+
+        // The independent unit is the control: nothing about it may move.
+        let untouched_after = fixture
+            .store
+            .schedule_slot(second_unit)
+            .unwrap()
+            .unwrap()
+            .selected_at_unix_ms;
+        assert_eq!(untouched_after, untouched_before);
+        assert_eq!(
+            fixture
+                .store
+                .task(fixture.feature_id, Revision::FIRST, second_task)
+                .unwrap()
+                .unwrap()
+                .state
+                .status(),
+            TaskStatus::Scheduled
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_unit_returns_to_the_queue_and_can_be_scheduled_again() {
+        let mut fixture = fixture();
+        let (unit_id, package_id, task_id) = fixture.units[0];
+
+        let withdrawn = fixture
+            .store
+            .invalidate_schedule_slot(unit_id, "policy changed", 50)
+            .unwrap();
+        assert_eq!(withdrawn.unwrap().selected_at_unix_ms, 100);
+        assert_eq!(
+            fixture
+                .store
+                .task(fixture.feature_id, Revision::FIRST, task_id)
+                .unwrap()
+                .unwrap()
+                .state
+                .status(),
+            TaskStatus::Queued,
+            "withdrawing a slot must return the work to the queue, not strand it"
+        );
+
+        // The package is not permanently bound to its withdrawn slot.
+        let rescheduled = fixture
+            .store
+            .persist_schedule_slot(&NewScheduleSlot {
+                release_unit_id: unit_id,
+                package_id,
+                package_revision: Revision::FIRST,
+                policy_revision: Revision::new(2).unwrap(),
+                timezone: IanaTimeZone::new("UTC").unwrap(),
+                eligible_at_unix_ms: 50,
+                selected_at_unix_ms: 500,
+                created_at_unix_ms: 50,
+            })
+            .unwrap();
+        assert_eq!(rescheduled.selected_at_unix_ms, 500);
+
+        // Both the withdrawn selection and the new one remain auditable.
+        let history = fixture.store.schedule_slot_history(unit_id).unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(
+            history
+                .iter()
+                .any(|slot| slot.invalidated_reason.as_deref() == Some("policy changed"))
+        );
+    }
+
+    #[test]
+    fn a_live_attempt_keeps_its_schedule_through_a_repository_recalculation() {
+        let mut fixture = fixture();
+        let (live_unit, _, live_task) = fixture.units[0];
+        let (queued_unit, _, _) = fixture.units[1];
+
+        // This unit's attempt has started; its identity is no longer the schedule's to discard.
+        fixture
+            .store
+            .advance_task(
+                fixture.feature_id,
+                Revision::FIRST,
+                live_task,
+                TaskStatus::Reconciling,
+                None,
+                60,
+            )
+            .unwrap();
+
+        let outcome = fixture
+            .store
+            .invalidate_repository_schedule(fixture.repository_id, "policy revised", 70)
+            .unwrap();
+
+        assert_eq!(outcome.retained, vec![live_unit]);
+        assert_eq!(outcome.withdrawn, vec![queued_unit]);
+        assert!(
+            fixture.store.schedule_slot(live_unit).unwrap().is_some(),
+            "a unit with a live attempt must keep its slot"
+        );
+        assert!(fixture.store.schedule_slot(queued_unit).unwrap().is_none());
+        assert_eq!(
+            fixture
+                .store
+                .task(fixture.feature_id, Revision::FIRST, live_task)
+                .unwrap()
+                .unwrap()
+                .state
+                .status(),
+            TaskStatus::Reconciling,
+            "a settings change must not reach into work already in flight"
         );
     }
 }

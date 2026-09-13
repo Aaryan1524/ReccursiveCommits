@@ -184,6 +184,25 @@ impl TaskState {
         })
     }
 
+    /// Withdraws a selected release time, returning the task to the queue.
+    ///
+    /// The ordinary lifecycle is forward-only, and deliberately so. Withdrawing a schedule is not
+    /// a backward step through it: it is a separate, narrowly legal operation that applies only
+    /// while a slot has been chosen but no work has begun. Once an attempt starts reconciling, the
+    /// selected time is no longer the thing that governs the work, and the attempt owns its own
+    /// identity — so withdrawal is refused rather than silently discarding live progress.
+    pub fn withdraw_schedule(&mut self) -> Result<(), TransitionError> {
+        if self.status != TaskStatus::Scheduled {
+            return Err(TransitionError::NotScheduled {
+                current: self.status,
+            });
+        }
+        self.status = TaskStatus::Queued;
+        self.reason = None;
+        self.blocked_from = None;
+        Ok(())
+    }
+
     pub fn transition(
         &mut self,
         target: TaskStatus,
@@ -296,6 +315,8 @@ pub enum TransitionError {
     CorruptBlockedState,
     #[error("persisted {status:?} state carries incoherent reason or resume information")]
     IncoherentPersistedState { status: TaskStatus },
+    #[error("only a scheduled task can have its release time withdrawn; this task is {current:?}")]
+    NotScheduled { current: TaskStatus },
     #[error("cannot resume blocked task at {requested:?}; resume at {expected:?}")]
     InvalidResume {
         requested: TaskStatus,
@@ -452,6 +473,34 @@ mod tests {
         assert!(!TaskStatus::Verifying.may_have_reached_remote());
         assert!(TaskStatus::PushPending.may_have_reached_remote());
         assert!(TaskStatus::Published.may_have_reached_remote());
+    }
+
+    #[test]
+    fn a_selected_release_time_can_be_withdrawn_only_before_work_starts() {
+        let mut state = TaskState::planned();
+        for status in [
+            TaskStatus::Building,
+            TaskStatus::Captured,
+            TaskStatus::Validated,
+            TaskStatus::Queued,
+            TaskStatus::Scheduled,
+        ] {
+            state.transition(status, None).unwrap();
+        }
+        state.withdraw_schedule().unwrap();
+        assert_eq!(state.status(), TaskStatus::Queued);
+
+        // Re-scheduling after withdrawal is the ordinary forward step, not a special case.
+        state.transition(TaskStatus::Scheduled, None).unwrap();
+        state.transition(TaskStatus::Reconciling, None).unwrap();
+
+        // An attempt is live now; its identity is not something a schedule change may discard.
+        assert_eq!(
+            state.withdraw_schedule(),
+            Err(TransitionError::NotScheduled {
+                current: TaskStatus::Reconciling
+            })
+        );
     }
 
     #[test]

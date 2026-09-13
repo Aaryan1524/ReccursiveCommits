@@ -13,9 +13,8 @@ pub use reccursive_core::{
 use serde::{Deserialize, Serialize};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 4 adds release-unit grouping and durable release
-/// scheduling.
-pub const API_VERSION: u16 = 4;
+/// Local API protocol version. Version 5 adds adaptive schedule recalculation.
+pub const API_VERSION: u16 = 5;
 
 /// Maximum encoded request or response size accepted by the local transport.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -107,6 +106,8 @@ impl RequestEnvelope {
             | Command::GetSchedulePolicy { .. }
             | Command::ScheduleUnit(_)
             | Command::GetScheduleSlot { .. }
+            | Command::WithdrawScheduleSlot { .. }
+            | Command::RecalculateSchedule { .. }
             | Command::GetReleaseAttempt { .. }
             | Command::ListReleaseAttempts { .. }
             | Command::AuditQueue
@@ -163,6 +164,16 @@ pub enum Command {
     /// Inspect the durable slot previously selected for a release unit.
     GetScheduleSlot {
         release_unit_id: ReleaseUnitId,
+    },
+    /// Withdraw one unit's selected release time so it returns to the queue.
+    WithdrawScheduleSlot {
+        release_unit_id: ReleaseUnitId,
+        reason: String,
+    },
+    /// Withdraw every live selection for a repository, for use after its policy changes.
+    RecalculateSchedule {
+        repository_id: RepositoryId,
+        reason: String,
     },
     /// Inspect one durable publication attempt.
     GetReleaseAttempt {
@@ -483,6 +494,15 @@ pub struct SchedulePolicyView {
     pub created_at_unix_ms: i64,
 }
 
+/// What an adaptive recalculation moved, and what it deliberately left alone.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleRecalculationView {
+    /// Units returned to the queue for a fresh selection.
+    pub withdrawn: Vec<ReleaseUnitId>,
+    /// Units left untouched because an attempt already owns them.
+    pub retained: Vec<ReleaseUnitId>,
+}
+
 /// A selected, durable UTC release time for one release unit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScheduleSlotView {
@@ -637,6 +657,9 @@ pub enum ResponseData {
     },
     ScheduleSlot {
         slot: ScheduleSlotView,
+    },
+    ScheduleRecalculated {
+        recalculation: ScheduleRecalculationView,
     },
     QueueAudit {
         audit: QueueAuditView,

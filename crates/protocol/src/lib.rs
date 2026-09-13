@@ -16,6 +16,9 @@ pub use transport::{LocalClient, TransportError};
 /// Local API protocol version. Version 8 adds pause, resume, release-now, and preview.
 pub const API_VERSION: u16 = 8;
 
+/// Stable service identifier shared by the daemon and by service installation.
+pub const SERVICE_NAME: &str = "reccursive-daemon";
+
 /// Maximum encoded request or response size accepted by the local transport.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 

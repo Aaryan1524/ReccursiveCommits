@@ -6,7 +6,7 @@ mod service;
 pub use service::{LocalService, ServiceError, ServicePaths};
 
 /// Stable service identifier used by launchers and diagnostics.
-pub const SERVICE_NAME: &str = "reccursive-daemon";
+pub use reccursive_protocol::SERVICE_NAME;
 
 /// API version served by this build.
 #[must_use]

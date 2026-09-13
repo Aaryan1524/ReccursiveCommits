@@ -44,6 +44,10 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state schedule preview repo_
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule pause repo_<uuid> --reason "investigating a failure"
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule resume repo_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule release-now unit_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state service install
+cargo run -p reccursive-cli -- --state-dir /path/to/state service status
+cargo run -p reccursive-cli -- --state-dir /path/to/state service show
+cargo run -p reccursive-cli -- --state-dir /path/to/state service uninstall
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue audit
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue export /absolute/path/to/queue-backup
 ```
@@ -191,6 +195,21 @@ same branch. Two checkouts publishing to one ref are two writers racing for it, 
 this is rejected at enrollment rather than surfacing later as a conflict. The live
 release lease is keyed on the remote and target themselves, not on the repository
 profile, for the same reason.
+
+`service install` registers the daemon as a macOS user-session agent so it keeps
+running after the terminal is closed. It runs in the user's own login session
+rather than as a system daemon on purpose: publishing uses the user's existing Git
+credentials and SSH agent, which a root-owned daemon would either lose access to or
+need a privileged copy of. The definition sets it to start at login and restart
+after a crash, and deliberately sets no timer — the daemon reconciles durable
+deadlines when it starts and when it wakes, rather than depending on a timer that
+does not fire while the machine is asleep.
+
+`service uninstall` stops the service and removes its definition but never deletes
+the state directory. Removing the service is not the same decision as discarding
+captured work that has not been published. `service status` reports whether it is
+installed and loaded; `service show` prints the definition without installing
+anything.
 
 ## Exit codes
 

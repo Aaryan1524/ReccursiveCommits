@@ -26,7 +26,7 @@ pub use events::{DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent,
 pub use migrations::STORAGE_SCHEMA_VERSION;
 pub use plans::StoredPlan;
 pub use redaction::{redact_json, redact_text};
-pub use repository::{RepositoryRegistration, StoredRepository};
+pub use repository::{RepositoryRegistration, StoredRepository, StoredSchedulePolicy};
 use rusqlite::{Connection, OpenFlags};
 pub use schedules::{NewScheduleSlot, ScheduleSlot};
 pub use snapshots::{SnapshotRecord, SnapshotRecoveryIssue};

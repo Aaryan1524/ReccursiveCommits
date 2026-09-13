@@ -27,6 +27,30 @@ trap cleanup EXIT
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
+  if [[ -d "$fixture_root/remote.git" ]]; then
+    printf '%s\n' 'Published remote history:' >&2
+    git -C "$fixture_root/remote.git" log --format='%H%x09%s' refs/heads/main >&2 || true
+  fi
+  if [[ -S "$fixture_root/state/service.sock" ]]; then
+    printf '%s\n' 'Durable release attempts:' >&2
+    cli release attempts --limit 20 >&2 || true
+    printf '%s\n' 'Feature status:' >&2
+    cli feature status "${feature_id:-}" --revision 1 >&2 || true
+    printf '%s\n' 'Queue audit:' >&2
+    cli queue audit >&2 || true
+  fi
+  if [[ -d "$fixture_root/remote.git" ]]; then
+    printf '%s\n' 'Each published commit and what it changed:' >&2
+    git -C "$fixture_root/remote.git" log --format='--- %H %s' --name-status refs/heads/main >&2 || true
+  fi
+  if [[ -d "$fixture_root/state/packages" ]]; then
+    printf '%s\n' 'Captured packages and their parents:' >&2
+    for manifest in "$fixture_root"/state/packages/*/revision-*/manifest.json; do
+      [[ -f "$manifest" ]] || continue
+      printf '%s\n' "$manifest" >&2
+      tr ',' '\n' <"$manifest" | grep -E 'package_id|parent_package_id|base_tree|result_tree|task_ids' >&2 || true
+    done
+  fi
   [[ -f "$fixture_root/daemon.log" ]] && sed -n '1,240p' "$fixture_root/daemon.log" >&2
   exit 1
 }

@@ -123,7 +123,7 @@ impl LocalService {
             shutdown.clone(),
             interval,
             std::time::Instant::now(),
-            current_unix_ms().map_or(0, |now| now),
+            current_unix_ms().unwrap_or(0),
         );
         thread::spawn(move || {
             while !shutdown.is_requested() {

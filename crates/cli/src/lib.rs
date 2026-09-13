@@ -206,6 +206,13 @@ enum ScheduleCommand {
         #[arg(long)]
         reason: String,
     },
+    /// Apply the repository's missed-window policy to release times that have already passed.
+    CatchUp {
+        repository_id: RepositoryId,
+        /// Deterministic selection seed; a random one is used when omitted.
+        #[arg(long)]
+        seed: Option<u64>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -601,6 +608,20 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 )?;
                 output_data(data, cli.json, stdout)
             }
+            ScheduleCommand::CatchUp {
+                repository_id,
+                seed,
+            } => {
+                let seed = seed.unwrap_or_else(random_seed);
+                let data = send(
+                    &paths,
+                    Command::ReconcileMissedWindows {
+                        repository_id,
+                        seed,
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
             ScheduleCommand::Recalculate {
                 repository_id,
                 reason,
@@ -926,6 +947,13 @@ fn output_data(
         ),
         ResponseData::SchedulePolicy { policy } => output_schedule_policy(out, &policy),
         ResponseData::ScheduleSlot { slot } => output_schedule_slot(out, &slot),
+        ResponseData::MissedWindowsReconciled { outcome } => writeln!(
+            out,
+            "Released {} overdue unit(s) now, moved {} forward, left {} in flight",
+            outcome.released_now.len(),
+            outcome.rescheduled.len(),
+            outcome.retained.len()
+        ),
         ResponseData::ScheduleRecalculated { recalculation } => writeln!(
             out,
             "Withdrew {} release time(s); left {} in-flight unit(s) untouched",

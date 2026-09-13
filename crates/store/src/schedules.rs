@@ -291,6 +291,33 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Lists live slots whose selected time has already passed, oldest first.
+    ///
+    /// These are the missed windows: work that should have been released while the machine was
+    /// asleep, offline, or simply not running.
+    pub fn overdue_schedule_slots(
+        &self,
+        repository_id: reccursive_core::RepositoryId,
+        now_unix_ms: i64,
+    ) -> Result<Vec<ScheduleSlot>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT release_unit_id, repository_id, package_id, package_revision,
+                    policy_revision, timezone, eligible_at_unix_ms, selected_at_unix_ms,
+                    created_at_unix_ms
+             FROM schedule_slots
+             WHERE repository_id = ?1 AND invalidated_at_unix_ms IS NULL
+               AND selected_at_unix_ms <= ?2
+             ORDER BY selected_at_unix_ms, release_unit_id",
+        )?;
+        statement
+            .query_map(
+                params![repository_id.to_string(), now_unix_ms],
+                RawScheduleSlot::from_row,
+            )?
+            .map(|row| row.map_err(StoreError::from)?.try_into())
+            .collect()
+    }
+
     /// Lists every slot ever selected for a unit, including withdrawn ones, newest first.
     pub fn schedule_slot_history(
         &self,

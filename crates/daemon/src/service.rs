@@ -20,12 +20,12 @@ use reccursive_capture::{
 use reccursive_protocol::{
     ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest, Command,
     CreateReleaseUnitRequest, CreateWorkspaceRequest, EnrollRepositoryRequest, EventSeverityView,
-    EventView, PackageView, PlanView, ProtocolValidationError, QueueAuditView, QueueExportView,
-    QueueRecoveryIssueView, ReasonCode, ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView,
-    RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData,
-    ResponseEnvelope, Revision, SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView,
-    ScheduleUnitRequest, SetSchedulePolicyRequest, StateReason, TaskCancellationView, TaskStatus,
-    TransportError, WorkspacePrerequisiteView, WorkspaceView,
+    EventView, MissedWindowView, PackageView, PlanView, ProtocolValidationError, QueueAuditView,
+    QueueExportView, QueueRecoveryIssueView, ReasonCode, ReleaseAttemptView, ReleasePackageRequest,
+    ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId,
+    ResponseData, ResponseEnvelope, Revision, SchedulePolicyView, ScheduleRecalculationView,
+    ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest, StateReason,
+    TaskCancellationView, TaskStatus, TransportError, WorkspacePrerequisiteView, WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -426,6 +426,10 @@ fn dispatch(
             repository_id,
             reason,
         } => recalculate_schedule(repository_id, &reason, store),
+        Command::ReconcileMissedWindows {
+            repository_id,
+            seed,
+        } => reconcile_missed_windows(repository_id, seed, store),
         Command::GetReleaseAttempt { attempt_id } => get_release_attempt(attempt_id, store),
         Command::ListReleaseAttempts { package_id, limit } => {
             list_release_attempts(package_id, limit, store)
@@ -462,6 +466,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::GetScheduleSlot { .. } => "schedule.slot.show",
         Command::WithdrawScheduleSlot { .. } => "schedule.withdraw",
         Command::RecalculateSchedule { .. } => "schedule.recalculate",
+        Command::ReconcileMissedWindows { .. } => "schedule.missed_windows",
         Command::GetReleaseAttempt { .. } => "release.attempt",
         Command::ListReleaseAttempts { .. } => "release.attempts",
         Command::GetPackage { .. } => "package.show",
@@ -1713,6 +1718,24 @@ fn recalculate_schedule(
     Ok(ResponseData::ScheduleRecalculated {
         recalculation: ScheduleRecalculationView {
             withdrawn: outcome.withdrawn,
+            retained: outcome.retained,
+        },
+    })
+}
+
+fn reconcile_missed_windows(
+    repository_id: RepositoryId,
+    seed: u64,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let mut store = lock_store(store)?;
+    let outcome = Scheduler::reconcile_missed_windows(&mut store, repository_id, seed, now)
+        .map_err(scheduler_api_error)?;
+    Ok(ResponseData::MissedWindowsReconciled {
+        outcome: MissedWindowView {
+            released_now: outcome.released_now,
+            rescheduled: outcome.rescheduled,
             retained: outcome.retained,
         },
     })

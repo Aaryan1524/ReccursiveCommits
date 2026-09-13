@@ -37,6 +37,7 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state schedule unit unit_<uu
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule show unit_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule withdraw unit_<uuid> --reason "policy under review"
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule recalculate repo_<uuid> --reason "policy revised"
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule catch-up repo_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue audit
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue export /absolute/path/to/queue-backup
 ```
@@ -137,6 +138,16 @@ alone and reported as retained rather than disturbed — once an attempt owns th
 work, its identity is not a schedule change's to discard. Cancelling or superseding
 a task withdraws the affected units' selections automatically for the same reason,
 and reports which units moved.
+
+`schedule catch-up` applies the repository's missed-window behaviour to every
+release time that has already passed — the case where the machine was asleep,
+offline, or simply not running through a window. Under the default
+`reschedule_forward`, nothing is released immediately and every overdue unit is
+given a new future time, so a multi-day gap cannot turn into a burst. Under
+`catch_up`, only as many units as `max_releases` allows are left due for immediate
+release, oldest first, and the rest still move forward. A replacement time is
+always drawn from the present moment onward, so an offline gap can never produce a
+commit dated earlier than the moment it was actually made.
 
 ## Exit codes
 

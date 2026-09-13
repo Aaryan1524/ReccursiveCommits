@@ -13,8 +13,8 @@ pub use reccursive_core::{
 use serde::{Deserialize, Serialize};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 5 adds adaptive schedule recalculation.
-pub const API_VERSION: u16 = 5;
+/// Local API protocol version. Version 6 adds missed-window reconciliation.
+pub const API_VERSION: u16 = 6;
 
 /// Maximum encoded request or response size accepted by the local transport.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -108,6 +108,7 @@ impl RequestEnvelope {
             | Command::GetScheduleSlot { .. }
             | Command::WithdrawScheduleSlot { .. }
             | Command::RecalculateSchedule { .. }
+            | Command::ReconcileMissedWindows { .. }
             | Command::GetReleaseAttempt { .. }
             | Command::ListReleaseAttempts { .. }
             | Command::AuditQueue
@@ -174,6 +175,11 @@ pub enum Command {
     RecalculateSchedule {
         repository_id: RepositoryId,
         reason: String,
+    },
+    /// Apply the repository's missed-window policy to every release time that has already passed.
+    ReconcileMissedWindows {
+        repository_id: RepositoryId,
+        seed: u64,
     },
     /// Inspect one durable publication attempt.
     GetReleaseAttempt {
@@ -494,6 +500,17 @@ pub struct SchedulePolicyView {
     pub created_at_unix_ms: i64,
 }
 
+/// What applying a missed-window policy did to release times that had already passed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MissedWindowView {
+    /// Units left due for immediate release under an explicit catch-up allowance.
+    pub released_now: Vec<ReleaseUnitId>,
+    /// Units whose overdue time was replaced with a future one.
+    pub rescheduled: Vec<ReleaseUnitId>,
+    /// Units left alone because an attempt already owns them.
+    pub retained: Vec<ReleaseUnitId>,
+}
+
 /// What an adaptive recalculation moved, and what it deliberately left alone.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScheduleRecalculationView {
@@ -660,6 +677,9 @@ pub enum ResponseData {
     },
     ScheduleRecalculated {
         recalculation: ScheduleRecalculationView,
+    },
+    MissedWindowsReconciled {
+        outcome: MissedWindowView,
     },
     QueueAudit {
         audit: QueueAuditView,

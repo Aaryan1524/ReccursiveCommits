@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 18;
+pub const STORAGE_SCHEMA_VERSION: u32 = 19;
 
 struct Migration {
     version: u32,
@@ -676,6 +676,31 @@ const MIGRATIONS: &[Migration] = &[
             paused_at_unix_ms INTEGER NOT NULL CHECK (paused_at_unix_ms >= 0),
             FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE
         );
+        "#,
+    },
+    Migration {
+        version: 19,
+        sql: r#"
+        -- A remote URL is an address, not an identity: one repository has several valid
+        -- addresses. Uniqueness and the release lease must compare identity, or two spellings of
+        -- the same repository become two publishers racing for one ref. The address column is
+        -- untouched, because fetching and pushing still use it verbatim.
+        ALTER TABLE repositories ADD COLUMN remote_identity TEXT NOT NULL DEFAULT '';
+        ALTER TABLE release_attempts ADD COLUMN target_remote_identity TEXT NOT NULL DEFAULT '';
+
+        -- Existing rows are backfilled in Rust immediately after migration, because deriving an
+        -- identity means parsing a URL, which SQL cannot do.
+        DROP INDEX IF EXISTS idx_release_attempts_live_target;
+
+        CREATE UNIQUE INDEX idx_release_attempts_live_target
+            ON release_attempts(target_remote_identity, target_ref)
+            WHERE status IN ('scheduled', 'reconciling', 'verifying', 'commit_prepared',
+                             'push_pending', 'remote_confirmed')
+               OR (status = 'blocked'
+                   AND blocked_from IN ('push_pending', 'remote_confirmed'));
+
+        CREATE INDEX idx_repositories_remote_identity
+            ON repositories(remote_identity);
         "#,
     },
 ];

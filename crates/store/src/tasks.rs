@@ -319,14 +319,24 @@ impl Store {
         now_unix_ms: i64,
     ) -> Result<TaskRecord, StoreError> {
         let mut record = self.expect_task(feature_id, plan_revision, task_id)?;
-        let mut guard = 0;
-        while record.state.status() != target {
-            guard += 1;
-            if guard > 16 {
+
+        // Asking for a state the task has already passed is a no-op, not a journey. A caller that
+        // repeats a completed step — an agent retrying after a dropped connection, say — must not
+        // move the task at all. Walking forward looking for a state already behind it would march
+        // it through every remaining state to the end of the lifecycle, publishing nothing.
+        match record.state.status().is_at_or_past(target) {
+            Some(true) => return Ok(record),
+            Some(false) => {}
+            None => {
                 return Err(StoreError::Conflict(format!(
-                    "task {task_id} cannot reach {target:?} by ordinary transitions"
+                    "task {task_id} is {:?}, which is not a point on the ordinary path, so it \
+                     cannot be advanced to {target:?}",
+                    record.state.status()
                 )));
             }
+        }
+
+        while record.state.status() != target {
             let next = record.state.status().next_ordinary().ok_or_else(|| {
                 StoreError::Conflict(format!(
                     "task {task_id} is {:?} and cannot advance to {target:?}",
@@ -575,6 +585,52 @@ mod tests {
                 .state
                 .status(),
             TaskStatus::Queued
+        );
+    }
+
+    #[test]
+    fn advancing_to_a_state_already_passed_changes_nothing() {
+        let mut fixture = fixture();
+        fixture
+            .store
+            .advance_task_to(
+                fixture.feature_id,
+                Revision::FIRST,
+                fixture.interface,
+                TaskStatus::Queued,
+                10,
+            )
+            .unwrap();
+
+        // An agent that repeats a step it already completed — a retry after a dropped
+        // connection, say — must not drive the task anywhere. Walking forward looking for a
+        // state already behind us would march it to the end of the lifecycle.
+        let repeated = fixture
+            .store
+            .advance_task_to(
+                fixture.feature_id,
+                Revision::FIRST,
+                fixture.interface,
+                TaskStatus::Captured,
+                11,
+            )
+            .unwrap();
+
+        assert_eq!(
+            repeated.state.status(),
+            TaskStatus::Queued,
+            "a task already past the requested state must stay where it is"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .task(fixture.feature_id, Revision::FIRST, fixture.interface)
+                .unwrap()
+                .unwrap()
+                .state
+                .status(),
+            TaskStatus::Queued,
+            "and must certainly never end up published without a publication"
         );
     }
 

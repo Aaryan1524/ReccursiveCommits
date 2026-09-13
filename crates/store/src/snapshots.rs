@@ -3,7 +3,7 @@ use std::{
     str::FromStr,
 };
 
-use reccursive_core::{FeatureId, PackageId, Revision};
+use reccursive_core::{FeatureId, PackageId, Revision, TaskId};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -131,6 +131,41 @@ impl Store {
                             parent_package_id
                      FROM snapshot_packages WHERE package_id = ?1 AND revision = ?2",
                 params![package_id.to_string(), revision.get()],
+                RawSnapshot::from_row,
+            )
+            .optional()?;
+        raw.map(TryInto::try_into).transpose()
+    }
+
+    /// Returns the package that already carries one task's work, if it has been captured.
+    ///
+    /// A task belongs to at most one package within a plan revision, which is what makes a
+    /// repeated submission answerable rather than ambiguous.
+    pub fn snapshot_package_for_task(
+        &self,
+        feature_id: FeatureId,
+        plan_revision: Revision,
+        task_id: TaskId,
+    ) -> Result<Option<SnapshotRecord>, StoreError> {
+        let raw: Option<RawSnapshot> = self
+            .connection
+            .query_row(
+                "SELECT package.package_id, package.revision, package.feature_id,
+                        package.plan_revision, package.package_path, package.base_tree,
+                        package.result_tree, package.content_hash, package.manifest_json,
+                        package.created_at_unix_ms, package.parent_package_id
+                 FROM snapshot_packages AS package
+                 JOIN snapshot_package_tasks AS carried
+                   ON carried.package_id = package.package_id
+                  AND carried.package_revision = package.revision
+                 WHERE package.feature_id = ?1 AND package.plan_revision = ?2
+                   AND carried.task_id = ?3
+                 ORDER BY package.created_at_unix_ms DESC, package.revision DESC LIMIT 1",
+                params![
+                    feature_id.to_string(),
+                    plan_revision.get(),
+                    task_id.to_string()
+                ],
                 RawSnapshot::from_row,
             )
             .optional()?;

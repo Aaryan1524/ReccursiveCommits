@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read, Write},
     os::unix::{
@@ -20,12 +20,13 @@ use reccursive_capture::{
 use reccursive_protocol::{
     ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest, Command,
     CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
-    EventSeverityView, EventView, IdempotencyKey, IntegrationHealthView, MissedWindowView,
-    PackageView, PlanView, ProtocolValidationError, QueueAuditView, QueueExportView,
-    QueueRecoveryIssueView, ReasonCode, ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView,
-    RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData,
-    ResponseEnvelope, Revision, SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView,
-    ScheduleUnitRequest, SetSchedulePolicyRequest, StateReason, TaskCancellationView, TaskStatus,
+    EventSeverityView, EventView, FeatureId, FeatureStatusView, IdempotencyKey,
+    IntegrationHealthView, MissedWindowView, PackageView, PlanView, ProtocolValidationError,
+    QueueAuditView, QueueExportView, QueueRecoveryIssueView, ReasonCode, ReleaseAttemptView,
+    ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryView,
+    RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision, SchedulePolicyView,
+    ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest,
+    StateReason, SubmissionView, TaskCancellationView, TaskProgressView, TaskStatus,
     TransportError, WorkspacePrerequisiteView, WorkspaceView,
     transport::{read_message, write_message},
 };
@@ -598,6 +599,12 @@ fn dispatch(
         } => get_workspace(feature_id, revision, store),
         Command::CapturePackage(request) => capture_package(request, store, package_root),
         Command::CancelTask(request) => cancel_task(request, store),
+        Command::SubmitTask(request) => submit_task(request, store, package_root),
+        Command::SealPlan { feature_id } => seal_plan(feature_id, store),
+        Command::GetFeatureStatus {
+            feature_id,
+            revision,
+        } => get_feature_status(feature_id, revision, store),
         Command::ReleasePackage(request) => {
             release_package(request, store, managed_root, release_root)
         }
@@ -654,6 +661,9 @@ fn command_name(command: &Command) -> &'static str {
         Command::ListRepositories => "repository.list",
         Command::ListEvents { .. } => "logs",
         Command::ImportPlan { .. } => "plan.import",
+        Command::SealPlan { .. } => "plan.seal",
+        Command::SubmitTask(_) => "task.submit",
+        Command::GetFeatureStatus { .. } => "feature.status",
         Command::GetPlan { .. } => "plan.show",
         Command::PlanHistory { .. } => "plan.history",
         Command::CreateWorkspace(_) => "workspace.create",
@@ -1736,6 +1746,241 @@ fn capture_package(
     }
     Ok(ResponseData::PackageCaptured {
         package: package_view(record, package.manifest)?,
+    })
+}
+
+/// Fixes a feature's scope by appending a sealed copy of its newest revision.
+///
+/// Sealing appends rather than editing. A stored plan revision means one thing forever — packages,
+/// units and attempts all name a revision, and P6-T04's scope enforcement is about to depend on
+/// that — so the revision an agent sealed is a new one, and the response says which.
+fn seal_plan(feature_id: FeatureId, store: &Mutex<Store>) -> Result<ResponseData, ApiError> {
+    let created_at_unix_ms = current_unix_ms()?;
+    let mut store = lock_store(store)?;
+    let latest = store
+        .plan(feature_id, None)
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotFound,
+                format!("feature plan {feature_id} was not found"),
+                false,
+            )
+        })?;
+    if latest.plan.sealed {
+        return Err(ApiError::new(
+            ApiErrorCode::Conflict,
+            format!(
+                "feature plan {feature_id} revision {} is already sealed",
+                latest.plan.revision.get()
+            ),
+            false,
+        ));
+    }
+    let next = Revision::new(latest.plan.revision.get() + 1)
+        .map_err(|error| ApiError::new(ApiErrorCode::InvalidRequest, error.to_string(), false))?;
+    let sealed = reccursive_protocol::FeaturePlan {
+        revision: next,
+        sealed: true,
+        ..latest.plan
+    };
+    store
+        .import_plan(&sealed, created_at_unix_ms)
+        .map_err(store_api_error)?;
+    Ok(ResponseData::PlanSealed {
+        plan: PlanView {
+            plan: sealed,
+            created_at_unix_ms,
+        },
+    })
+}
+
+/// Reports every task of one plan revision with whatever durable work is attached to it.
+fn get_feature_status(
+    feature_id: FeatureId,
+    revision: Option<Revision>,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let store = lock_store(store)?;
+    let plan = store
+        .plan(feature_id, revision)
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotFound,
+                format!("feature plan {feature_id} was not found"),
+                false,
+            )
+        })?;
+    let plan_revision = plan.plan.revision;
+
+    let mut tasks = Vec::new();
+    for record in store
+        .plan_tasks(feature_id, plan_revision)
+        .map_err(store_api_error)?
+    {
+        let package = store
+            .snapshot_package_for_task(feature_id, plan_revision, record.task_id)
+            .map_err(store_api_error)?;
+        let unit = store
+            .release_unit_for_task(feature_id, plan_revision, record.task_id)
+            .map_err(store_api_error)?;
+        let selected_at_unix_ms = match &unit {
+            Some(unit) => store
+                .schedule_slot(unit.unit_id)
+                .map_err(store_api_error)?
+                .map(|slot| slot.selected_at_unix_ms),
+            None => None,
+        };
+        tasks.push(TaskProgressView {
+            task_id: record.task_id,
+            name: record.name,
+            status: record.state.status(),
+            blocked_from: record.state.blocked_from(),
+            reason: record.state.reason().cloned(),
+            updated_at_unix_ms: record.updated_at_unix_ms,
+            package_id: package.map(|package| package.package_id),
+            release_unit_id: unit.map(|unit| unit.unit_id),
+            selected_at_unix_ms,
+        });
+    }
+
+    Ok(ResponseData::FeatureStatus {
+        status: FeatureStatusView {
+            feature_id,
+            plan_revision,
+            repository_id: plan.plan.repository_id,
+            goal: plan.plan.goal,
+            sealed: plan.plan.sealed,
+            tasks,
+        },
+    })
+}
+
+/// Captures, groups and schedules one task's work as a single intent.
+///
+/// Every step is a step the caller could take separately; what this adds is that *repeating* it is
+/// harmless without needing an idempotency key. Each of the three steps already answers a repeat
+/// with what it produced the first time, so the composition does too — an agent that cannot tell
+/// whether its submission landed can simply submit again.
+fn submit_task(
+    request: reccursive_protocol::SubmitTaskRequest,
+    store: &Mutex<Store>,
+    package_root: &Path,
+) -> Result<ResponseData, ApiError> {
+    let (plan_revision, existing) = {
+        let store = lock_store(store)?;
+        let plan = store
+            .plan(request.feature_id, request.plan_revision)
+            .map_err(store_api_error)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::NotFound,
+                    format!("feature plan {} was not found", request.feature_id),
+                    false,
+                )
+            })?;
+        let plan_revision = plan.plan.revision;
+        let first = *request.task_ids.iter().next().ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                "a submission must name at least one task",
+                false,
+            )
+        })?;
+        let existing = store
+            .snapshot_package_for_task(request.feature_id, plan_revision, first)
+            .map_err(store_api_error)?;
+        // The package has to carry exactly the submitted tasks. A package carrying a different set
+        // is a different submission that happens to share a task, and handing it back would report
+        // work the caller did not submit as though it had been accepted.
+        if let Some(package) = &existing {
+            let carried: BTreeSet<_> = store
+                .package_task_ids(package.package_id, package.revision)
+                .map_err(store_api_error)?
+                .into_iter()
+                .collect();
+            if carried != request.task_ids {
+                return Err(ApiError::new(
+                    ApiErrorCode::Conflict,
+                    format!(
+                        "task {first} is already captured in package {}, which carries different \
+                         work; cancel it or submit a new plan revision",
+                        package.package_id
+                    ),
+                    false,
+                ));
+            }
+        }
+        (plan_revision, existing)
+    };
+
+    let created = existing.is_none();
+    let package = match existing {
+        Some(record) => {
+            let opened = SnapshotPackage::open(record.path.clone()).map_err(snapshot_api_error)?;
+            if opened.manifest.content_hash != record.content_hash {
+                return Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    "snapshot record does not match its authenticated manifest",
+                    false,
+                ));
+            }
+            package_view(record, opened.manifest)?
+        }
+        None => match capture_package(
+            CapturePackageRequest {
+                feature_id: request.feature_id,
+                plan_revision,
+                task_ids: request.task_ids.clone(),
+            },
+            store,
+            package_root,
+        )? {
+            ResponseData::PackageCaptured { package } => package,
+            _ => {
+                return Err(ApiError::new(
+                    ApiErrorCode::Internal,
+                    "capture returned an unexpected result",
+                    false,
+                ));
+            }
+        },
+    };
+
+    let now = current_unix_ms()?;
+    let unit = lock_store(store)?
+        .create_release_unit(
+            reccursive_protocol::ReleaseUnitId::new(),
+            request.feature_id,
+            plan_revision,
+            request.task_ids,
+            request.required_checks,
+            now,
+        )
+        .map_err(store_api_error)?;
+    let unit = release_unit_view(unit);
+
+    let slot = {
+        let mut store = lock_store(store)?;
+        Scheduler::schedule(
+            &mut store,
+            unit.unit_id,
+            package.package_id,
+            package.revision,
+            request.seed,
+            now,
+        )
+        .map_err(scheduler_api_error)?
+    };
+
+    Ok(ResponseData::TaskSubmitted {
+        submission: SubmissionView {
+            package,
+            unit,
+            slot: schedule_slot_view(slot),
+            created,
+        },
     })
 }
 

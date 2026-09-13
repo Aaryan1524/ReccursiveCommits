@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 11 adds idempotency keys.
-pub const API_VERSION: u16 = 11;
+/// Local API protocol version. Version 12 adds sealing, submission, and feature status.
+pub const API_VERSION: u16 = 12;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -127,6 +127,7 @@ impl RequestEnvelope {
             Command::CreateWorkspace(request) => request.validate(),
             Command::CapturePackage(request) => request.validate(),
             Command::CancelTask(request) => request.validate(),
+            Command::SubmitTask(request) => request.validate(),
             Command::ReleasePackage(request) => request.validate(),
             Command::CreateReleaseUnit(request) => request.validate(),
             Command::PauseRepository { reason, .. }
@@ -160,6 +161,8 @@ impl RequestEnvelope {
             | Command::ListEvents { .. }
             | Command::GetPlan { .. }
             | Command::PlanHistory { .. }
+            | Command::SealPlan { .. }
+            | Command::GetFeatureStatus { .. }
             | Command::GetWorkspace { .. }
             | Command::GetPackage { .. }
             | Command::GetReleaseUnit { .. }
@@ -198,6 +201,10 @@ pub enum Command {
     ImportPlan {
         plan: FeaturePlan,
     },
+    /// Append a sealed copy of a feature's latest revision, fixing its scope.
+    SealPlan {
+        feature_id: FeatureId,
+    },
     GetPlan {
         feature_id: FeatureId,
         revision: Option<Revision>,
@@ -213,6 +220,13 @@ pub enum Command {
     CapturePackage(CapturePackageRequest),
     /// Cancel one not-yet-published task and block its dependent tasks.
     CancelTask(CancelTaskRequest),
+    /// Capture, group, and schedule one task's completed work in a single step.
+    SubmitTask(SubmitTaskRequest),
+    /// Report every task of one plan revision with the durable work attached to it.
+    GetFeatureStatus {
+        feature_id: FeatureId,
+        revision: Option<Revision>,
+    },
     /// Reconcile, validate, and publish one immutable package through the daemon-owned worker.
     ReleasePackage(ReleasePackageRequest),
     /// Group tasks that cannot independently leave the target usable into one release unit.
@@ -315,6 +329,8 @@ impl Command {
         match self {
             Self::EnrollRepository(_)
             | Self::ImportPlan { .. }
+            | Self::SealPlan { .. }
+            | Self::SubmitTask(_)
             | Self::CreateWorkspace(_)
             | Self::CapturePackage(_)
             | Self::CancelTask(_)
@@ -336,6 +352,7 @@ impl Command {
             | Self::GetPlan { .. }
             | Self::PlanHistory { .. }
             | Self::GetWorkspace { .. }
+            | Self::GetFeatureStatus { .. }
             | Self::GetReleaseUnit { .. }
             | Self::GetSchedulePolicy { .. }
             | Self::GetScheduleSlot { .. }
@@ -367,8 +384,11 @@ impl Command {
             | Self::ListRepositories
             | Self::ListEvents { .. }
             | Self::ImportPlan { .. }
+            | Self::SealPlan { .. }
             | Self::GetPlan { .. }
             | Self::PlanHistory { .. }
+            | Self::GetFeatureStatus { .. }
+            | Self::SubmitTask(_)
             | Self::CreateWorkspace(_)
             | Self::GetWorkspace { .. }
             | Self::CapturePackage(_)
@@ -456,6 +476,42 @@ impl CreateReleaseUnitRequest {
     pub fn validate(&self) -> Result<(), ProtocolValidationError> {
         if self.task_ids.is_empty() || self.task_ids.len() > 1_000 {
             return Err(ProtocolValidationError::InvalidReleaseUnitTasks);
+        }
+        for check in &self.required_checks {
+            if check.trim().is_empty() || check.len() > 256 {
+                return Err(ProtocolValidationError::InvalidRequiredCheck);
+            }
+        }
+        if self.required_checks.len() > 64 {
+            return Err(ProtocolValidationError::InvalidRequiredCheck);
+        }
+        Ok(())
+    }
+}
+
+/// One task's completed work, submitted as a single intent.
+///
+/// Capture, grouping, and time selection are three durable steps, and an agent that has to issue
+/// them separately can stop between any two of them — leaving work captured but never scheduled,
+/// which looks identical to work still in progress. Submitting them together removes that state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SubmitTaskRequest {
+    pub feature_id: FeatureId,
+    /// The plan revision to submit against. `None` means the newest stored revision, which is what
+    /// an agent working from the plan it just imported wants.
+    #[serde(default)]
+    pub plan_revision: Option<Revision>,
+    pub task_ids: BTreeSet<TaskId>,
+    #[serde(default)]
+    pub required_checks: BTreeSet<String>,
+    /// Seed for the deterministic slot selection, so a submission is reproducible.
+    pub seed: u64,
+}
+
+impl SubmitTaskRequest {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.task_ids.is_empty() || self.task_ids.len() > 1_000 {
+            return Err(ProtocolValidationError::InvalidPackageTasks);
         }
         for check in &self.required_checks {
             if check.trim().is_empty() || check.len() > 256 {
@@ -681,6 +737,49 @@ pub struct PackageView {
     pub created_at_unix_ms: i64,
 }
 
+/// Everything durable that one plan revision has produced so far.
+///
+/// This is the view an agent polls. It reports each task's status verbatim rather than a derived
+/// "ready" flag, because only the caller knows what it is waiting for — and because `blocked` and
+/// `cancelled` have to be distinguishable from "not yet", which a boolean cannot do.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FeatureStatusView {
+    pub feature_id: FeatureId,
+    pub plan_revision: Revision,
+    pub repository_id: RepositoryId,
+    pub goal: String,
+    pub sealed: bool,
+    pub tasks: Vec<TaskProgressView>,
+}
+
+/// One task's durable state and the work attached to it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskProgressView {
+    pub task_id: TaskId,
+    pub name: String,
+    pub status: TaskStatus,
+    /// The status the task was blocked out of, when it is blocked. What it was doing matters:
+    /// blocked before a push and blocked after one are different situations.
+    pub blocked_from: Option<TaskStatus>,
+    pub reason: Option<StateReason>,
+    pub updated_at_unix_ms: i64,
+    pub package_id: Option<PackageId>,
+    pub release_unit_id: Option<ReleaseUnitId>,
+    /// When this task's unit is due for release, if a time has been selected.
+    pub selected_at_unix_ms: Option<i64>,
+}
+
+/// The three durable results one submission produced.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SubmissionView {
+    pub package: PackageView,
+    pub unit: ReleaseUnitView,
+    pub slot: ScheduleSlotView,
+    /// False when the submission found the work already captured, grouped and scheduled, and
+    /// returned what was there. A repeat of a submission is not a second submission.
+    pub created: bool,
+}
+
 /// Durable result of cancelling one task and propagating its dependency consequences.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskCancellationView {
@@ -871,6 +970,15 @@ pub enum ResponseData {
     },
     PlanHistory {
         plans: Vec<PlanView>,
+    },
+    PlanSealed {
+        plan: PlanView,
+    },
+    FeatureStatus {
+        status: FeatureStatusView,
+    },
+    TaskSubmitted {
+        submission: SubmissionView,
     },
     WorkspaceCreated {
         workspace: WorkspaceView,

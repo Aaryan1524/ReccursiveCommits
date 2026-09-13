@@ -74,6 +74,18 @@ impl Store {
         let unit = ReleaseUnit::new(unit_id, task_ids, &coupling, required_checks)
             .map_err(|error| StoreError::Conflict(error.to_string()))?;
 
+        // Grouping the same work again returns the group it is already in, the way selecting a
+        // release time again returns the slot already selected. An agent that retries a submission
+        // is describing one intention twice, not asking for a second unit — and the work cannot be
+        // in two units anyway, so the only alternatives are this or an error.
+        //
+        // The comparison is the whole task set, after coupling has expanded it. A request that
+        // overlaps an existing unit without matching it is a genuinely different grouping of the
+        // same work, and returning the existing unit for it would answer a question nobody asked.
+        if let Some(existing) = self.existing_unit_for(feature_id, plan_revision, &unit)? {
+            return Ok(existing);
+        }
+
         let transaction = self.connection.transaction()?;
         transaction
             .execute(
@@ -113,6 +125,34 @@ impl Store {
             required_checks: unit.required_checks,
             created_at_unix_ms,
         })
+    }
+
+    /// Finds the unit that already publishes exactly this work, or reports a partial overlap.
+    ///
+    /// Returns `Ok(None)` only when none of the tasks are grouped yet.
+    fn existing_unit_for(
+        &self,
+        feature_id: FeatureId,
+        plan_revision: Revision,
+        proposed: &ReleaseUnit,
+    ) -> Result<Option<ReleaseUnitRecord>, StoreError> {
+        for task_id in &proposed.task_ids {
+            let Some(existing) = self.release_unit_for_task(feature_id, plan_revision, *task_id)?
+            else {
+                continue;
+            };
+            if existing.task_ids == proposed.task_ids
+                && existing.required_checks == proposed.required_checks
+            {
+                return Ok(Some(existing));
+            }
+            return Err(StoreError::Conflict(format!(
+                "task {task_id} already publishes with release unit {}, which groups different \
+                 work; withdraw or cancel that unit rather than regrouping its tasks",
+                existing.unit_id
+            )));
+        }
+        Ok(None)
     }
 
     /// Returns the unit a task publishes with, if it has been grouped.
@@ -629,6 +669,83 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn grouping_the_same_work_again_returns_the_group_it_is_already_in() {
+        let mut fixture = fixture();
+        let first = fixture
+            .unit(BTreeSet::from([fixture.interface, fixture.caller]))
+            .unwrap();
+
+        // An agent that cannot tell whether its submission landed submits again. That is one
+        // intention described twice, not a request for a second unit.
+        let repeated = fixture
+            .unit(BTreeSet::from([fixture.interface, fixture.caller]))
+            .unwrap();
+        assert_eq!(repeated, first);
+
+        // A narrower request is not the same submission. The interface alone is a coherent unit,
+        // but it is not the unit that already publishes the interface *and* its caller, so it is
+        // refused rather than quietly answered with the wider one.
+        let narrower = fixture.unit(BTreeSet::from([fixture.interface]));
+        assert!(
+            matches!(narrower, Err(StoreError::Conflict(_))),
+            "a narrower grouping of grouped work must be refused: {narrower:?}"
+        );
+    }
+
+    #[test]
+    fn regrouping_work_that_is_already_grouped_differently_is_refused() {
+        let mut fixture = fixture();
+        let first = fixture
+            .unit(BTreeSet::from([fixture.interface, fixture.caller]))
+            .unwrap();
+
+        // Overlapping without matching is a different grouping of work that already has one.
+        // Returning `first` here would answer a question nobody asked.
+        let overlapping = fixture.store.create_release_unit(
+            ReleaseUnitId::new(),
+            fixture.feature_id,
+            Revision::FIRST,
+            BTreeSet::from([fixture.interface, fixture.caller, fixture.docs]),
+            BTreeSet::from(["integration".to_owned()]),
+            3,
+        );
+        let Err(StoreError::Conflict(message)) = overlapping else {
+            panic!("regrouping grouped work must be refused: {overlapping:?}");
+        };
+        assert!(
+            message.contains(&first.unit_id.to_string()),
+            "the refusal must name the unit that already owns the work: {message}"
+        );
+        assert!(
+            !message.contains("UNIQUE constraint"),
+            "the refusal must not leak storage internals: {message}"
+        );
+    }
+
+    #[test]
+    fn the_same_tasks_with_different_required_checks_are_a_different_grouping() {
+        let mut fixture = fixture();
+        fixture
+            .unit(BTreeSet::from([fixture.interface, fixture.caller]))
+            .unwrap();
+
+        // The checks a unit must pass are part of what the unit is, so changing them is not a
+        // repeat of the same submission.
+        let different_checks = fixture.store.create_release_unit(
+            ReleaseUnitId::new(),
+            fixture.feature_id,
+            Revision::FIRST,
+            BTreeSet::from([fixture.interface, fixture.caller]),
+            BTreeSet::from(["lint".to_owned()]),
+            3,
+        );
+        assert!(
+            matches!(different_checks, Err(StoreError::Conflict(_))),
+            "changed required checks must not silently reuse the existing unit: {different_checks:?}"
+        );
+    }
+
+    #[test]
     fn a_coupled_caller_cannot_be_released_without_its_interface() {
         let mut fixture = fixture();
 
@@ -662,13 +779,31 @@ mod tests {
     #[test]
     fn a_task_cannot_be_claimed_by_two_release_units() {
         let mut fixture = fixture();
-        fixture
+        let first = fixture
             .unit(BTreeSet::from([fixture.interface, fixture.caller]))
             .unwrap();
-        let duplicate = fixture.unit(BTreeSet::from([fixture.interface, fixture.caller]));
+
+        // Asking again returns the existing unit rather than failing, but the invariant is the
+        // same one it always was: the task is published by exactly one unit, and no second unit
+        // exists to claim it.
+        let repeated = fixture
+            .unit(BTreeSet::from([fixture.interface, fixture.caller]))
+            .unwrap();
+        assert_eq!(repeated.unit_id, first.unit_id);
+        assert_eq!(
+            fixture
+                .store
+                .release_unit_for_task(fixture.feature_id, Revision::FIRST, fixture.caller)
+                .unwrap()
+                .map(|unit| unit.unit_id),
+            Some(first.unit_id)
+        );
+
+        // A different grouping of the same task is still refused outright.
+        let regrouped = fixture.unit(BTreeSet::from([fixture.caller, fixture.docs]));
         assert!(
-            matches!(duplicate, Err(StoreError::Conflict(_))),
-            "one task cannot be published by two units: {duplicate:?}"
+            matches!(regrouped, Err(StoreError::Conflict(_))),
+            "one task cannot be published by two units: {regrouped:?}"
         );
     }
 

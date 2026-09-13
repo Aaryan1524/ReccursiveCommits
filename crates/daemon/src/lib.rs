@@ -1,5 +1,6 @@
 //! Background service boundary.
 
+pub mod scheduler;
 mod service;
 
 pub use service::{LocalService, ServiceError, ServicePaths};

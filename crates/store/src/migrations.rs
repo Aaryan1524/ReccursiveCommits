@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 19;
+pub const STORAGE_SCHEMA_VERSION: u32 = 20;
 
 struct Migration {
     version: u32,
@@ -701,6 +701,31 @@ const MIGRATIONS: &[Migration] = &[
 
         CREATE INDEX idx_repositories_remote_identity
             ON repositories(remote_identity);
+        "#,
+    },
+    Migration {
+        version: 20,
+        sql: r#"
+        -- Backoff is tracked per integration and per scope so one outage stays one outage. A Git
+        -- remote being unreachable must not delay a different repository, and must not delay
+        -- notification delivery at all. Durable, because a restart during an outage should resume
+        -- the backoff rather than reset it into an immediate retry.
+        CREATE TABLE integration_backoff (
+            integration TEXT NOT NULL CHECK (integration IN ('git', 'ai_provider', 'telegram')),
+            scope TEXT NOT NULL CHECK (length(trim(scope)) > 0),
+            consecutive_failures INTEGER NOT NULL CHECK (consecutive_failures >= 0),
+            fault TEXT NOT NULL CHECK (fault IN
+                ('unreachable', 'rejected', 'refused', 'timed_out')),
+            detail TEXT NOT NULL CHECK (length(trim(detail)) > 0),
+            -- NULL means no further attempt is scheduled: the fault will not resolve by waiting.
+            next_attempt_at_unix_ms INTEGER
+                CHECK (next_attempt_at_unix_ms IS NULL OR next_attempt_at_unix_ms >= 0),
+            updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= 0),
+            PRIMARY KEY (integration, scope)
+        );
+
+        CREATE INDEX idx_integration_backoff_due
+            ON integration_backoff(integration, next_attempt_at_unix_ms);
         "#,
     },
 ];

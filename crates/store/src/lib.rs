@@ -3,6 +3,7 @@
 mod attempts;
 mod checks;
 mod events;
+mod integrations;
 mod migrations;
 mod plans;
 mod redaction;
@@ -23,6 +24,7 @@ use std::{
 pub use attempts::{AttemptLease, NewReleaseAttempt, ReleaseAttempt};
 pub use checks::{CandidateValidationEvidence, TrustedCheck, ValidationEvidence};
 pub use events::{DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, StoredEvent};
+pub use integrations::{GLOBAL_SCOPE, IntegrationHealth};
 pub use migrations::STORAGE_SCHEMA_VERSION;
 pub use plans::StoredPlan;
 pub use redaction::{redact_json, redact_text};

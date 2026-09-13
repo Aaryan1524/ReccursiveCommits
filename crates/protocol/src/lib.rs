@@ -5,16 +5,16 @@ pub mod transport;
 use std::{collections::BTreeSet, fmt};
 
 pub use reccursive_core::{
-    AcceptanceCheck, AttemptId, EventId, FeatureId, FeaturePlan, PLAN_SCHEMA_VERSION, PackageId,
-    PlanPhase, PlanTask, PublicationMode, ReasonCode, ReleaseUnitId, RepositoryId,
-    RepositoryPolicy, RequestId, Revision, SchedulePolicy, SchedulePolicyOverride, StateReason,
-    TargetMilestone, TargetRef, TaskId, TaskStatus,
+    AcceptanceCheck, AttemptId, ConnectivityFault, EventId, FeatureId, FeaturePlan, Integration,
+    PLAN_SCHEMA_VERSION, PackageId, PlanPhase, PlanTask, PublicationMode, ReasonCode,
+    ReleaseUnitId, RepositoryId, RepositoryPolicy, RequestId, Revision, SchedulePolicy,
+    SchedulePolicyOverride, StateReason, TargetMilestone, TargetRef, TaskId, TaskStatus,
 };
 use serde::{Deserialize, Serialize};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 8 adds pause, resume, release-now, and preview.
-pub const API_VERSION: u16 = 8;
+/// Local API protocol version. Version 9 adds integration health reporting.
+pub const API_VERSION: u16 = 9;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -128,6 +128,7 @@ impl RequestEnvelope {
             | Command::ResumeRepository { .. }
             | Command::ReleaseUnitNow { .. }
             | Command::PreviewSchedule { .. }
+            | Command::ListIntegrationHealth
             | Command::GetReleaseAttempt { .. }
             | Command::ListReleaseAttempts { .. }
             | Command::AuditQueue
@@ -227,6 +228,8 @@ pub enum Command {
     PreviewSchedule {
         repository_id: RepositoryId,
     },
+    /// List integrations currently failing, and when each may be retried.
+    ListIntegrationHealth,
     /// Inspect one durable publication attempt.
     GetReleaseAttempt {
         attempt_id: AttemptId,
@@ -546,6 +549,18 @@ pub struct SchedulePolicyView {
     pub created_at_unix_ms: i64,
 }
 
+/// One integration that is currently failing, and what happens next.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IntegrationHealthView {
+    pub integration: Integration,
+    pub scope: String,
+    pub consecutive_failures: u32,
+    pub fault: ConnectivityFault,
+    pub detail: String,
+    /// `None` means waiting will not help and a person has to act.
+    pub next_attempt_at_unix_ms: Option<i64>,
+}
+
 /// One unit whose selected release time has arrived.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DueUnitView {
@@ -755,6 +770,9 @@ pub enum ResponseData {
     SchedulePreview {
         slots: Vec<ScheduleSlotView>,
         paused: Option<String>,
+    },
+    IntegrationHealth {
+        integrations: Vec<IntegrationHealthView>,
     },
     QueueAudit {
         audit: QueueAuditView,

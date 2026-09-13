@@ -7,6 +7,8 @@
 
 use std::time::{Duration, Instant};
 
+pub use reccursive_core::ConnectivityFault;
+
 /// Detects that wall-clock time has advanced far more than the process has been running.
 ///
 /// Two clocks are read together: a monotonic one that stops while the machine is asleep, and the
@@ -68,68 +70,6 @@ impl WakeDetector {
         } else {
             TimeTransition::Continuous
         }
-    }
-}
-
-/// Why an endpoint could not be reached, distinguished so one outage does not look like another.
-///
-/// The distinction is what decides the response. A transport failure is worth retrying on its own
-/// schedule; a rejected credential is not, and retrying it can lock an account or trigger a
-/// prompt no one is present to answer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectivityFault {
-    /// The endpoint could not be reached at all. Retrying later is reasonable.
-    Unreachable,
-    /// The endpoint answered and refused the credentials. Retrying will not fix it.
-    Rejected,
-    /// The endpoint answered and refused the request itself, such as a protected branch.
-    Refused,
-    /// The operation ran too long without an answer.
-    TimedOut,
-}
-
-impl ConnectivityFault {
-    /// Reports whether waiting and trying again could plausibly succeed.
-    #[must_use]
-    pub const fn is_worth_retrying(self) -> bool {
-        matches!(self, Self::Unreachable | Self::TimedOut)
-    }
-
-    /// Classifies a Git transport failure from the message Git produced.
-    ///
-    /// Git reports all of these through the same non-zero exit, so the message is the only signal
-    /// available. Anything unrecognized is treated as unreachable rather than as a rejection: an
-    /// unknown fault that is retried costs a delay, while an unknown fault treated as a permanent
-    /// rejection strands work that would have succeeded.
-    #[must_use]
-    pub fn classify_git(message: &str) -> Self {
-        let lowered = message.to_ascii_lowercase();
-        const REJECTED: [&str; 6] = [
-            "authentication failed",
-            "permission denied",
-            "invalid username or password",
-            "access denied",
-            "could not read username",
-            "host key verification failed",
-        ];
-        const REFUSED: [&str; 4] = [
-            "protected branch",
-            "pre-receive hook declined",
-            "refusing to allow",
-            "non-fast-forward",
-        ];
-        const TIMED_OUT: [&str; 3] = ["timed out", "timeout", "operation timed out"];
-
-        if REJECTED.iter().any(|needle| lowered.contains(needle)) {
-            return Self::Rejected;
-        }
-        if REFUSED.iter().any(|needle| lowered.contains(needle)) {
-            return Self::Refused;
-        }
-        if TIMED_OUT.iter().any(|needle| lowered.contains(needle)) {
-            return Self::TimedOut;
-        }
-        Self::Unreachable
     }
 }
 

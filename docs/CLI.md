@@ -44,6 +44,7 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state schedule preview repo_
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule pause repo_<uuid> --reason "investigating a failure"
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule resume repo_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule release-now unit_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state integrations
 cargo run -p reccursive-cli -- --state-dir /path/to/state service install
 cargo run -p reccursive-cli -- --state-dir /path/to/state service status
 cargo run -p reccursive-cli -- --state-dir /path/to/state service show
@@ -195,6 +196,19 @@ same branch. Two checkouts publishing to one ref are two writers racing for it, 
 this is rejected at enrollment rather than surfacing later as a conflict. The live
 release lease is keyed on the remote and target themselves, not on the repository
 profile, for the same reason.
+
+`integrations` lists external endpoints that are currently failing, how many
+consecutive failures each has had, and when it may be retried. Health is tracked
+per endpoint *and* per repository, so an unreachable Git remote delays only that
+repository's Git work — a different repository keeps publishing, and notification
+delivery is unaffected. Backoff doubles to a ceiling so a long outage costs a
+bounded number of attempts rather than steady polling, and it is durable, so a
+restart during an outage resumes the wait instead of retrying immediately.
+
+An endpoint reported with no scheduled retry will not recover on its own. That is
+reserved for faults waiting cannot fix — a rejected credential, a refused push —
+because repeatedly presenting a rejected credential is how an account gets locked,
+or how a credential prompt appears with nobody present to answer it.
 
 `service install` registers the daemon as a macOS user-session agent so it keeps
 running after the terminal is closed. It runs in the user's own login session

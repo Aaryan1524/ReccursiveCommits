@@ -266,6 +266,43 @@ impl Store {
         registration: &RepositoryRegistration,
         policy: &RepositoryPolicy,
     ) -> Result<(), StoreError> {
+        self.enroll_repository_inner(registration, policy, None)
+    }
+
+    /// Atomically stores a repository, its publication policy, and its first schedule policy.
+    ///
+    /// A scheduled repository without an active schedule policy would be a durable but unusable
+    /// half-configuration. Initialization therefore commits every required record together.
+    pub fn enroll_repository_with_initial_schedule(
+        &mut self,
+        registration: &RepositoryRegistration,
+        policy: &RepositoryPolicy,
+        schedule_policy: &StoredSchedulePolicy,
+    ) -> Result<(), StoreError> {
+        if schedule_policy.repository_id != registration.id {
+            return Err(StoreError::InvalidData(
+                "initial schedule policy belongs to another repository".into(),
+            ));
+        }
+        if schedule_policy.revision != Revision::FIRST {
+            return Err(StoreError::InvalidData(
+                "initial schedule policy must be revision 1".into(),
+            ));
+        }
+        if schedule_policy.created_at_unix_ms < 0 {
+            return Err(StoreError::InvalidData(
+                "schedule policy timestamp must not be negative".into(),
+            ));
+        }
+        self.enroll_repository_inner(registration, policy, Some(schedule_policy))
+    }
+
+    fn enroll_repository_inner(
+        &mut self,
+        registration: &RepositoryRegistration,
+        policy: &RepositoryPolicy,
+        schedule_policy: Option<&StoredSchedulePolicy>,
+    ) -> Result<(), StoreError> {
         registration.validate()?;
         ensure_policy_owner(registration.id, policy)?;
         // One publisher per remote and branch. A second checkout of the same repository publishing
@@ -318,6 +355,19 @@ impl Store {
             "UPDATE repositories SET active_policy_revision = ?2 WHERE id = ?1",
             params![registration.id.to_string(), policy.revision.get()],
         )?;
+        if let Some(schedule_policy) = schedule_policy {
+            transaction.execute(
+                "INSERT INTO repository_schedule_policies (
+                    repository_id, revision, policy_json, created_at_unix_ms, active
+                 ) VALUES (?1, ?2, ?3, ?4, 1)",
+                params![
+                    schedule_policy.repository_id.to_string(),
+                    schedule_policy.revision.get(),
+                    serde_json::to_string(&schedule_policy.policy)?,
+                    schedule_policy.created_at_unix_ms,
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -600,6 +650,44 @@ mod tests {
                 active_policy: policy,
             })
         );
+    }
+
+    #[test]
+    fn initialization_persists_repository_and_first_schedule_together() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (registration, policy) = fixture();
+        let schedule = schedule_policy(registration.id, Revision::FIRST);
+
+        store
+            .enroll_repository_with_initial_schedule(&registration, &policy, &schedule)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .repository(registration.id)
+                .unwrap()
+                .unwrap()
+                .registration,
+            registration
+        );
+        assert_eq!(
+            store.schedule_policy(schedule.repository_id).unwrap(),
+            Some(schedule)
+        );
+    }
+
+    #[test]
+    fn initialization_refuses_a_schedule_for_another_repository_before_writing() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (registration, policy) = fixture();
+        let schedule = schedule_policy(RepositoryId::new(), Revision::FIRST);
+
+        assert!(
+            store
+                .enroll_repository_with_initial_schedule(&registration, &policy, &schedule)
+                .is_err()
+        );
+        assert!(store.repository(registration.id).unwrap().is_none());
     }
 
     #[test]

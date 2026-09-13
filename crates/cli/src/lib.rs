@@ -1341,6 +1341,16 @@ fn output_data(
                 repository.target.as_str()
             )
         }
+        ResponseData::RepositoryInitialized {
+            repository,
+            schedule_policy,
+        } => writeln!(
+            out,
+            "Initialized {}\nTarget: {}\nSchedule policy revision: {}",
+            repository.id,
+            repository.target.as_str(),
+            schedule_policy.revision.get(),
+        ),
         ResponseData::Repositories { repositories } => output_repositories(out, &repositories),
         ResponseData::Events { events } => output_events(out, &events),
         ResponseData::PlanSealed { plan } => {

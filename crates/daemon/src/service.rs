@@ -21,13 +21,13 @@ use reccursive_protocol::{
     ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest, Command,
     CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
     EventSeverityView, EventView, FeatureId, FeatureStatusView, IdempotencyKey,
-    IntegrationHealthView, MissedWindowView, PackageView, PlanView, ProtocolValidationError,
-    QueueAuditView, QueueExportView, QueueRecoveryIssueView, ReasonCode, ReleaseAttemptView,
-    ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryView,
-    RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision, SchedulePolicyView,
-    ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest,
-    StateReason, SubmissionView, TaskCancellationView, TaskProgressView, TaskStatus,
-    TransportError, WorkspacePrerequisiteView, WorkspaceView,
+    InitializeRepositoryRequest, IntegrationHealthView, MissedWindowView, PackageView, PlanView,
+    ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView, ReasonCode,
+    ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy,
+    RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision,
+    SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest,
+    SetSchedulePolicyRequest, StateReason, SubmissionView, TaskCancellationView, TaskProgressView,
+    TaskStatus, TransportError, WorkspacePrerequisiteView, WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -655,6 +655,9 @@ fn dispatch(
         Command::AuditQueue => audit_queue(store, roots.package),
         Command::ExportQueue { destination } => export_queue(destination, store, roots.package),
         Command::EnrollRepository(request) => enroll_repository(request, store, roots.managed),
+        Command::InitializeRepository(request) => {
+            initialize_repository(request, store, roots.managed)
+        }
     }
 }
 
@@ -662,6 +665,7 @@ fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Ping => "ping",
         Command::EnrollRepository(_) => "repository.add",
+        Command::InitializeRepository(_) => "repository.initialize",
         Command::ListRepositories => "repository.list",
         Command::ListEvents { .. } => "logs",
         Command::ImportPlan { .. } => "plan.import",
@@ -708,7 +712,8 @@ fn record_api_event(
     result: &Result<ResponseData, ApiError>,
 ) -> Result<(), ApiError> {
     let (repository_id, entity_type, entity_id, entity_revision) = match result {
-        Ok(ResponseData::RepositoryEnrolled { repository }) => (
+        Ok(ResponseData::RepositoryEnrolled { repository })
+        | Ok(ResponseData::RepositoryInitialized { repository, .. }) => (
             Some(repository.id),
             Some("repository".into()),
             Some(repository.id.to_string()),
@@ -2723,6 +2728,28 @@ fn enroll_repository(
     store: &Mutex<Store>,
     managed_root: &Path,
 ) -> Result<ResponseData, ApiError> {
+    enroll_repository_inner(request, None, store, managed_root)
+}
+
+fn initialize_repository(
+    request: InitializeRepositoryRequest,
+    store: &Mutex<Store>,
+    managed_root: &Path,
+) -> Result<ResponseData, ApiError> {
+    enroll_repository_inner(
+        request.enrollment,
+        Some(request.schedule_policy),
+        store,
+        managed_root,
+    )
+}
+
+fn enroll_repository_inner(
+    request: EnrollRepositoryRequest,
+    initial_schedule_policy: Option<reccursive_protocol::SchedulePolicy>,
+    store: &Mutex<Store>,
+    managed_root: &Path,
+) -> Result<ResponseData, ApiError> {
     let checkout = Path::new(&request.checkout_path);
     if !checkout.is_absolute() || !checkout.is_dir() {
         return Err(ApiError::new(
@@ -2755,9 +2782,20 @@ fn enroll_repository(
     )
     .map_err(|error| ApiError::new(ApiErrorCode::InvalidRequest, error.to_string(), false))?;
     let mut store = lock_store(store)?;
-    store
-        .enroll_repository(&registration, &policy)
-        .map_err(store_api_error)?;
+    let initial_schedule_policy = initial_schedule_policy.map(|policy| StoredSchedulePolicy {
+        repository_id,
+        revision: Revision::FIRST,
+        policy,
+        created_at_unix_ms,
+    });
+    match &initial_schedule_policy {
+        Some(schedule_policy) => store
+            .enroll_repository_with_initial_schedule(&registration, &policy, schedule_policy)
+            .map_err(store_api_error)?,
+        None => store
+            .enroll_repository(&registration, &policy)
+            .map_err(store_api_error)?,
+    }
     store
         .add_trusted_check(&TrustedCheck {
             repository_id,
@@ -2772,12 +2810,17 @@ fn enroll_repository(
             enabled: true,
         })
         .map_err(store_api_error)?;
-    Ok(ResponseData::RepositoryEnrolled {
-        repository: repository_view(StoredRepository {
-            registration,
-            active_policy: policy,
+    let repository = repository_view(StoredRepository {
+        registration,
+        active_policy: policy,
+    });
+    match initial_schedule_policy {
+        Some(schedule_policy) => Ok(ResponseData::RepositoryInitialized {
+            repository,
+            schedule_policy: schedule_policy_view(schedule_policy),
         }),
-    })
+        None => Ok(ResponseData::RepositoryEnrolled { repository }),
+    }
 }
 
 fn repository_view(stored: StoredRepository) -> RepositoryView {

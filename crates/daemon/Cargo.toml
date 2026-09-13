@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 reccursive-capture = { path = "../capture" }
+reccursive-core = { path = "../core" }
 reccursive-git = { path = "../git" }
 reccursive-protocol = { path = "../protocol" }
 reccursive-store = { path = "../store" }

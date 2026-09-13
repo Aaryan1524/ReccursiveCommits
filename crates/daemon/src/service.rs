@@ -487,6 +487,7 @@ fn dispatch(
         Command::ReleaseUnitNow { release_unit_id } => release_unit_now(release_unit_id, store),
         Command::PreviewSchedule { repository_id } => preview_schedule(repository_id, store),
         Command::ListIntegrationHealth => list_integration_health(store),
+        Command::DiagnoseRepository { repository_id } => diagnose_repository(repository_id, store),
         Command::GetReleaseAttempt { attempt_id } => get_release_attempt(attempt_id, store),
         Command::ListReleaseAttempts { package_id, limit } => {
             list_release_attempts(package_id, limit, store)
@@ -531,6 +532,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::ReleaseUnitNow { .. } => "schedule.release_now",
         Command::PreviewSchedule { .. } => "schedule.preview",
         Command::ListIntegrationHealth => "integrations.health",
+        Command::DiagnoseRepository { .. } => "repository.diagnose",
         Command::GetReleaseAttempt { .. } => "release.attempt",
         Command::ListReleaseAttempts { .. } => "release.attempts",
         Command::GetPackage { .. } => "package.show",
@@ -1929,6 +1931,72 @@ fn preview_schedule(
         .map_err(store_api_error)?
         .map(|pause| pause.reason);
     Ok(ResponseData::SchedulePreview { slots, paused })
+}
+
+/// Reports whether credentials and signing would currently let a repository publish.
+///
+/// Run before a release rather than discovered during one: the point is to answer "why can this
+/// not publish" while someone is present to read the answer.
+fn diagnose_repository(
+    repository_id: RepositoryId,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let repository = lock_store(store)?
+        .repository(repository_id)
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotFound,
+                format!("repository {repository_id} was not found"),
+                false,
+            )
+        })?;
+
+    let managed = PathBuf::from(&repository.registration.managed_path);
+    // Probes run against a directory that exists; before the first release the managed mirror has
+    // not been created, so the user's own checkout answers the same question.
+    let probe_root = if managed.is_dir() {
+        managed
+    } else {
+        PathBuf::from(&repository.registration.checkout_path)
+    };
+    let credentials = crate::diagnostics::probe_credentials(
+        &probe_root,
+        &repository.registration.canonical_remote,
+    );
+    let signing =
+        crate::diagnostics::probe_signing(&PathBuf::from(&repository.registration.checkout_path));
+    let diagnostics = crate::diagnostics::RepositoryDiagnostics {
+        credentials: credentials.clone(),
+        signing: signing.clone(),
+    };
+
+    let (credential_state, credential_detail) = match &credentials {
+        crate::diagnostics::CredentialStatus::Ready => ("ready", None),
+        crate::diagnostics::CredentialStatus::Rejected { detail } => {
+            ("rejected", Some(detail.clone()))
+        }
+        crate::diagnostics::CredentialStatus::Unreachable { detail } => {
+            ("unreachable", Some(detail.clone()))
+        }
+        crate::diagnostics::CredentialStatus::TimedOut => ("timed_out", None),
+    };
+    let (signing_state, signing_detail) = match &signing {
+        crate::diagnostics::SigningStatus::Disabled => ("disabled", None),
+        crate::diagnostics::SigningStatus::Ready { format } => ("ready", Some(format.clone())),
+        crate::diagnostics::SigningStatus::Unavailable { format, detail } => {
+            ("unavailable", Some(format!("{format}: {detail}")))
+        }
+    };
+
+    Ok(ResponseData::RepositoryDiagnostics {
+        repository_id,
+        credentials: credential_state.to_owned(),
+        credential_detail,
+        signing: signing_state.to_owned(),
+        signing_detail,
+        can_publish: diagnostics.can_publish(),
+    })
 }
 
 fn list_integration_health(store: &Mutex<Store>) -> Result<ResponseData, ApiError> {

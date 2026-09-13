@@ -44,6 +44,7 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state schedule preview repo_
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule pause repo_<uuid> --reason "investigating a failure"
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule resume repo_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule release-now unit_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state diagnose repo_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state integrations
 cargo run -p reccursive-cli -- --state-dir /path/to/state service install
 cargo run -p reccursive-cli -- --state-dir /path/to/state service status
@@ -196,6 +197,20 @@ same branch. Two checkouts publishing to one ref are two writers racing for it, 
 this is rejected at enrollment rather than surfacing later as a conflict. The live
 release lease is keyed on the remote and target themselves, not on the repository
 profile, for the same reason.
+
+`diagnose` answers whether one repository could publish right now, before a
+release is attempted rather than after it has been blocked. It checks the remote
+with a read-only `ls-remote`, which proves the stored credential is accepted
+without creating a ref or a commit, and checks signing by confirming the
+configured key is actually present. Background publication can never stop on a
+prompt — terminal prompts are disabled, askpass points at a program that always
+fails, and every invocation is bounded by a timeout — so a missing credential
+fails in seconds. This command exists so the reason is legible while somebody is
+there to read it.
+
+An unreachable host is never reported as a rejected credential: sending someone to
+re-authenticate because a server was down is a real cost, so only an actual refusal
+is called one.
 
 `integrations` lists external endpoints that are currently failing, how many
 consecutive failures each has had, and when it may be retried. Health is tracked

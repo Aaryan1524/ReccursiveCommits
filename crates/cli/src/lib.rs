@@ -103,6 +103,8 @@ enum TopLevelCommand {
     Doctor,
     /// Show integrations that are currently failing and when each may be retried.
     Integrations,
+    /// Check whether credentials and signing would let a repository publish right now.
+    Diagnose { repository_id: RepositoryId },
     /// Show recent sanitized daemon events.
     Logs {
         /// Maximum number of newest events to return.
@@ -445,6 +447,10 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
     let paths = ClientPaths::new(state_dir);
     match cli.command {
         TopLevelCommand::Doctor => doctor(&paths, cli.json, stdout),
+        TopLevelCommand::Diagnose { repository_id } => {
+            let data = send(&paths, Command::DiagnoseRepository { repository_id })?;
+            output_data(data, cli.json, stdout)
+        }
         TopLevelCommand::Integrations => {
             let data = send(&paths, Command::ListIntegrationHealth)?;
             output_data(data, cli.json, stdout)
@@ -1215,6 +1221,21 @@ fn output_data(
         ResponseData::IntegrationHealth { integrations } => {
             output_integration_health(out, &integrations)
         }
+        ResponseData::RepositoryDiagnostics {
+            repository_id,
+            credentials,
+            credential_detail,
+            signing,
+            signing_detail,
+            can_publish,
+        } => writeln!(
+            out,
+            "Repository {repository_id}\nCredentials: {credentials}{}\nSigning: {signing}{}\n\
+             Can publish now: {}",
+            credential_detail.map_or_else(String::new, |detail| format!(" ({detail})")),
+            signing_detail.map_or_else(String::new, |detail| format!(" ({detail})")),
+            if can_publish { "yes" } else { "no" }
+        ),
         ResponseData::RepositoryPaused {
             repository_id,
             reason,

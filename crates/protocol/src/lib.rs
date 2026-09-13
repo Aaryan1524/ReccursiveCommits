@@ -13,8 +13,8 @@ pub use reccursive_core::{
 use serde::{Deserialize, Serialize};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 9 adds integration health reporting.
-pub const API_VERSION: u16 = 9;
+/// Local API protocol version. Version 10 adds credential and signing diagnostics.
+pub const API_VERSION: u16 = 10;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -129,6 +129,7 @@ impl RequestEnvelope {
             | Command::ReleaseUnitNow { .. }
             | Command::PreviewSchedule { .. }
             | Command::ListIntegrationHealth
+            | Command::DiagnoseRepository { .. }
             | Command::GetReleaseAttempt { .. }
             | Command::ListReleaseAttempts { .. }
             | Command::AuditQueue
@@ -230,6 +231,10 @@ pub enum Command {
     },
     /// List integrations currently failing, and when each may be retried.
     ListIntegrationHealth,
+    /// Check whether credentials and signing would let this repository publish right now.
+    DiagnoseRepository {
+        repository_id: RepositoryId,
+    },
     /// Inspect one durable publication attempt.
     GetReleaseAttempt {
         attempt_id: AttemptId,
@@ -773,6 +778,14 @@ pub enum ResponseData {
     },
     IntegrationHealth {
         integrations: Vec<IntegrationHealthView>,
+    },
+    RepositoryDiagnostics {
+        repository_id: RepositoryId,
+        credentials: String,
+        credential_detail: Option<String>,
+        signing: String,
+        signing_detail: Option<String>,
+        can_publish: bool,
     },
     QueueAudit {
         audit: QueueAuditView,

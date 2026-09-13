@@ -156,6 +156,41 @@ request is correlated by request ID, stored with a stable event kind and severit
 and scrubbed for common credential formats before persistence. The installation
 retains a bounded event history rather than growing the database indefinitely.
 
+## Preparing a plan
+
+`plan template <repository>` writes a starter document that is already valid —
+a working two-task plan with a real dependency between them, not a skeleton of
+placeholders, because the fastest way to learn the format is to change something
+that already imports.
+
+`plan check FILE` validates a document locally, using the same
+`FeaturePlan::validate` the daemon runs at import. Nothing is sent anywhere, so
+an author can iterate without touching the service, and a document this accepts
+is a document import accepts.
+
+`plan show` is a review rather than a summary. Approving a plan means agreeing
+to what it will publish, so it prints every phase and task, what each task waits
+for and at which milestone, and what it claims will prove the task is done. A
+count of phases is not something anyone can approve.
+
+`plan export` writes a stored revision back out as a document — for editing
+elsewhere, for review, or for keeping alongside the code.
+
+`plan edit` opens the newest revision in `$VISUAL` or `$EDITOR` and appends the
+result as the next revision. It **never writes back to what is stored**: a
+stored revision is immutable, because packages, units, and publication attempts
+all name the revision they were built from. An edit reads revision N and imports
+what comes back as N+1, so already-published work is untouched by construction
+rather than by care. The appended revision is a draft even when the one it was
+derived from was sealed — an edit is a change of scope, and inheriting the seal
+would publish that change without anyone agreeing to it. An edit that changes
+nothing appends nothing, and an edit that produces an invalid plan imports
+nothing.
+
+Sealing is the approval step. `plan seal` fixes scope, and an owned workspace
+requires a sealed revision, so nothing can be built against a plan nobody has
+committed to. Review with `plan show`, then seal.
+
 `plan import` accepts the portable, versioned JSON contract documented in
 [`PLAN_FORMAT.md`](PLAN_FORMAT.md). Imports are append-only: the first revision is
 1 and each later document must use the next revision for the same feature and

@@ -16,11 +16,13 @@ use reccursive_protocol::{
     QueueExportView, ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitId, ReleaseUnitView,
     RepositoryId, RepositoryView, ResponseData, Revision, SchedulePolicy, SchedulePolicyOverride,
     SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest,
-    SubmissionView, SubmitTaskRequest, TargetRef, TaskId, TaskProgressView, WorkspaceView,
+    SubmissionView, SubmitTaskRequest, TargetMilestone, TargetRef, TaskId, TaskProgressView,
+    WorkspaceView,
 };
 use serde::Serialize;
 use serde_json::json;
 
+mod authoring;
 mod install;
 mod setup;
 
@@ -382,6 +384,32 @@ enum PlanCommand {
     History { feature_id: FeatureId },
     /// Fix a feature's scope by appending a sealed copy of its newest revision.
     Seal { feature_id: FeatureId },
+    /// Write a starter plan document that already imports.
+    Template {
+        /// Repository the plan delivers into.
+        repository_id: RepositoryId,
+        /// Target branch name or full refs/heads ref.
+        #[arg(long, default_value = "main")]
+        target: String,
+        /// Write here instead of standard output.
+        #[arg(long, short = 'o', value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+    /// Validate a plan document locally, without sending it anywhere.
+    Check {
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Write a stored revision back out as a document.
+    Export {
+        feature_id: FeatureId,
+        #[arg(long, value_parser = parse_revision)]
+        revision: Option<Revision>,
+        #[arg(long, short = 'o', value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+    /// Open the newest revision in your editor and append the result as the next revision.
+    Edit { feature_id: FeatureId },
 }
 
 #[derive(Debug, Subcommand)]
@@ -626,6 +654,18 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 let data = send(&session, Command::SealPlan { feature_id })?;
                 output_data(data, cli.json, stdout)
             }
+            PlanCommand::Template {
+                repository_id,
+                target,
+                output,
+            } => plan_template(repository_id, &target, output.as_deref(), stdout),
+            PlanCommand::Check { file } => plan_check(&file, cli.json, stdout),
+            PlanCommand::Export {
+                feature_id,
+                revision,
+                output,
+            } => plan_export(&session, feature_id, revision, output.as_deref(), stdout),
+            PlanCommand::Edit { feature_id } => plan_edit(&session, feature_id, cli.json, stdout),
         },
         TopLevelCommand::Feature { command } => match command {
             FeatureCommand::Status {
@@ -945,6 +985,190 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             }
         },
     }
+}
+
+fn write_document(
+    document: &str,
+    output: Option<&Path>,
+    out: &mut impl Write,
+) -> Result<(), CliFailure> {
+    match output {
+        Some(path) => {
+            fs::write(path, document).map_err(|error| {
+                CliFailure::new(
+                    EXIT_ACTION_REQUIRED,
+                    "write_failed",
+                    format!("cannot write {}: {error}", path.display()),
+                )
+            })?;
+            writeln!(out, "Wrote {}", path.display()).map_err(output_error)
+        }
+        None => write!(out, "{document}").map_err(output_error),
+    }
+}
+
+fn plan_template(
+    repository_id: RepositoryId,
+    target: &str,
+    output: Option<&Path>,
+    out: &mut impl Write,
+) -> Result<(), CliFailure> {
+    // A plan names the full ref, while every other command accepts a bare branch name. Normalizing
+    // here keeps the template consistent with how the user just typed it everywhere else.
+    let target = branch_ref(target)?;
+    write_document(
+        &authoring::template(repository_id, target.as_str()),
+        output,
+        out,
+    )
+}
+
+/// Validates a document locally, using the same rules the daemon applies at import.
+///
+/// Local on purpose: an author iterating on a plan should not have to reach the service, and a
+/// document rejected here is a document import would have rejected anyway.
+fn plan_check(file: &Path, json_output: bool, out: &mut impl Write) -> Result<(), CliFailure> {
+    let plan = load_plan(file)?;
+    if let Err(error) = plan.validate() {
+        return Err(CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "invalid_plan",
+            format!("{}: {error}", file.display()),
+        ));
+    }
+    let tasks: usize = plan.phases.iter().map(|phase| phase.tasks.len()).sum();
+    if json_output {
+        let value = json!({
+            "ok": true,
+            "data": {
+                "type": "plan_checked",
+                "payload": {
+                    "feature_id": plan.feature_id.to_string(),
+                    "revision": plan.revision.get(),
+                    "sealed": plan.sealed,
+                    "phases": plan.phases.len(),
+                    "tasks": tasks,
+                }
+            }
+        });
+        return writeln!(out, "{value}").map_err(output_error);
+    }
+    writeln!(
+        out,
+        "{} is a valid plan: revision {}, {} phase(s), {tasks} task(s), {}",
+        file.display(),
+        plan.revision.get(),
+        plan.phases.len(),
+        if plan.sealed { "sealed" } else { "draft" }
+    )
+    .map_err(output_error)
+}
+
+fn plan_export(
+    session: &Session,
+    feature_id: FeatureId,
+    revision: Option<Revision>,
+    output: Option<&Path>,
+    out: &mut impl Write,
+) -> Result<(), CliFailure> {
+    let plan = fetch_plan(session, feature_id, revision)?;
+    let document = serde_json::to_string_pretty(&plan.plan)
+        .map_err(|error| CliFailure::new(EXIT_INTERNAL, "encode_failed", error.to_string()))?;
+    write_document(&format!("{document}\n"), output, out)
+}
+
+fn fetch_plan(
+    session: &Session,
+    feature_id: FeatureId,
+    revision: Option<Revision>,
+) -> Result<PlanView, CliFailure> {
+    match send(
+        session,
+        Command::GetPlan {
+            feature_id,
+            revision,
+        },
+    )? {
+        ResponseData::Plan { plan } => Ok(plan),
+        _ => Err(CliFailure::new(
+            EXIT_INTERNAL,
+            "unexpected_response",
+            "reading a plan returned an unexpected result",
+        )),
+    }
+}
+
+/// Opens the newest revision in the user's editor and appends the result as the next revision.
+///
+/// The stored revision is never written to. An edit reads revision N, and imports what comes back
+/// as N+1 — so published work, which names the revision it was built from, is untouched by
+/// construction rather than by care.
+fn plan_edit(
+    session: &Session,
+    feature_id: FeatureId,
+    json_output: bool,
+    out: &mut impl Write,
+) -> Result<(), CliFailure> {
+    let editor = authoring::preferred_editor().ok_or_else(|| {
+        CliFailure::new(
+            EXIT_USAGE,
+            "editor_unset",
+            "no editor configured; set VISUAL or EDITOR, or use plan export, edit the file, and plan import",
+        )
+    })?;
+    let current = fetch_plan(session, feature_id, None)?;
+    let read_revision = current.plan.revision;
+
+    let scratch = tempfile::tempdir()
+        .map_err(|error| CliFailure::new(EXIT_INTERNAL, "scratch_failed", error.to_string()))?;
+    let path = authoring::scratch_path(scratch.path(), feature_id, read_revision.get());
+    let document = serde_json::to_string_pretty(&current.plan)
+        .map_err(|error| CliFailure::new(EXIT_INTERNAL, "encode_failed", error.to_string()))?;
+    fs::write(&path, format!("{document}\n"))
+        .map_err(|error| CliFailure::new(EXIT_INTERNAL, "scratch_failed", error.to_string()))?;
+
+    if !authoring::open_in_editor(&editor, &path).map_err(|error| {
+        CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "editor_failed",
+            format!("could not run {}: {error}", editor.to_string_lossy()),
+        )
+    })? {
+        return Err(CliFailure::new(
+            EXIT_USAGE,
+            "editor_failed",
+            "the editor exited with an error; nothing was imported",
+        ));
+    }
+
+    let edited = load_plan(&path)?;
+    if let Err(error) = edited.validate() {
+        return Err(CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "invalid_plan",
+            format!("the edited plan is not valid, so nothing was imported: {error}"),
+        ));
+    }
+    if edited == current.plan {
+        return Err(CliFailure::new(
+            EXIT_USAGE,
+            "unchanged",
+            format!(
+                "revision {} was not changed, so no revision was appended",
+                read_revision.get()
+            ),
+        ));
+    }
+
+    let next = Revision::new(read_revision.get() + 1).map_err(|error| {
+        CliFailure::new(EXIT_ACTION_REQUIRED, "invalid_revision", error.to_string())
+    })?;
+    let plan = authoring::as_next_revision(edited, next);
+    // Imported against the revision that was read, not whatever is newest now. If something
+    // appended while the editor was open, the daemon refuses this as a conflict rather than
+    // silently rebasing edits onto a revision the author never saw.
+    let data = send(session, Command::ImportPlan { plan })?;
+    output_data(data, json_output, out)
 }
 
 fn load_plan(path: &Path) -> Result<FeaturePlan, CliFailure> {
@@ -1541,22 +1765,52 @@ fn output_data(
     .map_err(output_error)
 }
 
+/// Renders a plan for review, not just for counting.
+///
+/// Approving a plan means agreeing to what it will publish, so the review has to show the work
+/// itself: every phase, every task, what each one waits for and at which milestone, and what it
+/// claims will prove it is done. A summary of counts is not something anyone can approve.
 fn output_plan(out: &mut impl Write, plan: &PlanView) -> io::Result<()> {
+    let tasks: usize = plan.plan.phases.iter().map(|phase| phase.tasks.len()).sum();
     writeln!(
         out,
-        "Feature: {}\nRevision: {}\nState: {}\nTarget: {}\nGoal: {}\nPhases: {}\nTasks: {}",
+        "Feature: {}\nRevision: {} ({})\nTarget:  {}\nGoal:    {}\n{} phase(s), {tasks} task(s)",
         plan.plan.feature_id,
         plan.plan.revision.get(),
-        if plan.plan.sealed { "sealed" } else { "draft" },
+        if plan.plan.sealed {
+            "sealed"
+        } else {
+            "draft — seal it before any work can start"
+        },
         plan.plan.target.as_str(),
         plan.plan.goal,
         plan.plan.phases.len(),
-        plan.plan
-            .phases
-            .iter()
-            .map(|phase| phase.tasks.len())
-            .sum::<usize>()
-    )
+    )?;
+    for phase in &plan.plan.phases {
+        writeln!(out, "\n{} ({})", phase.name, phase.id)?;
+        for task in &phase.tasks {
+            writeln!(out, "  {}\n    {}", task.name, task.id)?;
+            for (prerequisite, milestone) in &task.dependencies {
+                // The milestone is the whole point of a dependency here: waiting for a
+                // prerequisite to be captured groups the work into one release, while waiting for
+                // it to be published holds this task back until the target actually moved.
+                writeln!(
+                    out,
+                    "    waits for {prerequisite} to be {}",
+                    match milestone {
+                        TargetMilestone::Captured => "captured",
+                        TargetMilestone::DevelopmentAvailable =>
+                            "available on the development branch",
+                        TargetMilestone::TargetPublished => "published to the target",
+                    }
+                )?;
+            }
+            for check in &task.acceptance_checks {
+                writeln!(out, "    done when: {}", check.description)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn output_plan_history(out: &mut impl Write, plans: &[PlanView]) -> io::Result<()> {

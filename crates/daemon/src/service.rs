@@ -75,6 +75,12 @@ impl ServicePaths {
 /// ask a question whose answer is almost always "nothing" costs battery for no benefit.
 const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How many units one pass may publish.
+///
+/// A bound rather than a throughput target: a backlog that accumulated over a long offline period
+/// should drain steadily across passes instead of becoming a burst of simultaneous pushes.
+const RELEASE_CONCURRENCY_LIMIT: usize = 4;
+
 pub struct LocalService {
     owner: ServiceOwner,
     store: Arc<Mutex<Store>>,
@@ -118,6 +124,8 @@ impl LocalService {
     fn spawn_maintenance(&self) -> thread::JoinHandle<()> {
         let store = Arc::clone(&self.store);
         let shutdown = self.shutdown.clone();
+        let managed_root = Arc::clone(&self.managed_root);
+        let release_root = Arc::clone(&self.release_root);
         let interval = MAINTENANCE_INTERVAL;
         let mut maintenance = crate::maintenance::Maintenance::new(
             shutdown.clone(),
@@ -137,6 +145,20 @@ impl LocalService {
                     // A maintenance failure is never fatal: the next pass tries again, and the
                     // state it would have written is still discoverable from what is durable.
                     let _ = maintenance.tick(&mut store, std::time::Instant::now(), now, seed);
+                    // The pass that notices a slot is due is the same one that acts on it. Without
+                    // this a schedule is only ever a record of intent, and publishing still waits
+                    // for someone to type a command.
+                    let worker = crate::release::ReleaseWorker::new(
+                        managed_root.as_path(),
+                        release_root.as_path(),
+                        crate::SERVICE_NAME,
+                    );
+                    let _ = maintenance.release_due_units(
+                        &mut store,
+                        &worker,
+                        now,
+                        RELEASE_CONCURRENCY_LIMIT,
+                    );
                 }
             }
         })

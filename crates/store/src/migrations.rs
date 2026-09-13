@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 14;
+pub const STORAGE_SCHEMA_VERSION: u32 = 15;
 
 struct Migration {
     version: u32,
@@ -539,6 +539,26 @@ const MIGRATIONS: &[Migration] = &[
 
         CREATE INDEX idx_schedule_slots_due
             ON schedule_slots(repository_id, selected_at_unix_ms);
+        "#,
+    },
+    Migration {
+        version: 15,
+        sql: r#"
+        -- Scheduling policy changes are versioned independently from publication policy. A slot
+        -- records the revision that selected it, so changing future hours never rewrites the
+        -- already-authorized release time of existing work.
+        CREATE TABLE repository_schedule_policies (
+            repository_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision > 0),
+            policy_json TEXT NOT NULL CHECK (json_valid(policy_json)),
+            created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            PRIMARY KEY (repository_id, revision),
+            FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+        );
+
+        CREATE UNIQUE INDEX idx_repository_schedule_policy_active
+            ON repository_schedule_policies(repository_id) WHERE active = 1;
         "#,
     },
 ];

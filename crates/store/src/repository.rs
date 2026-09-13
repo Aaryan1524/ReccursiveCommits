@@ -1,7 +1,8 @@
 use std::str::FromStr;
 
 use reccursive_core::{
-    PolicyError, PublicationMode, RepositoryId, RepositoryPolicy, Revision, TargetRef,
+    PolicyError, PublicationMode, RepositoryId, RepositoryPolicy, Revision, SchedulePolicy,
+    TargetRef,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -65,7 +66,120 @@ pub struct StoredRepository {
     pub active_policy: RepositoryPolicy,
 }
 
+/// One immutable revision of a repository's release-time policy.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredSchedulePolicy {
+    pub repository_id: RepositoryId,
+    pub revision: Revision,
+    pub policy: SchedulePolicy,
+    pub created_at_unix_ms: i64,
+}
+
 impl Store {
+    /// Adds and activates a validated scheduling-policy revision.
+    ///
+    /// Activating a later revision changes future selection only; existing slots retain their
+    /// recorded policy revision until an explicit recalculation in P4-T03.
+    pub fn activate_schedule_policy(
+        &mut self,
+        policy: &StoredSchedulePolicy,
+    ) -> Result<(), StoreError> {
+        if policy.created_at_unix_ms < 0 {
+            return Err(StoreError::InvalidData(
+                "schedule policy timestamp must not be negative".into(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM repositories WHERE id = ?1)",
+            [policy.repository_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::InvalidData(format!(
+                "repository {} does not exist",
+                policy.repository_id
+            )));
+        }
+        let current: Option<u32> = transaction
+            .query_row(
+                "SELECT revision FROM repository_schedule_policies
+                 WHERE repository_id = ?1 AND active = 1",
+                [policy.repository_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let current = current
+            .map(Revision::new)
+            .transpose()
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let expected = match current {
+            Some(revision) => revision
+                .next()
+                .map_err(|error| StoreError::InvalidData(error.to_string()))?,
+            None => Revision::FIRST,
+        };
+        if policy.revision != expected {
+            return Err(StoreError::Conflict(format!(
+                "schedule policy revision must be {}, got {}",
+                expected.get(),
+                policy.revision.get()
+            )));
+        }
+        transaction.execute(
+            "UPDATE repository_schedule_policies SET active = 0
+             WHERE repository_id = ?1 AND active = 1",
+            [policy.repository_id.to_string()],
+        )?;
+        transaction
+            .execute(
+                "INSERT INTO repository_schedule_policies (
+                repository_id, revision, policy_json, created_at_unix_ms, active
+             ) VALUES (?1, ?2, ?3, ?4, 1)",
+                params![
+                    policy.repository_id.to_string(),
+                    policy.revision.get(),
+                    serde_json::to_string(&policy.policy)?,
+                    policy.created_at_unix_ms,
+                ],
+            )
+            .map_err(map_write_error)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Returns the active schedule policy for a repository, if it has been configured.
+    pub fn schedule_policy(
+        &self,
+        repository_id: RepositoryId,
+    ) -> Result<Option<StoredSchedulePolicy>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT revision, policy_json, created_at_unix_ms
+             FROM repository_schedule_policies
+             WHERE repository_id = ?1 AND active = 1",
+                [repository_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(revision, policy_json, created_at_unix_ms)| {
+                Ok(StoredSchedulePolicy {
+                    repository_id,
+                    revision: Revision::new(revision)
+                        .map_err(|error| StoreError::InvalidData(error.to_string()))?,
+                    policy: serde_json::from_str(&policy_json)?,
+                    created_at_unix_ms,
+                })
+            })
+            .transpose()
+    }
+
     /// Atomically stores a repository and its first active policy.
     pub fn enroll_repository(
         &mut self,
@@ -305,6 +419,12 @@ fn map_write_error(error: rusqlite::Error) -> StoreError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use reccursive_core::{
+        DailyReleaseRange, DailyTime, DailyWindow, IanaTimeZone, MissedWindowBehavior, Weekday,
+    };
+
     use super::*;
     use tempfile::tempdir;
 
@@ -327,6 +447,29 @@ mod tests {
         )
         .unwrap();
         (registration, policy)
+    }
+
+    fn schedule_policy(repository_id: RepositoryId, revision: Revision) -> StoredSchedulePolicy {
+        StoredSchedulePolicy {
+            repository_id,
+            revision,
+            policy: SchedulePolicy::new(
+                IanaTimeZone::new("America/New_York").unwrap(),
+                BTreeSet::from([Weekday::Monday, Weekday::Tuesday]),
+                vec![
+                    DailyWindow::new(
+                        DailyTime::new(9, 0).unwrap(),
+                        DailyTime::new(17, 0).unwrap(),
+                    )
+                    .unwrap(),
+                ],
+                DailyReleaseRange::new(1, 2).unwrap(),
+                60,
+                MissedWindowBehavior::RescheduleForward,
+            )
+            .unwrap(),
+            created_at_unix_ms: 1_780_000_000_000 + i64::from(revision.get()),
+        }
     }
 
     #[test]
@@ -373,6 +516,32 @@ mod tests {
                 .active_policy,
             next
         );
+    }
+
+    #[test]
+    fn schedule_policy_activation_is_versioned_and_keeps_the_active_revision() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (registration, policy) = fixture();
+        store.enroll_repository(&registration, &policy).unwrap();
+        let first = schedule_policy(registration.id, Revision::FIRST);
+        store.activate_schedule_policy(&first).unwrap();
+        assert_eq!(
+            store.schedule_policy(registration.id).unwrap(),
+            Some(first.clone())
+        );
+
+        let second = schedule_policy(registration.id, Revision::new(2).unwrap());
+        store.activate_schedule_policy(&second).unwrap();
+        assert_eq!(
+            store.schedule_policy(registration.id).unwrap(),
+            Some(second)
+        );
+
+        let skipped = schedule_policy(registration.id, Revision::new(4).unwrap());
+        assert!(matches!(
+            store.activate_schedule_policy(&skipped),
+            Err(StoreError::Conflict(_))
+        ));
     }
 
     #[test]

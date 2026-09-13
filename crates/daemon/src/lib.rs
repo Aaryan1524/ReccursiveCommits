@@ -1,5 +1,6 @@
 //! Background service boundary.
 
+pub mod lifecycle;
 pub mod scheduler;
 mod service;
 

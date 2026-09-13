@@ -184,4 +184,36 @@ grep -q '"type":"schedule_recalculated"' <<<"$recalculated_json" || \
 grep -q "\"withdrawn\":\[\"$unit_id\"\]" <<<"$recalculated_json" || \
   fail "repository recalculation did not report the withdrawn unit: $recalculated_json"
 
-printf 'PASS release-unit creation, policy activation, deterministic scheduling, restart-stable slots, and adaptive recalculation\n'
+# The repository-wide recalculation above withdrew the selection, so give the unit a live one
+# again before exercising the controls that report and act on it.
+current_json="$(cli schedule unit "$unit_id" --package-id "$package_id" --revision 1 --seed 777)"
+current_at="$(json_number selected_at_unix_ms <<<"$current_json")"
+[[ -n "$current_at" ]] || fail "could not reschedule the unit after recalculation"
+
+# Schedule controls. Preview never changes anything; pause and resume are durable decisions.
+preview_json="$(cli schedule preview "$repository_id")"
+grep -q '"type":"schedule_preview"' <<<"$preview_json" || fail "preview did not return the expected payload"
+preview_at="$(json_number selected_at_unix_ms <<<"$preview_json")"
+[[ "$preview_at" == "$current_at" ]] || \
+  fail "preview reported a different time than the live selection: $preview_at vs $current_at"
+
+cli schedule pause "$repository_id" --reason "investigating" >/dev/null
+paused_preview="$(cli schedule preview "$repository_id")"
+grep -q '"paused":"investigating"' <<<"$paused_preview" || \
+  fail "a paused repository did not report why: $paused_preview"
+due_while_paused="$(cli schedule due --concurrency-limit 10)"
+grep -q '"units":\[\]' <<<"$due_while_paused" || \
+  fail "a paused repository still handed out due work: $due_while_paused"
+
+cli schedule resume "$repository_id" >/dev/null
+resumed_preview="$(cli schedule preview "$repository_id")"
+grep -q '"paused":null' <<<"$resumed_preview" || fail "resume did not clear the pause"
+
+# Release-now moves the unit to the front of the queue and it becomes claimable.
+release_now_json="$(cli schedule release-now "$unit_id")"
+grep -q '"type":"schedule_slot"' <<<"$release_now_json" || fail "release-now did not return a slot"
+due_json="$(cli schedule due --concurrency-limit 10)"
+grep -q "$unit_id" <<<"$due_json" || \
+  fail "a unit released now did not become due: $due_json"
+
+printf 'PASS release-unit creation, policy activation, deterministic scheduling, restart-stable slots, adaptive recalculation, and schedule controls\n'

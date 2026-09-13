@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 17;
+pub const STORAGE_SCHEMA_VERSION: u32 = 18;
 
 struct Migration {
     version: u32,
@@ -663,6 +663,19 @@ const MIGRATIONS: &[Migration] = &[
 
         CREATE UNIQUE INDEX idx_repository_schedule_overrides_active
             ON repository_schedule_overrides(repository_id) WHERE active = 1;
+        "#,
+    },
+    Migration {
+        version: 18,
+        sql: r#"
+        -- Pausing is a durable, explained decision rather than a process-lifetime flag: a daemon
+        -- restart must not quietly resume publishing that an operator deliberately stopped.
+        CREATE TABLE repository_pauses (
+            repository_id TEXT PRIMARY KEY,
+            reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+            paused_at_unix_ms INTEGER NOT NULL CHECK (paused_at_unix_ms >= 0),
+            FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+        );
         "#,
     },
 ];

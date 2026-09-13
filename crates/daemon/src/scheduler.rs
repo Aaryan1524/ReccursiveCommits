@@ -99,17 +99,27 @@ impl Scheduler {
         let mut per_repository: Vec<Vec<DueUnit>> = Vec::new();
         for repository in store.repositories()? {
             let repository_id = repository.registration.id;
-            let mut due: Vec<DueUnit> = store
-                .overdue_schedule_slots(repository_id, now_unix_ms)?
-                .into_iter()
-                .map(|slot| DueUnit {
+            // Pausing governs what is started. Work already transmitted keeps its own recovery
+            // path; this only declines to hand out anything new.
+            if store.repository_pause(repository_id)?.is_some() {
+                continue;
+            }
+            let mut due = Vec::new();
+            for slot in store.overdue_schedule_slots(repository_id, now_unix_ms)? {
+                // A unit is claimable only while every one of its tasks is still merely scheduled.
+                // Anything further along is already owned by an attempt, and handing it out again
+                // would be a second publisher for the same work.
+                if !Self::is_claimable(store, slot.release_unit_id)? {
+                    continue;
+                }
+                due.push(DueUnit {
                     release_unit_id: slot.release_unit_id,
                     repository_id,
                     package_id: slot.package_id,
                     package_revision: slot.package_revision,
                     selected_at_unix_ms: slot.selected_at_unix_ms,
-                })
-                .collect();
+                });
+            }
             due.sort_by_key(|unit| (unit.selected_at_unix_ms, unit.release_unit_id));
             if !due.is_empty() {
                 per_repository.push(due);
@@ -135,6 +145,22 @@ impl Scheduler {
             round += 1;
         }
         Ok(claimed)
+    }
+
+    /// Reports whether every task in a unit is still waiting at its selected time.
+    fn is_claimable(store: &Store, release_unit_id: ReleaseUnitId) -> Result<bool, SchedulerError> {
+        let Some(unit) = store.release_unit(release_unit_id)? else {
+            return Ok(false);
+        };
+        for task_id in &unit.task_ids {
+            let Some(task) = store.task(unit.feature_id, unit.plan_revision, *task_id)? else {
+                return Ok(false);
+            };
+            if task.state.status() != reccursive_core::TaskStatus::Scheduled {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Applies a repository's missed-window policy to every slot whose time has already passed.
@@ -653,6 +679,105 @@ mod tests {
             weekday, 3,
             "the override must constrain selection to Wednesday even though the policy allows \
              every day"
+        );
+    }
+
+    #[test]
+    fn pausing_stops_new_work_without_disturbing_a_transmitted_push() {
+        let now = 1_800_000_000_000;
+        let (mut store, repository_id, units, feature_id, tasks) =
+            overdue_fixture(MissedWindowBehavior::RescheduleForward, 2, now);
+
+        // One unit's push is already on the wire: its outcome exists on the remote whether or not
+        // anyone pauses anything, and it must keep its own recovery path.
+        for status in [
+            TaskStatus::Reconciling,
+            TaskStatus::Verifying,
+            TaskStatus::CommitPrepared,
+            TaskStatus::PushPending,
+        ] {
+            store
+                .advance_task(feature_id, Revision::FIRST, tasks[0], status, None, now)
+                .unwrap();
+        }
+        assert!(
+            store
+                .task(feature_id, Revision::FIRST, tasks[0])
+                .unwrap()
+                .unwrap()
+                .state
+                .status()
+                .may_have_reached_remote()
+        );
+
+        assert_eq!(Scheduler::due_units(&store, now, 10).unwrap().len(), 1);
+        store
+            .pause_repository(repository_id, "investigating a failure", now)
+            .unwrap();
+
+        // Paused: nothing new is handed out.
+        assert!(
+            Scheduler::due_units(&store, now, 10).unwrap().is_empty(),
+            "a paused repository must not hand out new work"
+        );
+        // The transmitted push is untouched, not rolled back or re-queued.
+        assert_eq!(
+            store
+                .task(feature_id, Revision::FIRST, tasks[0])
+                .unwrap()
+                .unwrap()
+                .state
+                .status(),
+            TaskStatus::PushPending
+        );
+        assert_eq!(
+            store
+                .repository_pause(repository_id)
+                .unwrap()
+                .unwrap()
+                .reason,
+            "investigating a failure"
+        );
+
+        // Resuming restores exactly what was pending before.
+        assert!(store.resume_repository(repository_id).unwrap());
+        let resumed = Scheduler::due_units(&store, now, 10).unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].release_unit_id, units[1]);
+    }
+
+    #[test]
+    fn releasing_now_still_refuses_a_unit_whose_prerequisite_has_not_arrived() {
+        let now = 1_800_000_000_000;
+        let (mut store, _, units, feature_id, tasks) =
+            overdue_fixture(MissedWindowBehavior::RescheduleForward, 1, now);
+
+        // A unit with satisfied prerequisites moves to the front of the queue on request.
+        let released = store.release_unit_now(units[0], now).unwrap();
+        assert_eq!(released.selected_at_unix_ms, now);
+
+        // Now make the unit ineligible the way a real prerequisite failure would.
+        store
+            .advance_task(
+                feature_id,
+                Revision::FIRST,
+                tasks[0],
+                TaskStatus::Blocked,
+                Some(
+                    reccursive_core::StateReason::new(
+                        reccursive_core::ReasonCode::ValidationFailed,
+                        "a check failed",
+                    )
+                    .unwrap(),
+                ),
+                now,
+            )
+            .unwrap();
+
+        let refused = store.release_unit_now(units[0], now + 1);
+        assert!(
+            refused.is_err(),
+            "release-now must not bypass the eligibility rules: {refused:?}"
         );
     }
 

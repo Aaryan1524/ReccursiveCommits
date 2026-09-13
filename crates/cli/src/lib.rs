@@ -225,6 +225,18 @@ enum ScheduleCommand {
         #[arg(long, default_value_t = 10, value_parser = parse_event_limit)]
         concurrency_limit: usize,
     },
+    /// Stop a repository from starting new releases until it is resumed.
+    Pause {
+        repository_id: RepositoryId,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Resume a paused repository.
+    Resume { repository_id: RepositoryId },
+    /// Move one unit's release time to now, subject to the same eligibility rules.
+    ReleaseNow { release_unit_id: ReleaseUnitId },
+    /// Show a repository's upcoming release times without changing any of them.
+    Preview { repository_id: RepositoryId },
 }
 
 #[derive(Debug, Subcommand)]
@@ -620,6 +632,31 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 )?;
                 output_data(data, cli.json, stdout)
             }
+            ScheduleCommand::Pause {
+                repository_id,
+                reason,
+            } => {
+                let data = send(
+                    &paths,
+                    Command::PauseRepository {
+                        repository_id,
+                        reason,
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::Resume { repository_id } => {
+                let data = send(&paths, Command::ResumeRepository { repository_id })?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::ReleaseNow { release_unit_id } => {
+                let data = send(&paths, Command::ReleaseUnitNow { release_unit_id })?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::Preview { repository_id } => {
+                let data = send(&paths, Command::PreviewSchedule { repository_id })?;
+                output_data(data, cli.json, stdout)
+            }
             ScheduleCommand::SetOverride {
                 repository_id,
                 file,
@@ -1006,6 +1043,25 @@ fn output_data(
             revision.get()
         ),
         ResponseData::DueUnits { units } => output_due_units(out, &units),
+        ResponseData::RepositoryPaused {
+            repository_id,
+            reason,
+        } => writeln!(out, "Paused {repository_id}: {reason}"),
+        ResponseData::RepositoryResumed {
+            repository_id,
+            was_paused,
+        } => writeln!(
+            out,
+            "{repository_id} is running{}",
+            if was_paused {
+                " again"
+            } else {
+                " (was not paused)"
+            }
+        ),
+        ResponseData::SchedulePreview { slots, paused } => {
+            output_schedule_preview(out, &slots, paused.as_deref())
+        }
         ResponseData::MissedWindowsReconciled { outcome } => writeln!(
             out,
             "Released {} overdue unit(s) now, moved {} forward, left {} in flight",
@@ -1128,6 +1184,27 @@ fn output_schedule_policy(out: &mut impl Write, policy: &SchedulePolicyView) -> 
         policy.policy.daily_releases.maximum,
         policy.policy.minimum_spacing_minutes,
     )
+}
+
+fn output_schedule_preview(
+    out: &mut impl Write,
+    slots: &[ScheduleSlotView],
+    paused: Option<&str>,
+) -> io::Result<()> {
+    if let Some(reason) = paused {
+        writeln!(out, "Paused: {reason}")?;
+    }
+    if slots.is_empty() {
+        return writeln!(out, "No release times are scheduled.");
+    }
+    for slot in slots {
+        writeln!(
+            out,
+            "{} · package {} · {} ({})",
+            slot.release_unit_id, slot.package_id, slot.selected_at_unix_ms, slot.timezone
+        )?;
+    }
+    Ok(())
 }
 
 fn output_due_units(out: &mut impl Write, units: &[DueUnitView]) -> io::Result<()> {

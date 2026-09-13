@@ -13,8 +13,8 @@ pub use reccursive_core::{
 use serde::{Deserialize, Serialize};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 7 adds repository overrides and fair due-unit listing.
-pub const API_VERSION: u16 = 7;
+/// Local API protocol version. Version 8 adds pause, resume, release-now, and preview.
+pub const API_VERSION: u16 = 8;
 
 /// Maximum encoded request or response size accepted by the local transport.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -80,6 +80,12 @@ impl RequestEnvelope {
             Command::CancelTask(request) => request.validate(),
             Command::ReleasePackage(request) => request.validate(),
             Command::CreateReleaseUnit(request) => request.validate(),
+            Command::PauseRepository { reason, .. }
+                if reason.trim().is_empty() || reason.len() > 256 =>
+            {
+                Err(ProtocolValidationError::InvalidLifecycleMessage)
+            }
+            Command::PauseRepository { .. } => Ok(()),
             Command::ListReleaseAttempts { limit, .. } if !(1..=1_000).contains(limit) => {
                 Err(ProtocolValidationError::InvalidAttemptLimit)
             }
@@ -116,6 +122,9 @@ impl RequestEnvelope {
             | Command::RecalculateSchedule { .. }
             | Command::ReconcileMissedWindows { .. }
             | Command::SetScheduleOverride { .. }
+            | Command::ResumeRepository { .. }
+            | Command::ReleaseUnitNow { .. }
+            | Command::PreviewSchedule { .. }
             | Command::GetReleaseAttempt { .. }
             | Command::ListReleaseAttempts { .. }
             | Command::AuditQueue
@@ -197,6 +206,23 @@ pub enum Command {
     /// List units due for release now, fairly across repositories and within a global limit.
     ListDueUnits {
         concurrency_limit: usize,
+    },
+    /// Stop a repository from handing out new release work until it is resumed.
+    PauseRepository {
+        repository_id: RepositoryId,
+        reason: String,
+    },
+    /// Resume a paused repository.
+    ResumeRepository {
+        repository_id: RepositoryId,
+    },
+    /// Move one unit's release time to now, subject to the same eligibility rules.
+    ReleaseUnitNow {
+        release_unit_id: ReleaseUnitId,
+    },
+    /// Show a repository's upcoming release times without changing any of them.
+    PreviewSchedule {
+        repository_id: RepositoryId,
     },
     /// Inspect one durable publication attempt.
     GetReleaseAttempt {
@@ -714,6 +740,18 @@ pub enum ResponseData {
     },
     DueUnits {
         units: Vec<DueUnitView>,
+    },
+    RepositoryPaused {
+        repository_id: RepositoryId,
+        reason: String,
+    },
+    RepositoryResumed {
+        repository_id: RepositoryId,
+        was_paused: bool,
+    },
+    SchedulePreview {
+        slots: Vec<ScheduleSlotView>,
+        paused: Option<String>,
     },
     QueueAudit {
         audit: QueueAuditView,

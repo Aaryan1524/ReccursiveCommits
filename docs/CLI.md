@@ -40,6 +40,10 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state schedule recalculate r
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule catch-up repo_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule set-override repo_<uuid> schedule-override.json
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule due --concurrency-limit 10
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule preview repo_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule pause repo_<uuid> --reason "investigating a failure"
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule resume repo_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule release-now unit_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue audit
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue export /absolute/path/to/queue-backup
 ```
@@ -163,6 +167,24 @@ any repository gets a second, so a repository with a deep queue, or one that kee
 failing and retrying, delays only itself. `--concurrency-limit` bounds how much work
 is listed at once, which is what keeps a large backlog from becoming a burst of
 simultaneous pushes.
+
+`schedule preview` reports a repository's upcoming release times, and whether it is
+paused, without changing anything.
+
+`schedule pause` stops a repository from *starting* new releases and records why;
+`schedule resume` lifts it. The distinction matters: pausing governs what begins,
+never what is already running. An attempt that has transmitted a push has an
+outcome on the remote that still has to be resolved, so pausing leaves it alone
+rather than orphaning it — and a unit is only ever handed out as due while every
+one of its tasks is still merely scheduled, so nothing an attempt already owns can
+be claimed twice. The pause is durable, so a daemon restart does not quietly resume
+publishing an operator deliberately stopped.
+
+`schedule release-now` moves one unit's release time to the present. It overrides
+the schedule, not the rules: the same eligibility checks apply, so a unit whose
+prerequisites have not reached their required milestone is refused rather than
+released early. To reschedule rather than release, use `schedule withdraw`
+followed by `schedule unit`.
 
 Enrollment refuses a second checkout of the same canonical remote that targets the
 same branch. Two checkouts publishing to one ref are two writers racing for it, so

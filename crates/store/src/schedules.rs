@@ -28,6 +28,13 @@ pub struct ScheduleSlot {
     pub created_at_unix_ms: i64,
 }
 
+/// Why a repository is currently not handing out release work.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryPause {
+    pub reason: String,
+    pub paused_at_unix_ms: i64,
+}
+
 /// What an adaptive recalculation actually changed.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScheduleRecalculation {
@@ -289,6 +296,93 @@ impl Store {
             }
         }
         Ok(outcome)
+    }
+
+    /// Stops a repository from handing out due work until it is explicitly resumed.
+    ///
+    /// Pausing governs what is *started*, never what is already running. An attempt that has
+    /// transmitted a push has an outcome on the remote that must still be resolved, and pausing
+    /// must not orphan it — so this records the decision and leaves in-flight attempts alone.
+    pub fn pause_repository(
+        &mut self,
+        repository_id: reccursive_core::RepositoryId,
+        reason: &str,
+        now_unix_ms: i64,
+    ) -> Result<(), StoreError> {
+        if reason.trim().is_empty() || reason.len() > 256 {
+            return Err(StoreError::InvalidData(
+                "pause reason must be a short non-empty explanation".into(),
+            ));
+        }
+        self.connection
+            .execute(
+                "INSERT INTO repository_pauses (repository_id, reason, paused_at_unix_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(repository_id) DO UPDATE SET
+                     reason = excluded.reason,
+                     paused_at_unix_ms = excluded.paused_at_unix_ms",
+                params![repository_id.to_string(), reason, now_unix_ms],
+            )
+            .map_err(map_schedule_write_error)?;
+        Ok(())
+    }
+
+    /// Resumes a paused repository. Resuming one that is not paused is not an error.
+    pub fn resume_repository(
+        &mut self,
+        repository_id: reccursive_core::RepositoryId,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "DELETE FROM repository_pauses WHERE repository_id = ?1",
+            [repository_id.to_string()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Returns why a repository is paused, if it is.
+    pub fn repository_pause(
+        &self,
+        repository_id: reccursive_core::RepositoryId,
+    ) -> Result<Option<RepositoryPause>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT reason, paused_at_unix_ms FROM repository_pauses WHERE repository_id = ?1",
+                [repository_id.to_string()],
+                |row| {
+                    Ok(RepositoryPause {
+                        reason: row.get(0)?,
+                        paused_at_unix_ms: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Moves a unit's selected time to now so it is due immediately.
+    ///
+    /// This is a schedule override, not a dependency override: the same eligibility rules that
+    /// govern an ordinary selection are applied again, so a unit whose prerequisites have not
+    /// reached their required milestone is refused rather than released early.
+    pub fn release_unit_now(
+        &mut self,
+        release_unit_id: ReleaseUnitId,
+        now_unix_ms: i64,
+    ) -> Result<ScheduleSlot, StoreError> {
+        let existing = self.schedule_slot(release_unit_id)?.ok_or_else(|| {
+            StoreError::InvalidData("release unit has no live schedule slot".into())
+        })?;
+        self.invalidate_schedule_slot(release_unit_id, "released on request", now_unix_ms)?;
+        self.persist_schedule_slot(&NewScheduleSlot {
+            release_unit_id,
+            package_id: existing.package_id,
+            package_revision: existing.package_revision,
+            policy_revision: existing.policy_revision,
+            timezone: existing.timezone,
+            eligible_at_unix_ms: now_unix_ms,
+            selected_at_unix_ms: now_unix_ms,
+            created_at_unix_ms: now_unix_ms,
+        })
     }
 
     /// Lists live slots whose selected time has already passed, oldest first.

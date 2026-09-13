@@ -20,19 +20,20 @@ use reccursive_capture::{
 use reccursive_protocol::{
     ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest, Command,
     CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
-    EventSeverityView, EventView, IntegrationHealthView, MissedWindowView, PackageView, PlanView,
-    ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView, ReasonCode,
-    ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy,
-    RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision,
-    SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest,
-    SetSchedulePolicyRequest, StateReason, TaskCancellationView, TaskStatus, TransportError,
-    WorkspacePrerequisiteView, WorkspaceView,
+    EventSeverityView, EventView, IdempotencyKey, IntegrationHealthView, MissedWindowView,
+    PackageView, PlanView, ProtocolValidationError, QueueAuditView, QueueExportView,
+    QueueRecoveryIssueView, ReasonCode, ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView,
+    RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData,
+    ResponseEnvelope, Revision, SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView,
+    ScheduleUnitRequest, SetSchedulePolicyRequest, StateReason, TaskCancellationView, TaskStatus,
+    TransportError, WorkspacePrerequisiteView, WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
-    DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, RepositoryRegistration,
-    SnapshotRecord, SnapshotRecoveryIssue, Store, StoreError, StoredEvent, StoredPlan,
-    StoredRepository, StoredSchedulePolicy, TrustedCheck, ValidationEvidence, WorkspaceRecord,
+    DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, IdempotencyClaim, NewEvent,
+    RepositoryRegistration, SnapshotRecord, SnapshotRecoveryIssue, Store, StoreError, StoredEvent,
+    StoredPlan, StoredRepository, StoredSchedulePolicy, TrustedCheck, ValidationEvidence,
+    WorkspaceRecord,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -374,8 +375,12 @@ fn handle_connection(
     } else {
         let request_id = request.request_id;
         let command_name = command_name(&request.command);
-        let result = dispatch(
+        let result = execute_command(
             request.command,
+            KeyedRequest {
+                idempotency_key: request.idempotency_key.as_ref(),
+                command_name,
+            },
             store,
             managed_root,
             workspace_root,
@@ -392,6 +397,120 @@ fn handle_connection(
     };
     write_message(&mut stream, &response)?;
     Ok(())
+}
+
+/// What the caller said about repeating this request, alongside the name used to record it.
+struct KeyedRequest<'a> {
+    idempotency_key: Option<&'a IdempotencyKey>,
+    command_name: &'static str,
+}
+
+/// Carries out one command, replaying an earlier result when the caller named a repeated intent.
+///
+/// Without a key this is `dispatch` and nothing more. With one, the key is claimed *before* the
+/// command runs: a duplicate arriving during the first attempt is told to wait rather than allowed
+/// to act alongside it, and a duplicate arriving afterwards is handed the original outcome instead
+/// of a second one.
+fn execute_command(
+    command: Command,
+    request: KeyedRequest<'_>,
+    store: &Mutex<Store>,
+    managed_root: &Path,
+    workspace_root: &Path,
+    release_root: &Path,
+    package_root: &Path,
+) -> Result<ResponseData, ApiError> {
+    let KeyedRequest {
+        idempotency_key,
+        command_name,
+    } = request;
+    // A key on a query is accepted and ignored: repeating a question is already safe, and
+    // recording its answer would freeze that answer for every later use of the key.
+    let Some(key) = idempotency_key.filter(|_| command.changes_state()) else {
+        return dispatch(
+            command,
+            store,
+            managed_root,
+            workspace_root,
+            release_root,
+            package_root,
+        );
+    };
+
+    let fingerprint = command.fingerprint();
+    let may_reach_remote = command.may_reach_remote();
+    let claimed_at = current_unix_ms()?;
+    let claim = lock_store(store)?
+        .claim_idempotency_key(key.as_str(), command_name, &fingerprint, claimed_at)
+        .map_err(store_api_error)?;
+
+    match claim {
+        IdempotencyClaim::Settled { outcome } => return replay_outcome(key, &outcome),
+        IdempotencyClaim::InProgress => {
+            return Err(ApiError::new(
+                ApiErrorCode::TemporarilyUnavailable,
+                format!(
+                    "idempotency key {key} names a request that is still running;                      retry to collect its result"
+                ),
+                true,
+            ));
+        }
+        IdempotencyClaim::Mismatched { command: earlier } => {
+            return Err(ApiError::new(
+                ApiErrorCode::Conflict,
+                format!("idempotency key {key} was already used for a different {earlier} request"),
+                false,
+            ));
+        }
+        IdempotencyClaim::Claimed => {}
+    }
+
+    let result = dispatch(
+        command,
+        store,
+        managed_root,
+        workspace_root,
+        release_root,
+        package_root,
+    );
+
+    // A failure that provably never left this machine gives the key back, so a real retry runs. A
+    // failure anywhere a push could have reached the remote keeps it: the error alone does not say
+    // whether the remote moved, and the durable attempt record is where that is settled.
+    let release = match &result {
+        Ok(_) => false,
+        Err(error) => error.retryable && !may_reach_remote,
+    };
+    let mut store = lock_store(store)?;
+    if release {
+        store
+            .release_idempotency_key(key.as_str())
+            .map_err(store_api_error)?;
+        return result;
+    }
+    let outcome = serde_json::to_string(&result).map_err(|error| {
+        ApiError::new(
+            ApiErrorCode::Internal,
+            format!("the result of {command_name} could not be recorded for replay: {error}"),
+            false,
+        )
+    })?;
+    let settled_at = current_unix_ms()?;
+    store
+        .settle_idempotency_key(key.as_str(), &outcome, settled_at)
+        .map_err(store_api_error)?;
+    result
+}
+
+/// Returns what the first request carrying this key returned.
+fn replay_outcome(key: &IdempotencyKey, outcome: &str) -> Result<ResponseData, ApiError> {
+    serde_json::from_str::<Result<ResponseData, ApiError>>(outcome).map_err(|error| {
+        ApiError::new(
+            ApiErrorCode::Internal,
+            format!("the recorded result for idempotency key {key} is unreadable: {error}"),
+            false,
+        )
+    })?
 }
 
 fn dispatch(

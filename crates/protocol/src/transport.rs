@@ -34,7 +34,22 @@ impl LocalClient {
         socket_path: impl AsRef<Path>,
         command: crate::Command,
     ) -> Result<ResponseEnvelope, TransportError> {
-        let request = RequestEnvelope::new(self.auth_token.clone(), command);
+        self.send_with_key(socket_path, command, None)
+    }
+
+    /// Sends a command, optionally naming the intent it belongs to.
+    ///
+    /// The key is the caller's, not the transport's: a retry only returns the earlier result if
+    /// the same key is deliberately sent again. `request_id` cannot serve this purpose — it is
+    /// generated per transmission, so a retry carries a new one by construction.
+    pub fn send_with_key(
+        &self,
+        socket_path: impl AsRef<Path>,
+        command: crate::Command,
+        idempotency_key: Option<crate::IdempotencyKey>,
+    ) -> Result<ResponseEnvelope, TransportError> {
+        let mut request = RequestEnvelope::new(self.auth_token.clone(), command);
+        request.idempotency_key = idempotency_key;
         let expected_request_id = request.request_id;
         let mut stream = UnixStream::connect(socket_path)?;
         write_message(&mut stream, &request)?;

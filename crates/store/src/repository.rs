@@ -290,7 +290,8 @@ impl Store {
             .optional()?;
         if let Some(existing) = duplicate {
             return Err(StoreError::Conflict(format!(
-                "{} is already enrolled to publish {} on this remote; two checkouts must not                  publish to one branch",
+                "{} is already enrolled to publish {} on this remote; \
+                 two checkouts must not publish to one branch",
                 existing,
                 policy.target.as_str()
             )));

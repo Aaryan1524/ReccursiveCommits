@@ -11,10 +11,11 @@ pub use reccursive_core::{
     SchedulePolicyOverride, StateReason, TargetMilestone, TargetRef, TaskId, TaskStatus,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 10 adds credential and signing diagnostics.
-pub const API_VERSION: u16 = 10;
+/// Local API protocol version. Version 11 adds idempotency keys.
+pub const API_VERSION: u16 = 11;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -26,6 +27,41 @@ pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 #[must_use]
 pub const fn domain_version() -> u16 {
     reccursive_core::DOMAIN_VERSION
+}
+
+/// A client-chosen name for one intended action, reused across retries of that action.
+///
+/// Deliberately opaque to the daemon: it is compared, never interpreted. Constrained only enough
+/// that it can be a primary key and cannot be used to smuggle unbounded data into storage.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct IdempotencyKey(String);
+
+impl IdempotencyKey {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolValidationError> {
+        let value = value.into();
+        let usable = (1..=200).contains(&value.len())
+            && value.trim() == value
+            && !value.is_empty()
+            && value
+                .chars()
+                .all(|character| character.is_ascii_graphic() || character == ' ');
+        if !usable {
+            return Err(ProtocolValidationError::InvalidIdempotencyKey);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for IdempotencyKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
 }
 
 /// Installation-scoped credential. Debug output is always redacted.
@@ -55,6 +91,15 @@ pub struct RequestEnvelope {
     pub api_version: u16,
     pub request_id: RequestId,
     pub auth_token: AuthToken,
+    /// Client-chosen key making a repeated request return its first result instead of acting
+    /// twice.
+    ///
+    /// Distinct from `request_id`, which is generated per send and identifies *this*
+    /// transmission for correlation. An idempotency key identifies the *intent*, and a client
+    /// retrying after a dropped connection deliberately reuses it. Optional, because an
+    /// interactive user issuing a command by hand has no retry to protect against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<IdempotencyKey>,
     pub command: Command,
 }
 
@@ -65,6 +110,7 @@ impl RequestEnvelope {
             api_version: API_VERSION,
             request_id: RequestId::new(),
             auth_token,
+            idempotency_key: None,
             command,
         }
     }
@@ -255,6 +301,117 @@ pub enum Command {
         destination: String,
     },
     Status,
+}
+
+impl Command {
+    /// Whether repeating this command could act twice.
+    ///
+    /// Only these commands are recorded against an idempotency key. A key on a query is accepted
+    /// and ignored: repeating a question is already safe, and recording an answer would freeze it
+    /// for every later use of that key. The match is exhaustive on purpose — a command added later
+    /// must be classified deliberately rather than fall into a default.
+    #[must_use]
+    pub const fn changes_state(&self) -> bool {
+        match self {
+            Self::EnrollRepository(_)
+            | Self::ImportPlan { .. }
+            | Self::CreateWorkspace(_)
+            | Self::CapturePackage(_)
+            | Self::CancelTask(_)
+            | Self::ReleasePackage(_)
+            | Self::CreateReleaseUnit(_)
+            | Self::SetSchedulePolicy(_)
+            | Self::ScheduleUnit(_)
+            | Self::WithdrawScheduleSlot { .. }
+            | Self::RecalculateSchedule { .. }
+            | Self::ReconcileMissedWindows { .. }
+            | Self::SetScheduleOverride { .. }
+            | Self::PauseRepository { .. }
+            | Self::ResumeRepository { .. }
+            | Self::ReleaseUnitNow { .. }
+            | Self::ExportQueue { .. } => true,
+            Self::Ping
+            | Self::ListRepositories
+            | Self::ListEvents { .. }
+            | Self::GetPlan { .. }
+            | Self::PlanHistory { .. }
+            | Self::GetWorkspace { .. }
+            | Self::GetReleaseUnit { .. }
+            | Self::GetSchedulePolicy { .. }
+            | Self::GetScheduleSlot { .. }
+            | Self::ListDueUnits { .. }
+            | Self::PreviewSchedule { .. }
+            | Self::ListIntegrationHealth
+            | Self::DiagnoseRepository { .. }
+            | Self::GetReleaseAttempt { .. }
+            | Self::ListReleaseAttempts { .. }
+            | Self::GetPackage { .. }
+            | Self::AuditQueue
+            | Self::Status => false,
+        }
+    }
+
+    /// Whether carrying this command out can reach a Git remote.
+    ///
+    /// This decides what happens to an idempotency claim when the command fails. A failure that
+    /// provably never left the machine can release its claim, so a genuine retry runs. A failure
+    /// somewhere in a publication sequence cannot: the push may already have landed, and the
+    /// service has no way to know from the error alone. Those keep the claim and replay the
+    /// recorded failure, leaving the durable attempt record as the place to look.
+    #[must_use]
+    pub const fn may_reach_remote(&self) -> bool {
+        match self {
+            Self::ReleasePackage(_) => true,
+            Self::Ping
+            | Self::EnrollRepository(_)
+            | Self::ListRepositories
+            | Self::ListEvents { .. }
+            | Self::ImportPlan { .. }
+            | Self::GetPlan { .. }
+            | Self::PlanHistory { .. }
+            | Self::CreateWorkspace(_)
+            | Self::GetWorkspace { .. }
+            | Self::CapturePackage(_)
+            | Self::CancelTask(_)
+            | Self::CreateReleaseUnit(_)
+            | Self::GetReleaseUnit { .. }
+            | Self::SetSchedulePolicy(_)
+            | Self::GetSchedulePolicy { .. }
+            | Self::ScheduleUnit(_)
+            | Self::GetScheduleSlot { .. }
+            | Self::WithdrawScheduleSlot { .. }
+            | Self::RecalculateSchedule { .. }
+            | Self::ReconcileMissedWindows { .. }
+            | Self::SetScheduleOverride { .. }
+            | Self::ListDueUnits { .. }
+            | Self::PauseRepository { .. }
+            | Self::ResumeRepository { .. }
+            | Self::ReleaseUnitNow { .. }
+            | Self::PreviewSchedule { .. }
+            | Self::ListIntegrationHealth
+            | Self::DiagnoseRepository { .. }
+            | Self::GetReleaseAttempt { .. }
+            | Self::ListReleaseAttempts { .. }
+            | Self::GetPackage { .. }
+            | Self::AuditQueue
+            | Self::ExportQueue { .. }
+            | Self::Status => false,
+        }
+    }
+
+    /// A stable digest of exactly what this command asks for.
+    ///
+    /// Used to catch an idempotency key reused for a different request, which is a client bug
+    /// worth reporting rather than silently serving the wrong cached answer. Every collection in a
+    /// command payload is a `BTreeSet` or `BTreeMap`, so the serialization is ordered and the
+    /// digest is reproducible across processes.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        let encoded = serde_json::to_vec(self).unwrap_or_default();
+        let mut digest = Sha256::new();
+        digest.update(&encoded);
+        format!("{:x}", digest.finalize())
+    }
 }
 
 /// Task selection for one immutable snapshot package.
@@ -864,6 +1021,8 @@ pub enum ProtocolValidationError {
     InvalidAttemptLimit,
     #[error("release concurrency limit must be between 1 and 1000")]
     InvalidConcurrencyLimit,
+    #[error("idempotency key must be 1-200 printable characters without surrounding whitespace")]
+    InvalidIdempotencyKey,
     #[error("release unit must select between 1 and 1000 plan tasks")]
     InvalidReleaseUnitTasks,
     #[error(
@@ -980,5 +1139,76 @@ mod tests {
                 Err(ProtocolValidationError::InvalidAttemptLimit)
             );
         }
+    }
+
+    #[test]
+    fn an_idempotency_key_must_be_usable_as_an_identifier() {
+        assert!(IdempotencyKey::new("agent-7/capture/task-2").is_ok());
+        for rejected in [
+            "",
+            " ",
+            " leading",
+            "trailing ",
+            "line\nbreak",
+            &"x".repeat(201),
+        ] {
+            assert!(
+                IdempotencyKey::new(rejected).is_err(),
+                "{rejected:?} should not be accepted as a key"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_request_fingerprints_the_same_way_and_a_different_one_does_not() {
+        let plan_tasks = BTreeSet::from([TaskId::new(), TaskId::new()]);
+        let feature_id = FeatureId::new();
+        let request = CapturePackageRequest {
+            feature_id,
+            plan_revision: Revision::new(1).unwrap(),
+            task_ids: plan_tasks.clone(),
+        };
+        let command = Command::CapturePackage(request.clone());
+        assert_eq!(
+            command.fingerprint(),
+            Command::CapturePackage(request).fingerprint()
+        );
+
+        let different = Command::CapturePackage(CapturePackageRequest {
+            feature_id,
+            plan_revision: Revision::new(1).unwrap(),
+            task_ids: BTreeSet::from([TaskId::new()]),
+        });
+        assert_ne!(command.fingerprint(), different.fingerprint());
+    }
+
+    #[test]
+    fn every_command_that_writes_is_classified_as_writing() {
+        assert!(!Command::Ping.changes_state());
+        assert!(!Command::Status.changes_state());
+        assert!(!Command::AuditQueue.changes_state());
+        assert!(
+            Command::ReleaseUnitNow {
+                release_unit_id: ReleaseUnitId::new()
+            }
+            .changes_state()
+        );
+        assert!(
+            Command::ResumeRepository {
+                repository_id: RepositoryId::new()
+            }
+            .changes_state()
+        );
+    }
+
+    #[test]
+    fn only_publication_is_treated_as_able_to_reach_a_remote() {
+        assert!(!Command::Status.may_reach_remote());
+        assert!(
+            !Command::ReleaseUnitNow {
+                release_unit_id: ReleaseUnitId::new()
+            }
+            .may_reach_remote()
+        );
     }
 }

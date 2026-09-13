@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 20;
+pub const STORAGE_SCHEMA_VERSION: u32 = 21;
 
 struct Migration {
     version: u32,
@@ -726,6 +726,35 @@ const MIGRATIONS: &[Migration] = &[
 
         CREATE INDEX idx_integration_backoff_due
             ON integration_backoff(integration, next_attempt_at_unix_ms);
+        "#,
+    },
+    Migration {
+        version: 21,
+        sql: r#"
+        -- One row per client-declared intent. An agent that loses its connection mid-request has
+        -- no way to tell a request that never arrived from one that arrived and answered, so it
+        -- reuses its key and this table answers for the original.
+        --
+        -- The claim is written before the command runs, not after it succeeds, because the gap
+        -- between the two is exactly when a retry would otherwise duplicate the work.
+        CREATE TABLE idempotent_requests (
+            idempotency_key TEXT PRIMARY KEY
+                CHECK (length(idempotency_key) BETWEEN 1 AND 200),
+            command TEXT NOT NULL CHECK (length(trim(command)) > 0),
+            -- Digest of the command payload: the same key arriving with a different request is a
+            -- client bug, and is reported rather than served the earlier answer.
+            fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 64),
+            status TEXT NOT NULL CHECK (status IN ('in_progress', 'settled')),
+            -- The serialized result, success or failure, replayed verbatim to later retries.
+            -- NULL exactly while the first attempt is still running.
+            outcome TEXT CHECK ((status = 'settled') = (outcome IS NOT NULL)),
+            claimed_at_unix_ms INTEGER NOT NULL CHECK (claimed_at_unix_ms >= 0),
+            settled_at_unix_ms INTEGER
+                CHECK (settled_at_unix_ms IS NULL OR settled_at_unix_ms >= claimed_at_unix_ms)
+        );
+
+        CREATE INDEX idx_idempotent_requests_claimed
+            ON idempotent_requests(claimed_at_unix_ms);
         "#,
     },
 ];

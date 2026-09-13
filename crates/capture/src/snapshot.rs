@@ -816,3 +816,101 @@ mod tests {
         assert!(!error.to_string().contains("sk-this-must-not-appear"));
     }
 }
+
+#[cfg(test)]
+mod resource_pressure_tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    /// A capture that cannot complete must leave everything already captured exactly as it was.
+    ///
+    /// This is the disk-pressure guarantee stated in a way a test can actually express: rather
+    /// than filling a real disk, the destination is made unwritable, which produces the same
+    /// failure at the same point — partway through installing a package. What matters is not which
+    /// error occurred but that an acknowledged package is still intact afterwards.
+    #[test]
+    fn a_capture_that_cannot_be_written_preserves_the_packages_already_captured() {
+        let root = tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        git_status(&workspace, ["init", "--quiet"]).unwrap();
+        git_status(&workspace, ["config", "user.name", "Fixture"]).unwrap();
+        git_status(
+            &workspace,
+            ["config", "user.email", "fixture@example.invalid"],
+        )
+        .unwrap();
+        fs::write(workspace.join("README.md"), "base\n").unwrap();
+        git_status(&workspace, ["add", "."]).unwrap();
+        git_status(&workspace, ["commit", "--quiet", "-m", "base"]).unwrap();
+        let base = git_text(&workspace, ["rev-parse", "HEAD"]).unwrap();
+        let packages = root.path().join("packages");
+
+        // One unit is captured and acknowledged before anything goes wrong.
+        fs::write(workspace.join("first.txt"), "first unit\n").unwrap();
+        let first = SnapshotPackage::capture(SnapshotRequest {
+            package_id: PackageId::new(),
+            revision: Revision::FIRST,
+            feature_id: FeatureId::new(),
+            plan_revision: Revision::FIRST,
+            task_ids: [TaskId::new()].into(),
+            workspace: &workspace,
+            package_root: &packages,
+            expected_base_commit: &base,
+            parent_package_id: None,
+            validation_policy: ContentValidationPolicy::default(),
+        })
+        .unwrap();
+        let first_hash = first.manifest.content_hash.clone();
+        let first_path = first.path.clone();
+
+        // Storage becomes unwritable, exactly as it would when a disk fills.
+        let mut permissions = fs::metadata(&packages).unwrap().permissions();
+        permissions.set_mode(0o500);
+        fs::set_permissions(&packages, permissions).unwrap();
+
+        fs::write(workspace.join("second.txt"), "second unit\n").unwrap();
+        let blocked = SnapshotPackage::capture(SnapshotRequest {
+            package_id: PackageId::new(),
+            revision: Revision::FIRST,
+            feature_id: first.manifest.feature_id,
+            plan_revision: Revision::FIRST,
+            task_ids: [TaskId::new()].into(),
+            workspace: &workspace,
+            package_root: &packages,
+            expected_base_commit: first.advanced_base_commit(),
+            parent_package_id: Some(first.manifest.package_id),
+            validation_policy: ContentValidationPolicy::default(),
+        });
+        assert!(
+            blocked.is_err(),
+            "a capture that cannot be written must fail rather than report success"
+        );
+
+        // Restore access and check what survived.
+        let mut permissions = fs::metadata(&packages).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&packages, permissions).unwrap();
+
+        let reopened = SnapshotPackage::open(first_path).unwrap();
+        assert_eq!(
+            reopened.manifest.content_hash, first_hash,
+            "work acknowledged before the failure must still verify afterwards"
+        );
+
+        // No half-written package was left behind pretending to be complete.
+        let installed: Vec<_> = fs::read_dir(&packages)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert_eq!(
+            installed.len(),
+            1,
+            "only the one complete package should be installed"
+        );
+    }
+}

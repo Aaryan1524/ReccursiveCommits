@@ -539,6 +539,7 @@ dependencies = [
  "reccursive-git",
  "reccursive-protocol",
  "reccursive-store",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

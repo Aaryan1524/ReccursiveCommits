@@ -2,9 +2,11 @@
 
 mod graph;
 mod ids;
+mod integration;
 mod plan;
 mod policy;
 mod release;
+mod remote;
 mod revision;
 mod schedule;
 mod task;
@@ -14,12 +16,14 @@ pub use ids::{
     AttemptId, EventId, FeatureId, IdParseError, PackageId, ReleaseUnitId, RepositoryId, RequestId,
     TaskId,
 };
+pub use integration::{BackoffPolicy, ConnectivityFault, Integration};
 pub use plan::{AcceptanceCheck, FeaturePlan, PLAN_SCHEMA_VERSION, PlanError, PlanPhase, PlanTask};
 pub use policy::{
     PackageError, PackageRevision, PolicyError, PolicyRef, PublicationMode, RepositoryPolicy,
     TargetMilestone, TargetRef,
 };
 pub use release::{ReleaseUnit, ReleaseUnitError};
+pub use remote::RemoteIdentity;
 pub use revision::{Revision, RevisionError};
 pub use schedule::{
     DailyReleaseRange, DailyTime, DailyWindow, IanaTimeZone, MissedWindowBehavior, PlannedSlot,

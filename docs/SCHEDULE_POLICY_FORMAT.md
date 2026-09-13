@@ -36,6 +36,9 @@ truncated.
 {"kind": "catch_up", "max_releases": 5}
 ```
 
+Both shapes are exactly what the daemon accepts; the scheduling scenario in CI writes a
+policy in this form and the daemon reads it back.
+
 `reschedule_forward` is the default-safe choice: an overdue slot moves to the
 next eligible window rather than backdating a commit. `catch_up` permits a
 deliberately bounded burst after an offline gap; unbounded catch-up is never

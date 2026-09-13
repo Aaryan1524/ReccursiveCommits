@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use reccursive_core::{
-    PolicyError, PublicationMode, RepositoryId, RepositoryPolicy, Revision, SchedulePolicy,
-    TargetRef,
+    PolicyError, PublicationMode, RemoteIdentity, RepositoryId, RepositoryPolicy, Revision,
+    SchedulePolicy, TargetRef,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -272,6 +272,9 @@ impl Store {
         // to the same target is two writers racing for one ref, which is exactly the situation the
         // release lease exists to prevent — so it is refused at enrollment rather than discovered
         // later as a conflict.
+        // Compared by identity, not by the address as typed: one repository has several valid
+        // addresses, and any of them would otherwise enroll as a second publisher for one branch.
+        let identity = RemoteIdentity::of(&registration.canonical_remote);
         let duplicate: Option<String> = self
             .connection
             .query_row(
@@ -279,9 +282,9 @@ impl Store {
                  FROM repositories r
                  JOIN repository_policies p
                    ON p.repository_id = r.id AND p.revision = r.active_policy_revision
-                 WHERE r.canonical_remote = ?1 AND p.target_ref = ?2
+                 WHERE r.remote_identity = ?1 AND p.target_ref = ?2
                  LIMIT 1",
-                params![registration.canonical_remote, policy.target.as_str()],
+                params![identity.as_str(), policy.target.as_str()],
                 |row| row.get(0),
             )
             .optional()?;
@@ -296,14 +299,16 @@ impl Store {
         transaction
             .execute(
                 "INSERT INTO repositories (
-                id, checkout_path, canonical_remote, managed_path, created_at_unix_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                id, checkout_path, canonical_remote, managed_path, created_at_unix_ms,
+                remote_identity
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     registration.id.to_string(),
                     registration.checkout_path,
                     registration.canonical_remote,
                     registration.managed_path,
                     registration.created_at_unix_ms,
+                    identity.as_str(),
                 ],
             )
             .map_err(map_write_error)?;

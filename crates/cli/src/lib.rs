@@ -11,12 +11,12 @@ use install::{InstallError, ServiceInstallation};
 use reccursive_protocol::{
     ApiError, ApiErrorCode, CancelTaskRequest, CapturePackageRequest, Command,
     CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
-    EventSeverityView, EventView, FeatureId, FeaturePlan, LocalClient, PackageId, PackageView,
-    PlanView, PublicationMode, QueueAuditView, QueueExportView, ReleaseAttemptView,
-    ReleasePackageRequest, ReleaseUnitId, ReleaseUnitView, RepositoryId, RepositoryView,
-    ResponseData, Revision, SchedulePolicy, SchedulePolicyOverride, SchedulePolicyView,
-    ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest, TargetRef, TaskId,
-    WorkspaceView,
+    EventSeverityView, EventView, FeatureId, FeaturePlan, IntegrationHealthView, LocalClient,
+    PackageId, PackageView, PlanView, PublicationMode, QueueAuditView, QueueExportView,
+    ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitId, ReleaseUnitView, RepositoryId,
+    RepositoryView, ResponseData, Revision, SchedulePolicy, SchedulePolicyOverride,
+    SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest, TargetRef,
+    TaskId, WorkspaceView,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -101,6 +101,10 @@ enum TopLevelCommand {
     Status,
     /// Check local prerequisites and service connectivity.
     Doctor,
+    /// Show integrations that are currently failing and when each may be retried.
+    Integrations,
+    /// Check whether credentials and signing would let a repository publish right now.
+    Diagnose { repository_id: RepositoryId },
     /// Show recent sanitized daemon events.
     Logs {
         /// Maximum number of newest events to return.
@@ -443,6 +447,14 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
     let paths = ClientPaths::new(state_dir);
     match cli.command {
         TopLevelCommand::Doctor => doctor(&paths, cli.json, stdout),
+        TopLevelCommand::Diagnose { repository_id } => {
+            let data = send(&paths, Command::DiagnoseRepository { repository_id })?;
+            output_data(data, cli.json, stdout)
+        }
+        TopLevelCommand::Integrations => {
+            let data = send(&paths, Command::ListIntegrationHealth)?;
+            output_data(data, cli.json, stdout)
+        }
         TopLevelCommand::Service { command } => service_command(command, &paths, cli.json, stdout),
         TopLevelCommand::Status => {
             let data = send(&paths, Command::Status)?;
@@ -1206,6 +1218,24 @@ fn output_data(
             revision.get()
         ),
         ResponseData::DueUnits { units } => output_due_units(out, &units),
+        ResponseData::IntegrationHealth { integrations } => {
+            output_integration_health(out, &integrations)
+        }
+        ResponseData::RepositoryDiagnostics {
+            repository_id,
+            credentials,
+            credential_detail,
+            signing,
+            signing_detail,
+            can_publish,
+        } => writeln!(
+            out,
+            "Repository {repository_id}\nCredentials: {credentials}{}\nSigning: {signing}{}\n\
+             Can publish now: {}",
+            credential_detail.map_or_else(String::new, |detail| format!(" ({detail})")),
+            signing_detail.map_or_else(String::new, |detail| format!(" ({detail})")),
+            if can_publish { "yes" } else { "no" }
+        ),
         ResponseData::RepositoryPaused {
             repository_id,
             reason,
@@ -1365,6 +1395,32 @@ fn output_schedule_preview(
             out,
             "{} · package {} · {} ({})",
             slot.release_unit_id, slot.package_id, slot.selected_at_unix_ms, slot.timezone
+        )?;
+    }
+    Ok(())
+}
+
+fn output_integration_health(
+    out: &mut impl Write,
+    integrations: &[IntegrationHealthView],
+) -> io::Result<()> {
+    if integrations.is_empty() {
+        return writeln!(out, "All integrations are healthy.");
+    }
+    for health in integrations {
+        let next = match health.next_attempt_at_unix_ms {
+            Some(at) => format!("retry after {at}"),
+            // Deliberately explicit: this will not clear on its own.
+            None => "needs attention; no retry scheduled".to_owned(),
+        };
+        writeln!(
+            out,
+            "{:?} · {} · {:?} after {} failure(s) · {next}\n  {}",
+            health.integration,
+            health.scope,
+            health.fault,
+            health.consecutive_failures,
+            health.detail
         )?;
     }
     Ok(())

@@ -16,6 +16,10 @@ use std::{
 };
 
 use reccursive_capture::SnapshotPackage;
+
+use reccursive_core::{BackoffPolicy, Integration};
+
+use crate::lifecycle::ConnectivityFault;
 use reccursive_git::{
     CandidateApplyOutcome, CandidateCommitRequest, CandidatePublishError, CandidatePublishRequest,
     CandidateVerificationError, CandidateWorkspace, GitError, ManagedClone, PersistedCandidate,
@@ -351,6 +355,12 @@ impl ReleaseWorker {
         store.advance_release_attempt(id, TaskStatus::PushPending, None, now_unix_ms)?;
         match workspace.publish(candidate, &publish_request, GIT_TIMEOUT) {
             Ok(published) => {
+                // The endpoint answered: the next outage should start from the beginning rather
+                // than inheriting this one's backoff.
+                store.clear_integration_failure(
+                    Integration::Git,
+                    &attempt.repository_id.to_string(),
+                )?;
                 self.confirm_publication(store, attempt, &published.commit, now_unix_ms)?;
                 Ok(ReleaseOutcome::Published {
                     attempt_id: id,
@@ -534,6 +544,18 @@ impl ReleaseWorker {
             return Ok(());
         }
         store.record_publication_failure(attempt.attempt_id, classification, now_unix_ms)?;
+        // Recorded against this repository's Git endpoint specifically, so an unreachable remote
+        // delays only this repository, and only its Git work. A fault that waiting cannot fix
+        // schedules no retry at all, which is what stops a rejected credential being presented
+        // over and over.
+        store.record_integration_failure(
+            Integration::Git,
+            &attempt.repository_id.to_string(),
+            ConnectivityFault::classify_git(detail),
+            detail,
+            BackoffPolicy::default(),
+            now_unix_ms,
+        )?;
         let reason = StateReason::new(reason_code(classification), detail)
             .map_err(|error| StoreError::InvalidData(error.to_string()))?;
         store.advance_release_attempt(
@@ -741,9 +763,23 @@ fn current_unix_ms() -> Result<i64, ReleaseError> {
         .map_err(|_| ReleaseError::Unavailable("system clock exceeds supported range".to_owned()))
 }
 
+/// Names why a publication failed, distinguishing faults that retrying could fix from those it
+/// cannot.
+///
+/// Git reports an unreachable host, a rejected credential, and a protected branch through the same
+/// non-zero exit, so the message is the only signal available. Treating them alike would either
+/// retry a credential failure — which can lock an account or raise a prompt with nobody present to
+/// answer it — or give up on a transient outage that would have cleared on its own.
 fn classify(error: &CandidatePublishError) -> &'static str {
     match error {
-        CandidatePublishError::Git(_) => "transport",
+        CandidatePublishError::Git(git_error) => {
+            match ConnectivityFault::classify_git(&git_error.to_string()) {
+                ConnectivityFault::Rejected => "authentication",
+                ConnectivityFault::Refused => "branch_rule",
+                ConnectivityFault::TimedOut => "timeout",
+                ConnectivityFault::Unreachable => "transport",
+            }
+        }
         CandidatePublishError::TargetAdvanced { .. } => "target_changed",
         _ => "publication_failed",
     }
@@ -751,8 +787,8 @@ fn classify(error: &CandidatePublishError) -> &'static str {
 
 fn reason_code(classification: &str) -> ReasonCode {
     match classification {
-        "conflict" | "target_changed" => ReasonCode::Conflict,
-        "transport" | "ambiguous_remote" => ReasonCode::DeviceUnavailable,
+        "conflict" | "target_changed" | "branch_rule" => ReasonCode::Conflict,
+        "transport" | "timeout" | "ambiguous_remote" => ReasonCode::DeviceUnavailable,
         "authentication" => ReasonCode::AuthenticationRequired,
         other => ReasonCode::Other(other.to_owned()),
     }

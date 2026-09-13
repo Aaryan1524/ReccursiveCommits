@@ -20,13 +20,13 @@ use reccursive_capture::{
 use reccursive_protocol::{
     ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest, Command,
     CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
-    EventSeverityView, EventView, MissedWindowView, PackageView, PlanView, ProtocolValidationError,
-    QueueAuditView, QueueExportView, QueueRecoveryIssueView, ReasonCode, ReleaseAttemptView,
-    ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryView,
-    RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision, SchedulePolicyView,
-    ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest,
-    StateReason, TaskCancellationView, TaskStatus, TransportError, WorkspacePrerequisiteView,
-    WorkspaceView,
+    EventSeverityView, EventView, IntegrationHealthView, MissedWindowView, PackageView, PlanView,
+    ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView, ReasonCode,
+    ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy,
+    RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision,
+    SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest,
+    SetSchedulePolicyRequest, StateReason, TaskCancellationView, TaskStatus, TransportError,
+    WorkspacePrerequisiteView, WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -69,6 +69,18 @@ impl ServicePaths {
 }
 
 /// Bound local API and exclusive owner of mutable service state.
+/// How often the daemon performs its periodic pass.
+///
+/// Coarse on purpose: scheduling resolution is minutes, and an idle daemon that wakes constantly to
+/// ask a question whose answer is almost always "nothing" costs battery for no benefit.
+const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many units one pass may publish.
+///
+/// A bound rather than a throughput target: a backlog that accumulated over a long offline period
+/// should drain steadily across passes instead of becoming a burst of simultaneous pushes.
+const RELEASE_CONCURRENCY_LIMIT: usize = 4;
+
 pub struct LocalService {
     owner: ServiceOwner,
     store: Arc<Mutex<Store>>,
@@ -76,6 +88,7 @@ pub struct LocalService {
     workspace_root: Arc<PathBuf>,
     release_root: Arc<PathBuf>,
     package_root: Arc<PathBuf>,
+    shutdown: crate::maintenance::ShutdownSignal,
 }
 
 impl LocalService {
@@ -90,6 +103,7 @@ impl LocalService {
         let package_root = state_root.join("packages");
         reconcile_snapshot_storage(&mut store, &package_root)?;
         reconcile_interrupted_releases(&mut store, &managed_root, &state_root.join("releases"))?;
+        reconcile_overdue_schedules(&mut store)?;
         Ok(Self {
             owner,
             store: Arc::new(Mutex::new(store)),
@@ -97,11 +111,62 @@ impl LocalService {
             workspace_root: Arc::new(workspace_root),
             release_root: Arc::new(release_root),
             package_root: Arc::new(package_root),
+            shutdown: crate::maintenance::ShutdownSignal::new(),
+        })
+    }
+
+    /// Starts the periodic maintenance pass.
+    ///
+    /// Kept coarse on purpose. A slot whose time arrives between two passes is simply overdue at
+    /// the next one, which is the same state a slot reaches after a sleep and is handled by the
+    /// same path — so nothing depends on a pass landing at any particular moment, and the daemon
+    /// can stay cheap while idle instead of polling.
+    fn spawn_maintenance(&self) -> thread::JoinHandle<()> {
+        let store = Arc::clone(&self.store);
+        let shutdown = self.shutdown.clone();
+        let managed_root = Arc::clone(&self.managed_root);
+        let release_root = Arc::clone(&self.release_root);
+        let interval = MAINTENANCE_INTERVAL;
+        let mut maintenance = crate::maintenance::Maintenance::new(
+            shutdown.clone(),
+            interval,
+            std::time::Instant::now(),
+            current_unix_ms().unwrap_or(0),
+        );
+        thread::spawn(move || {
+            while !shutdown.is_requested() {
+                thread::sleep(interval);
+                if shutdown.is_requested() {
+                    break;
+                }
+                let Ok(now) = current_unix_ms() else { continue };
+                let seed = u64::from(Uuid::new_v4().as_fields().0);
+                if let Ok(mut store) = store.lock() {
+                    // A maintenance failure is never fatal: the next pass tries again, and the
+                    // state it would have written is still discoverable from what is durable.
+                    let _ = maintenance.tick(&mut store, std::time::Instant::now(), now, seed);
+                    // The pass that notices a slot is due is the same one that acts on it. Without
+                    // this a schedule is only ever a record of intent, and publishing still waits
+                    // for someone to type a command.
+                    let worker = crate::release::ReleaseWorker::new(
+                        managed_root.as_path(),
+                        release_root.as_path(),
+                        crate::SERVICE_NAME,
+                    );
+                    let _ = maintenance.release_due_units(
+                        &mut store,
+                        &worker,
+                        now,
+                        RELEASE_CONCURRENCY_LIMIT,
+                    );
+                }
+            }
         })
     }
 
     /// Serves forever, creating one worker thread per accepted local connection.
     pub fn serve_forever(self) -> Result<(), ServiceError> {
+        let _maintenance = self.spawn_maintenance();
         for connection in self.owner.listener.incoming() {
             let stream = connection?;
             let auth_token = self.owner.auth_token.clone();
@@ -443,6 +508,8 @@ fn dispatch(
         Command::ResumeRepository { repository_id } => resume_repository(repository_id, store),
         Command::ReleaseUnitNow { release_unit_id } => release_unit_now(release_unit_id, store),
         Command::PreviewSchedule { repository_id } => preview_schedule(repository_id, store),
+        Command::ListIntegrationHealth => list_integration_health(store),
+        Command::DiagnoseRepository { repository_id } => diagnose_repository(repository_id, store),
         Command::GetReleaseAttempt { attempt_id } => get_release_attempt(attempt_id, store),
         Command::ListReleaseAttempts { package_id, limit } => {
             list_release_attempts(package_id, limit, store)
@@ -486,6 +553,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::ResumeRepository { .. } => "schedule.resume",
         Command::ReleaseUnitNow { .. } => "schedule.release_now",
         Command::PreviewSchedule { .. } => "schedule.preview",
+        Command::ListIntegrationHealth => "integrations.health",
+        Command::DiagnoseRepository { .. } => "repository.diagnose",
         Command::GetReleaseAttempt { .. } => "release.attempt",
         Command::ListReleaseAttempts { .. } => "release.attempts",
         Command::GetPackage { .. } => "package.show",
@@ -914,6 +983,38 @@ fn reconcile_snapshot_storage(store: &mut Store, package_root: &Path) -> Result<
 /// discovered rather than repeated as a second commit. It is deliberately best-effort — a daemon
 /// starting without network access must still come up, and the attempt stays listed for the next
 /// attempt at resolution rather than being lost.
+/// Applies each repository's missed-window policy to anything overdue at startup.
+///
+/// This is what makes a scheduled release a durable deadline rather than a timer. A machine that
+/// slept through a window, or was simply off, starts up with work whose time has already passed;
+/// nothing fired while it was away, so the reconciliation has to happen on the way up rather than
+/// in response to an event nobody was present to receive.
+///
+/// Best-effort by design: a repository with no policy configured yet, or one whose selection fails,
+/// must not stop the service from starting.
+fn reconcile_overdue_schedules(store: &mut Store) -> Result<(), StoreError> {
+    let now = recovery_unix_ms()?;
+    let seed = u64::from(Uuid::new_v4().as_fields().0);
+    for repository in store.repositories()? {
+        let repository_id = repository.registration.id;
+        if store.overdue_schedule_slots(repository_id, now)?.is_empty() {
+            continue;
+        }
+        if let Err(error) =
+            crate::scheduler::Scheduler::reconcile_missed_windows(store, repository_id, seed, now)
+        {
+            record_recovery_issue(
+                store,
+                PathBuf::from(repository_id.to_string()),
+                "missed_window_unreconciled",
+                &format!("overdue release times could not be reconciled at startup: {error}"),
+                now,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn reconcile_interrupted_releases(
     store: &mut Store,
     managed_root: &Path,
@@ -1852,6 +1953,89 @@ fn preview_schedule(
         .map_err(store_api_error)?
         .map(|pause| pause.reason);
     Ok(ResponseData::SchedulePreview { slots, paused })
+}
+
+/// Reports whether credentials and signing would currently let a repository publish.
+///
+/// Run before a release rather than discovered during one: the point is to answer "why can this
+/// not publish" while someone is present to read the answer.
+fn diagnose_repository(
+    repository_id: RepositoryId,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let repository = lock_store(store)?
+        .repository(repository_id)
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotFound,
+                format!("repository {repository_id} was not found"),
+                false,
+            )
+        })?;
+
+    let managed = PathBuf::from(&repository.registration.managed_path);
+    // Probes run against a directory that exists; before the first release the managed mirror has
+    // not been created, so the user's own checkout answers the same question.
+    let probe_root = if managed.is_dir() {
+        managed
+    } else {
+        PathBuf::from(&repository.registration.checkout_path)
+    };
+    let credentials = crate::diagnostics::probe_credentials(
+        &probe_root,
+        &repository.registration.canonical_remote,
+    );
+    let signing =
+        crate::diagnostics::probe_signing(&PathBuf::from(&repository.registration.checkout_path));
+    let diagnostics = crate::diagnostics::RepositoryDiagnostics {
+        credentials: credentials.clone(),
+        signing: signing.clone(),
+    };
+
+    let (credential_state, credential_detail) = match &credentials {
+        crate::diagnostics::CredentialStatus::Ready => ("ready", None),
+        crate::diagnostics::CredentialStatus::Rejected { detail } => {
+            ("rejected", Some(detail.clone()))
+        }
+        crate::diagnostics::CredentialStatus::Unreachable { detail } => {
+            ("unreachable", Some(detail.clone()))
+        }
+        crate::diagnostics::CredentialStatus::TimedOut => ("timed_out", None),
+    };
+    let (signing_state, signing_detail) = match &signing {
+        crate::diagnostics::SigningStatus::Disabled => ("disabled", None),
+        crate::diagnostics::SigningStatus::Ready { format } => ("ready", Some(format.clone())),
+        crate::diagnostics::SigningStatus::Unavailable { format, detail } => {
+            ("unavailable", Some(format!("{format}: {detail}")))
+        }
+    };
+
+    Ok(ResponseData::RepositoryDiagnostics {
+        repository_id,
+        credentials: credential_state.to_owned(),
+        credential_detail,
+        signing: signing_state.to_owned(),
+        signing_detail,
+        can_publish: diagnostics.can_publish(),
+    })
+}
+
+fn list_integration_health(store: &Mutex<Store>) -> Result<ResponseData, ApiError> {
+    let integrations = lock_store(store)?
+        .failing_integrations()
+        .map_err(store_api_error)?
+        .into_iter()
+        .map(|health| IntegrationHealthView {
+            integration: health.integration,
+            scope: health.scope,
+            consecutive_failures: health.consecutive_failures,
+            fault: health.fault,
+            detail: health.detail,
+            next_attempt_at_unix_ms: health.next_attempt_at_unix_ms,
+        })
+        .collect();
+    Ok(ResponseData::IntegrationHealth { integrations })
 }
 
 fn schedule_slot_view(slot: reccursive_store::ScheduleSlot) -> ScheduleSlotView {

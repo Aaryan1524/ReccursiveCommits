@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 18;
+pub const STORAGE_SCHEMA_VERSION: u32 = 20;
 
 struct Migration {
     version: u32,
@@ -676,6 +676,56 @@ const MIGRATIONS: &[Migration] = &[
             paused_at_unix_ms INTEGER NOT NULL CHECK (paused_at_unix_ms >= 0),
             FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE
         );
+        "#,
+    },
+    Migration {
+        version: 19,
+        sql: r#"
+        -- A remote URL is an address, not an identity: one repository has several valid
+        -- addresses. Uniqueness and the release lease must compare identity, or two spellings of
+        -- the same repository become two publishers racing for one ref. The address column is
+        -- untouched, because fetching and pushing still use it verbatim.
+        ALTER TABLE repositories ADD COLUMN remote_identity TEXT NOT NULL DEFAULT '';
+        ALTER TABLE release_attempts ADD COLUMN target_remote_identity TEXT NOT NULL DEFAULT '';
+
+        -- Existing rows are backfilled in Rust immediately after migration, because deriving an
+        -- identity means parsing a URL, which SQL cannot do.
+        DROP INDEX IF EXISTS idx_release_attempts_live_target;
+
+        CREATE UNIQUE INDEX idx_release_attempts_live_target
+            ON release_attempts(target_remote_identity, target_ref)
+            WHERE status IN ('scheduled', 'reconciling', 'verifying', 'commit_prepared',
+                             'push_pending', 'remote_confirmed')
+               OR (status = 'blocked'
+                   AND blocked_from IN ('push_pending', 'remote_confirmed'));
+
+        CREATE INDEX idx_repositories_remote_identity
+            ON repositories(remote_identity);
+        "#,
+    },
+    Migration {
+        version: 20,
+        sql: r#"
+        -- Backoff is tracked per integration and per scope so one outage stays one outage. A Git
+        -- remote being unreachable must not delay a different repository, and must not delay
+        -- notification delivery at all. Durable, because a restart during an outage should resume
+        -- the backoff rather than reset it into an immediate retry.
+        CREATE TABLE integration_backoff (
+            integration TEXT NOT NULL CHECK (integration IN ('git', 'ai_provider', 'telegram')),
+            scope TEXT NOT NULL CHECK (length(trim(scope)) > 0),
+            consecutive_failures INTEGER NOT NULL CHECK (consecutive_failures >= 0),
+            fault TEXT NOT NULL CHECK (fault IN
+                ('unreachable', 'rejected', 'refused', 'timed_out')),
+            detail TEXT NOT NULL CHECK (length(trim(detail)) > 0),
+            -- NULL means no further attempt is scheduled: the fault will not resolve by waiting.
+            next_attempt_at_unix_ms INTEGER
+                CHECK (next_attempt_at_unix_ms IS NULL OR next_attempt_at_unix_ms >= 0),
+            updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= 0),
+            PRIMARY KEY (integration, scope)
+        );
+
+        CREATE INDEX idx_integration_backoff_due
+            ON integration_backoff(integration, next_attempt_at_unix_ms);
         "#,
     },
 ];

@@ -1202,6 +1202,88 @@ mod concurrency_tests {
     }
 
     #[test]
+    fn two_spellings_of_one_remote_are_still_one_publisher() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("queue.sqlite");
+        let mut store = Store::open(&database).unwrap();
+        let target = TargetRef::new("refs/heads/main").unwrap();
+
+        let enroll = |store: &mut Store, remote: &str, checkout: &str, managed: &str| {
+            let id = RepositoryId::new();
+            store.enroll_repository(
+                &RepositoryRegistration::new(id, checkout, remote, managed, 1).unwrap(),
+                &RepositoryPolicy::new(
+                    id,
+                    Revision::FIRST,
+                    PublicationMode::ScheduledCreation,
+                    TargetRef::new("refs/heads/main").unwrap(),
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+
+        // The same GitHub repository, written the two ways git itself will report it.
+        enroll(
+            &mut store,
+            "git@github.com:example/project.git",
+            "/tmp/checkout-a",
+            "/tmp/managed-a.git",
+        )
+        .unwrap();
+        let second = enroll(
+            &mut store,
+            "https://github.com/example/project",
+            "/tmp/checkout-b",
+            "/tmp/managed-b.git",
+        );
+
+        assert!(
+            matches!(second, Err(StoreError::Conflict(_))),
+            "two spellings of one remote must not both become publishers for {}: {second:?}",
+            target.as_str()
+        );
+    }
+
+    #[test]
+    fn a_second_address_for_one_remote_cannot_take_the_same_release_lease() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("queue.sqlite");
+        let (repository_id, unit_id, package_id, target) = seed(&database);
+        let mut store = Store::open(&database).unwrap();
+        store
+            .persist_schedule_slot(&slot(unit_id, package_id, 1_000))
+            .unwrap();
+
+        let attempt = |remote: &str| NewReleaseAttempt {
+            attempt_id: AttemptId::new(),
+            repository_id,
+            package_id,
+            package_revision: Revision::FIRST,
+            remote: remote.into(),
+            target: target.clone(),
+            base_commit: object_id('a'),
+            lease: AttemptLease {
+                owner: "client".into(),
+                expires_at_unix_ms: 100_000,
+            },
+            created_at_unix_ms: 10,
+        };
+
+        store
+            .open_release_attempt(&attempt("ssh://git@example.invalid/race.git"))
+            .unwrap();
+        // The same repository, reached by a different address. It is still one branch.
+        let contended = store.open_release_attempt(&attempt("https://example.invalid/race"));
+
+        assert!(
+            matches!(contended, Err(StoreError::Conflict(_))),
+            "the lease must be held against the repository, not the spelling of its URL: \
+             {contended:?}"
+        );
+    }
+
+    #[test]
     fn two_clients_claiming_one_target_cannot_both_hold_a_release_lease() {
         let directory = tempdir().unwrap();
         let database = directory.path().join("queue.sqlite");

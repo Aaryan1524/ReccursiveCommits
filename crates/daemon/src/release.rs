@@ -16,6 +16,8 @@ use std::{
 };
 
 use reccursive_capture::SnapshotPackage;
+
+use crate::lifecycle::ConnectivityFault;
 use reccursive_git::{
     CandidateApplyOutcome, CandidateCommitRequest, CandidatePublishError, CandidatePublishRequest,
     CandidateVerificationError, CandidateWorkspace, GitError, ManagedClone, PersistedCandidate,
@@ -741,9 +743,23 @@ fn current_unix_ms() -> Result<i64, ReleaseError> {
         .map_err(|_| ReleaseError::Unavailable("system clock exceeds supported range".to_owned()))
 }
 
+/// Names why a publication failed, distinguishing faults that retrying could fix from those it
+/// cannot.
+///
+/// Git reports an unreachable host, a rejected credential, and a protected branch through the same
+/// non-zero exit, so the message is the only signal available. Treating them alike would either
+/// retry a credential failure — which can lock an account or raise a prompt with nobody present to
+/// answer it — or give up on a transient outage that would have cleared on its own.
 fn classify(error: &CandidatePublishError) -> &'static str {
     match error {
-        CandidatePublishError::Git(_) => "transport",
+        CandidatePublishError::Git(git_error) => {
+            match ConnectivityFault::classify_git(&git_error.to_string()) {
+                ConnectivityFault::Rejected => "authentication",
+                ConnectivityFault::Refused => "branch_rule",
+                ConnectivityFault::TimedOut => "timeout",
+                ConnectivityFault::Unreachable => "transport",
+            }
+        }
         CandidatePublishError::TargetAdvanced { .. } => "target_changed",
         _ => "publication_failed",
     }
@@ -751,8 +767,8 @@ fn classify(error: &CandidatePublishError) -> &'static str {
 
 fn reason_code(classification: &str) -> ReasonCode {
     match classification {
-        "conflict" | "target_changed" => ReasonCode::Conflict,
-        "transport" | "ambiguous_remote" => ReasonCode::DeviceUnavailable,
+        "conflict" | "target_changed" | "branch_rule" => ReasonCode::Conflict,
+        "transport" | "timeout" | "ambiguous_remote" => ReasonCode::DeviceUnavailable,
         "authentication" => ReasonCode::AuthenticationRequired,
         other => ReasonCode::Other(other.to_owned()),
     }

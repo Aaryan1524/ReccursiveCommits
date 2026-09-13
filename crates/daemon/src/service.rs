@@ -90,6 +90,7 @@ impl LocalService {
         let package_root = state_root.join("packages");
         reconcile_snapshot_storage(&mut store, &package_root)?;
         reconcile_interrupted_releases(&mut store, &managed_root, &state_root.join("releases"))?;
+        reconcile_overdue_schedules(&mut store)?;
         Ok(Self {
             owner,
             store: Arc::new(Mutex::new(store)),
@@ -914,6 +915,38 @@ fn reconcile_snapshot_storage(store: &mut Store, package_root: &Path) -> Result<
 /// discovered rather than repeated as a second commit. It is deliberately best-effort — a daemon
 /// starting without network access must still come up, and the attempt stays listed for the next
 /// attempt at resolution rather than being lost.
+/// Applies each repository's missed-window policy to anything overdue at startup.
+///
+/// This is what makes a scheduled release a durable deadline rather than a timer. A machine that
+/// slept through a window, or was simply off, starts up with work whose time has already passed;
+/// nothing fired while it was away, so the reconciliation has to happen on the way up rather than
+/// in response to an event nobody was present to receive.
+///
+/// Best-effort by design: a repository with no policy configured yet, or one whose selection fails,
+/// must not stop the service from starting.
+fn reconcile_overdue_schedules(store: &mut Store) -> Result<(), StoreError> {
+    let now = recovery_unix_ms()?;
+    let seed = u64::from(Uuid::new_v4().as_fields().0);
+    for repository in store.repositories()? {
+        let repository_id = repository.registration.id;
+        if store.overdue_schedule_slots(repository_id, now)?.is_empty() {
+            continue;
+        }
+        if let Err(error) =
+            crate::scheduler::Scheduler::reconcile_missed_windows(store, repository_id, seed, now)
+        {
+            record_recovery_issue(
+                store,
+                PathBuf::from(repository_id.to_string()),
+                "missed_window_unreconciled",
+                &format!("overdue release times could not be reconciled at startup: {error}"),
+                now,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn reconcile_interrupted_releases(
     store: &mut Store,
     managed_root: &Path,

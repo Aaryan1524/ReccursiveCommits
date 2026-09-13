@@ -44,3 +44,4 @@ jobs:
       - run: ./tests/scenarios/phase6_agent_submit.sh
       - run: ./tests/scenarios/phase6_capture_boundaries.sh
       - run: ./tests/scenarios/phase6_codex_integration.sh
+      - run: ./tests/scenarios/phase6_agent_publication.sh

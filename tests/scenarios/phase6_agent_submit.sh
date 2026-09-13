@@ -112,7 +112,10 @@ fi
 # and the response says which — an agent must carry that number forward.
 sealed_revision="$(cli plan seal "$feature_id" | sed -E 's/.*"revision":([0-9]+).*/\1/')"
 [[ "$sealed_revision" == "2" ]] || fail "sealing did not append revision 2, got $sealed_revision"
-cli plan show "$feature_id" --revision 1 | grep -q '"sealed":false' || \
+# Matched from a variable, not a pipe: a quiet grep that matches early would SIGPIPE the writer
+# and, under `pipefail`, turn a found match into a failed assertion.
+draft_revision="$(cli plan show "$feature_id" --revision 1)"
+grep -q '"sealed":false' <<<"$draft_revision" || \
   fail "sealing modified the draft revision instead of appending a new one"
 cli plan seal "$feature_id" >"$fixture_root/reseal.json" 2>&1 && fail "an already-sealed plan was sealed again"
 grep -q '"code":"conflict"' "$fixture_root/reseal.json" || \

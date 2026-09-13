@@ -39,6 +39,16 @@ fail() {
     printf '%s\n' 'Queue audit:' >&2
     cli queue audit >&2 || true
   fi
+  if [[ -f "$fixture_root/remote-at-exit.txt" ]]; then
+    printf '%s\n' "Remote when the wait loop exited ($(cat "$fixture_root/exit-time.txt" 2>/dev/null)):" >&2
+    cat "$fixture_root/remote-at-exit.txt" >&2
+    printf '%s\n' 'Attempts that satisfied the wait:' >&2
+    cat "$fixture_root/attempts-at-exit.json" >&2
+  fi
+  if [[ -d "$fixture_root/verification" ]]; then
+    printf '%s\n' 'The clone the assertion actually read:' >&2
+    git -C "$fixture_root/verification" log --format='%H%x09%s' >&2 || true
+  fi
   if [[ -d "$fixture_root/remote.git" ]]; then
     printf '%s\n' 'Each published commit and what it changed:' >&2
     git -C "$fixture_root/remote.git" log --format='--- %H %s' --name-status refs/heads/main >&2 || true
@@ -185,6 +195,10 @@ for _ in {1..210}; do
   attempts="$(cli release attempts --limit 10)"
   if [[ "$(grep -o '"status":"published"' <<<"$attempts" | wc -l | tr -d ' ')" == "3" ]]; then
     published=yes
+    printf '%s\n' "$attempts" >"$fixture_root/attempts-at-exit.json"
+    date +%s%3N >"$fixture_root/exit-time.txt" 2>/dev/null || date +%s000 >"$fixture_root/exit-time.txt"
+    git -C "$fixture_root/remote.git" log --format='%H%x09%s' refs/heads/main \
+      >"$fixture_root/remote-at-exit.txt" 2>&1 || true
     break
   fi
   sleep 2
@@ -198,8 +212,13 @@ git clone --quiet "$fixture_root/remote.git" "$fixture_root/verification"
 for file in first.txt second.txt third.txt; do
   [[ -f "$fixture_root/verification/$file" ]] || fail "published history is missing $file"
 done
+# Read the log once into a variable rather than piping it into `grep -q`. Under `pipefail` a
+# quiet grep that matches early exits immediately, the writer on the left takes SIGPIPE, and the
+# pipeline reports 141 — so the assertion fails precisely when the subject it is looking for is
+# the newest commit. That is a property of the harness, not of the history being checked.
+published_subjects="$(git -C "$fixture_root/verification" log --format=%s)"
 for subject in "Add first agent unit" "Add second agent unit" "Add third agent unit"; do
-  git -C "$fixture_root/verification" log --format=%s | grep -Fxq "$subject" || \
+  grep -Fxq "$subject" <<<"$published_subjects" || \
     fail "published history is missing the plan-derived subject: $subject"
 done
 

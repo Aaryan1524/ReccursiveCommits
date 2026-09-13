@@ -6,6 +6,10 @@ repository checkout and writes code, and every step below is an ordinary CLI
 invocation with `--json`. There is no vendor SDK, no plugin, and no daemon-side
 knowledge of any particular tool.
 
+The supported Codex package is documented in [CODEX.md](CODEX.md). It is an
+instruction layer over this contract; it does not add a separate transport,
+daemon, or publishing path.
+
 The protocol exists because a session that writes code and a service that
 publishes it have to agree on three things they cannot otherwise see: which plan
 the work belongs to, which base commit it was written against, and when a unit of
@@ -17,7 +21,7 @@ this replaces.
 **Versioned.** Every request carries `api_version`, and the daemon refuses a
 version it does not implement rather than interpreting an unfamiliar payload. The
 CLI surfaces that as exit code 13, which an agent should treat as "upgrade", not
-"retry". The current version is 12.
+"retry". The current version is 13.
 
 **Idempotent.** Any step that changes state accepts `--idempotency-key`, which
 makes a repeat of that step return the first result instead of acting again. See

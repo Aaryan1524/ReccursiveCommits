@@ -18,6 +18,7 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state repository list
 cargo run -p reccursive-cli -- --state-dir /path/to/state status
 cargo run -p reccursive-cli -- --state-dir /path/to/state logs --limit 50
 cargo run -p reccursive-cli -- --state-dir /path/to/state plan import feature-plan.json
+cargo run -p reccursive-cli -- --state-dir /path/to/state plan seal feature_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state plan show feature_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state plan history feature_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state workspace create feature_<uuid>
@@ -25,7 +26,9 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state workspace create featu
 cargo run -p reccursive-cli -- --state-dir /path/to/state workspace show feature_<uuid> --revision 1
 cargo run -p reccursive-cli -- --state-dir /path/to/state package capture feature_<uuid> --revision 1 --task task_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state package show package_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state task submit feature_<uuid> --revision 1 --task task_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state task cancel feature_<uuid> --revision 1 --task task_<uuid> --message "replaced by a newer approach"
+cargo run -p reccursive-cli -- --state-dir /path/to/state feature status feature_<uuid> --revision 1
 cargo run -p reccursive-cli -- --state-dir /path/to/state release publish package_<uuid> --revision 1 --message "feat: publish the unit" --author-name "Your Name" --author-email you@example.invalid
 cargo run -p reccursive-cli -- --state-dir /path/to/state release attempt attempt_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state release attempts --package-id package_<uuid> --limit 50

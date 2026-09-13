@@ -57,8 +57,19 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state queue audit
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue export /absolute/path/to/queue-backup
 ```
 
-Pass `--json` for a stable JSON envelope with no prompts or spinners. The
+Pass `--json` for a stable JSON envelope with no prompts or spinners. Successful
+responses are written to standard output; failures are written to standard error
+with the same `{ "ok": false, "error": { "code": "...", "message": "..." } }` shape,
+including command and argument mistakes. `--help` and `--version` are successful
+commands and write their human-readable output to standard output. The
 `RECCURSIVE_STATE_DIR` environment variable can replace `--state-dir`.
+
+`doctor --json` intentionally writes its complete multi-check report to standard
+output even when it finds a problem, so callers always receive one report rather
+than an incomplete result plus a separate error object.
+
+Run `reccursive --help` for a short start-here path, or use
+`reccursive <command> --help` to inspect a command group before making changes.
 
 An agent driving the CLI should start from
 [`AGENT_HANDOFF.md`](AGENT_HANDOFF.md), which specifies the whole sequence.

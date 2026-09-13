@@ -210,7 +210,7 @@ grep -q '"created":true' <<<"$accepted" || \
 "$binary_dir/reccursive" --state-dir "$fixture_root/state" --json \
   task submit "$feature_id" --revision 1 --task "$task_id" --check my-own-check \
   >"$fixture_root/check-attempt.json" 2>&1 && fail "a client-named release check was accepted"
-grep -qi 'unexpected argument' "$fixture_root/check-attempt.json" || \
+grep -q '"code":"usage"' "$fixture_root/check-attempt.json" || \
   fail "naming a release check failed for the wrong reason: $(cat "$fixture_root/check-attempt.json")"
 
 printf 'PASS every out-of-scope attempt was refused with the queue unchanged, and in-scope work still succeeded\n'

@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 13 removes the unenforced client-named release checks.
-pub const API_VERSION: u16 = 13;
+/// Local API protocol version. Version 14 adds atomic repository initialization with its first
+/// schedule policy.
+pub const API_VERSION: u16 = 14;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -124,6 +125,7 @@ impl RequestEnvelope {
         }
         match &self.command {
             Command::EnrollRepository(request) => request.validate(),
+            Command::InitializeRepository(request) => request.validate(),
             Command::CreateWorkspace(request) => request.validate(),
             Command::CapturePackage(request) => request.validate(),
             Command::CancelTask(request) => request.validate(),
@@ -194,6 +196,8 @@ impl RequestEnvelope {
 pub enum Command {
     Ping,
     EnrollRepository(EnrollRepositoryRequest),
+    /// Register a repository and activate its first scheduling policy as one durable operation.
+    InitializeRepository(InitializeRepositoryRequest),
     ListRepositories,
     ListEvents {
         limit: usize,
@@ -328,6 +332,7 @@ impl Command {
     pub const fn changes_state(&self) -> bool {
         match self {
             Self::EnrollRepository(_)
+            | Self::InitializeRepository(_)
             | Self::ImportPlan { .. }
             | Self::SealPlan { .. }
             | Self::SubmitTask(_)
@@ -381,6 +386,7 @@ impl Command {
             Self::ReleasePackage(_) => true,
             Self::Ping
             | Self::EnrollRepository(_)
+            | Self::InitializeRepository(_)
             | Self::ListRepositories
             | Self::ListEvents { .. }
             | Self::ImportPlan { .. }
@@ -594,6 +600,23 @@ pub struct EnrollRepositoryRequest {
     pub publication_mode: PublicationMode,
     pub target: TargetRef,
     pub development_target: Option<TargetRef>,
+}
+
+/// Validated inputs needed to make a repository ready to accept scheduled work.
+///
+/// Enrollment and initial schedule activation are one request because a repository without an
+/// active schedule policy is not a usable scheduled publisher. Keeping them together lets the
+/// daemon persist both or neither across a crash.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InitializeRepositoryRequest {
+    pub enrollment: EnrollRepositoryRequest,
+    pub schedule_policy: SchedulePolicy,
+}
+
+impl InitializeRepositoryRequest {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        self.enrollment.validate()
+    }
 }
 
 impl EnrollRepositoryRequest {
@@ -934,6 +957,10 @@ pub enum ResponseData {
     },
     RepositoryEnrolled {
         repository: RepositoryView,
+    },
+    RepositoryInitialized {
+        repository: RepositoryView,
+        schedule_policy: SchedulePolicyView,
     },
     Repositories {
         repositories: Vec<RepositoryView>,

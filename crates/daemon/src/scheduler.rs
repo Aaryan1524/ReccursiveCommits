@@ -104,6 +104,16 @@ impl Scheduler {
             if store.repository_pause(repository_id)?.is_some() {
                 continue;
             }
+            // A repository whose remote is failing waits out its own backoff. Scoped to this
+            // repository so a single unreachable remote cannot stall every other one, and durable
+            // so a restart mid-outage resumes the wait instead of retrying immediately.
+            if !store.integration_is_ready(
+                reccursive_core::Integration::Git,
+                &repository_id.to_string(),
+                now_unix_ms,
+            )? {
+                continue;
+            }
             let mut due = Vec::new();
             for slot in store.overdue_schedule_slots(repository_id, now_unix_ms)? {
                 // A unit is claimable only while every one of its tasks is still merely scheduled.
@@ -833,6 +843,50 @@ mod tests {
         assert!(
             refused.is_err(),
             "release-now must not bypass the eligibility rules: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_failing_remote_delays_only_its_own_repository() {
+        let now = 1_800_000_000_000;
+        let (mut store, busy_repo, _, _, _) =
+            overdue_fixture(MissedWindowBehavior::RescheduleForward, 2, now);
+        let (quiet_repo, quiet_unit) = add_second_repository(&mut store, now);
+
+        // The first repository's remote is unreachable.
+        store
+            .record_integration_failure(
+                reccursive_core::Integration::Git,
+                &busy_repo.to_string(),
+                reccursive_core::ConnectivityFault::Unreachable,
+                "could not reach the remote",
+                reccursive_core::BackoffPolicy::default(),
+                now,
+            )
+            .unwrap();
+
+        let due = Scheduler::due_units(&store, now, 10).unwrap();
+
+        assert!(
+            due.iter().all(|unit| unit.repository_id == quiet_repo),
+            "a repository waiting out a remote outage must not be handed work"
+        );
+        assert!(
+            due.iter().any(|unit| unit.release_unit_id == quiet_unit),
+            "an unrelated repository must keep working through another's outage"
+        );
+
+        // Once the backoff elapses, the repository is offered work again.
+        let health = store
+            .integration_health(reccursive_core::Integration::Git, &busy_repo.to_string())
+            .unwrap()
+            .unwrap();
+        let after = health.next_attempt_at_unix_ms.unwrap();
+        assert!(
+            Scheduler::due_units(&store, after, 10)
+                .unwrap()
+                .iter()
+                .any(|unit| unit.repository_id == busy_repo)
         );
     }
 

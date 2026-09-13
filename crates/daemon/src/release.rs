@@ -17,6 +17,8 @@ use std::{
 
 use reccursive_capture::SnapshotPackage;
 
+use reccursive_core::{BackoffPolicy, Integration};
+
 use crate::lifecycle::ConnectivityFault;
 use reccursive_git::{
     CandidateApplyOutcome, CandidateCommitRequest, CandidatePublishError, CandidatePublishRequest,
@@ -353,6 +355,12 @@ impl ReleaseWorker {
         store.advance_release_attempt(id, TaskStatus::PushPending, None, now_unix_ms)?;
         match workspace.publish(candidate, &publish_request, GIT_TIMEOUT) {
             Ok(published) => {
+                // The endpoint answered: the next outage should start from the beginning rather
+                // than inheriting this one's backoff.
+                store.clear_integration_failure(
+                    Integration::Git,
+                    &attempt.repository_id.to_string(),
+                )?;
                 self.confirm_publication(store, attempt, &published.commit, now_unix_ms)?;
                 Ok(ReleaseOutcome::Published {
                     attempt_id: id,
@@ -536,6 +544,18 @@ impl ReleaseWorker {
             return Ok(());
         }
         store.record_publication_failure(attempt.attempt_id, classification, now_unix_ms)?;
+        // Recorded against this repository's Git endpoint specifically, so an unreachable remote
+        // delays only this repository, and only its Git work. A fault that waiting cannot fix
+        // schedules no retry at all, which is what stops a rejected credential being presented
+        // over and over.
+        store.record_integration_failure(
+            Integration::Git,
+            &attempt.repository_id.to_string(),
+            ConnectivityFault::classify_git(detail),
+            detail,
+            BackoffPolicy::default(),
+            now_unix_ms,
+        )?;
         let reason = StateReason::new(reason_code(classification), detail)
             .map_err(|error| StoreError::InvalidData(error.to_string()))?;
         store.advance_release_attempt(

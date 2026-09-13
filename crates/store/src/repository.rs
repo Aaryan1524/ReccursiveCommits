@@ -148,6 +148,86 @@ impl Store {
         Ok(())
     }
 
+    /// Activates one immutable scheduling-override revision for a repository.
+    ///
+    /// The override is stored unresolved. It is combined with whatever policy is active at the
+    /// moment a selection is made, so changing either one independently stays coherent.
+    pub fn activate_schedule_override(
+        &mut self,
+        repository_id: RepositoryId,
+        override_policy: &reccursive_core::SchedulePolicyOverride,
+        created_at_unix_ms: i64,
+    ) -> Result<Revision, StoreError> {
+        if created_at_unix_ms < 0 {
+            return Err(StoreError::InvalidData(
+                "schedule override timestamp must not be negative".into(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM repositories WHERE id = ?1)",
+            [repository_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::InvalidData(format!(
+                "repository {repository_id} does not exist"
+            )));
+        }
+        let current: Option<u32> = transaction
+            .query_row(
+                "SELECT revision FROM repository_schedule_overrides
+                 WHERE repository_id = ?1 AND active = 1",
+                [repository_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let revision = match current {
+            Some(revision) => Revision::new(revision)
+                .and_then(Revision::next)
+                .map_err(|error| StoreError::InvalidData(error.to_string()))?,
+            None => Revision::FIRST,
+        };
+        transaction.execute(
+            "UPDATE repository_schedule_overrides SET active = 0
+             WHERE repository_id = ?1 AND active = 1",
+            [repository_id.to_string()],
+        )?;
+        transaction
+            .execute(
+                "INSERT INTO repository_schedule_overrides (
+                    repository_id, revision, override_json, created_at_unix_ms, active
+                 ) VALUES (?1, ?2, ?3, ?4, 1)",
+                params![
+                    repository_id.to_string(),
+                    revision.get(),
+                    serde_json::to_string(override_policy)?,
+                    created_at_unix_ms,
+                ],
+            )
+            .map_err(map_write_error)?;
+        transaction.commit()?;
+        Ok(revision)
+    }
+
+    /// Returns a repository's active scheduling override, if one has been set.
+    pub fn schedule_override(
+        &self,
+        repository_id: RepositoryId,
+    ) -> Result<Option<reccursive_core::SchedulePolicyOverride>, StoreError> {
+        let raw: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT override_json FROM repository_schedule_overrides
+                 WHERE repository_id = ?1 AND active = 1",
+                [repository_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.map(|json| serde_json::from_str(&json).map_err(StoreError::from))
+            .transpose()
+    }
+
     /// Returns the active schedule policy for a repository, if it has been configured.
     pub fn schedule_policy(
         &self,
@@ -188,6 +268,30 @@ impl Store {
     ) -> Result<(), StoreError> {
         registration.validate()?;
         ensure_policy_owner(registration.id, policy)?;
+        // One publisher per remote and branch. A second checkout of the same repository publishing
+        // to the same target is two writers racing for one ref, which is exactly the situation the
+        // release lease exists to prevent — so it is refused at enrollment rather than discovered
+        // later as a conflict.
+        let duplicate: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT r.checkout_path
+                 FROM repositories r
+                 JOIN repository_policies p
+                   ON p.repository_id = r.id AND p.revision = r.active_policy_revision
+                 WHERE r.canonical_remote = ?1 AND p.target_ref = ?2
+                 LIMIT 1",
+                params![registration.canonical_remote, policy.target.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = duplicate {
+            return Err(StoreError::Conflict(format!(
+                "{} is already enrolled to publish {} on this remote; two checkouts must not                  publish to one branch",
+                existing,
+                policy.target.as_str()
+            )));
+        }
         let transaction = self.connection.transaction()?;
         transaction
             .execute(

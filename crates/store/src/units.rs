@@ -34,6 +34,8 @@ pub struct LifecycleOutcome {
     pub blocked_dependents: Vec<TaskId>,
     /// Validation results marked stale because the work they attest to changed.
     pub invalidated_evidence: usize,
+    /// Release units whose selected release time was withdrawn as a result.
+    pub withdrawn_schedules: Vec<ReleaseUnitId>,
 }
 
 impl Store {
@@ -224,9 +226,19 @@ impl Store {
         )?;
         let invalidated_evidence =
             self.invalidate_task_evidence(task_id, "task cancelled", now_unix_ms)?;
+        // A cancelled task and everything blocked behind it are no longer releasable, so any
+        // release time already chosen for them is stale future work rather than a plan.
+        let withdrawn_schedules = self.withdraw_schedules_for_tasks(
+            feature_id,
+            plan_revision,
+            std::iter::once(task_id).chain(blocked_dependents.iter().copied()),
+            "a task in this unit was cancelled",
+            now_unix_ms,
+        )?;
         Ok(LifecycleOutcome {
             blocked_dependents,
             invalidated_evidence,
+            withdrawn_schedules,
         })
     }
 
@@ -259,10 +271,50 @@ impl Store {
         )?;
         let invalidated_evidence =
             self.invalidate_task_evidence(task_id, "task superseded", now_unix_ms)?;
+        let withdrawn_schedules = self.withdraw_schedules_for_tasks(
+            feature_id,
+            plan_revision,
+            std::iter::once(task_id).chain(blocked_dependents.iter().copied()),
+            "a task in this unit was superseded",
+            now_unix_ms,
+        )?;
         Ok(LifecycleOutcome {
             blocked_dependents,
             invalidated_evidence,
+            withdrawn_schedules,
         })
+    }
+
+    /// Withdraws the live schedule of every unit containing one of these tasks.
+    ///
+    /// A unit an attempt already owns is skipped rather than disturbed; the caller learns which
+    /// units actually moved from the returned list.
+    fn withdraw_schedules_for_tasks(
+        &mut self,
+        feature_id: FeatureId,
+        plan_revision: Revision,
+        task_ids: impl IntoIterator<Item = TaskId>,
+        reason: &str,
+        now_unix_ms: i64,
+    ) -> Result<Vec<ReleaseUnitId>, StoreError> {
+        let mut units = BTreeSet::new();
+        for task_id in task_ids {
+            if let Some(unit) = self.release_unit_for_task(feature_id, plan_revision, task_id)? {
+                units.insert(unit.unit_id);
+            }
+        }
+        let mut withdrawn = Vec::new();
+        for unit_id in units {
+            match self.invalidate_schedule_slot(unit_id, reason, now_unix_ms) {
+                Ok(Some(_)) => withdrawn.push(unit_id),
+                Ok(None) => {}
+                // A live attempt owns this unit. Cancellation still stands; the attempt's own
+                // failure path reports it.
+                Err(StoreError::Conflict(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(withdrawn)
     }
 
     /// Counts validation results that still stand for a package revision.

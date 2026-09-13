@@ -19,13 +19,14 @@ use reccursive_capture::{
 };
 use reccursive_protocol::{
     ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest, Command,
-    CreateReleaseUnitRequest, CreateWorkspaceRequest, EnrollRepositoryRequest, EventSeverityView,
-    EventView, PackageView, PlanView, ProtocolValidationError, QueueAuditView, QueueExportView,
-    QueueRecoveryIssueView, ReasonCode, ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView,
-    RepositoryId, RepositoryPolicy, RepositoryView, RequestEnvelope, RequestId, ResponseData,
-    ResponseEnvelope, Revision, SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest,
-    SetSchedulePolicyRequest, StateReason, TaskCancellationView, TaskStatus, TransportError,
-    WorkspacePrerequisiteView, WorkspaceView,
+    CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
+    EventSeverityView, EventView, MissedWindowView, PackageView, PlanView, ProtocolValidationError,
+    QueueAuditView, QueueExportView, QueueRecoveryIssueView, ReasonCode, ReleaseAttemptView,
+    ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryView,
+    RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision, SchedulePolicyView,
+    ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest,
+    StateReason, TaskCancellationView, TaskStatus, TransportError, WorkspacePrerequisiteView,
+    WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -418,6 +419,30 @@ fn dispatch(
         Command::GetSchedulePolicy { repository_id } => get_schedule_policy(repository_id, store),
         Command::ScheduleUnit(request) => schedule_unit(request, store),
         Command::GetScheduleSlot { release_unit_id } => get_schedule_slot(release_unit_id, store),
+        Command::WithdrawScheduleSlot {
+            release_unit_id,
+            reason,
+        } => withdraw_schedule_slot(release_unit_id, &reason, store),
+        Command::RecalculateSchedule {
+            repository_id,
+            reason,
+        } => recalculate_schedule(repository_id, &reason, store),
+        Command::ReconcileMissedWindows {
+            repository_id,
+            seed,
+        } => reconcile_missed_windows(repository_id, seed, store),
+        Command::SetScheduleOverride {
+            repository_id,
+            override_policy,
+        } => set_schedule_override(repository_id, &override_policy, store),
+        Command::ListDueUnits { concurrency_limit } => list_due_units(concurrency_limit, store),
+        Command::PauseRepository {
+            repository_id,
+            reason,
+        } => pause_repository(repository_id, &reason, store),
+        Command::ResumeRepository { repository_id } => resume_repository(repository_id, store),
+        Command::ReleaseUnitNow { release_unit_id } => release_unit_now(release_unit_id, store),
+        Command::PreviewSchedule { repository_id } => preview_schedule(repository_id, store),
         Command::GetReleaseAttempt { attempt_id } => get_release_attempt(attempt_id, store),
         Command::ListReleaseAttempts { package_id, limit } => {
             list_release_attempts(package_id, limit, store)
@@ -452,6 +477,15 @@ fn command_name(command: &Command) -> &'static str {
         Command::GetSchedulePolicy { .. } => "schedule.policy.show",
         Command::ScheduleUnit(_) => "schedule.unit",
         Command::GetScheduleSlot { .. } => "schedule.slot.show",
+        Command::WithdrawScheduleSlot { .. } => "schedule.withdraw",
+        Command::RecalculateSchedule { .. } => "schedule.recalculate",
+        Command::ReconcileMissedWindows { .. } => "schedule.missed_windows",
+        Command::SetScheduleOverride { .. } => "schedule.override.set",
+        Command::ListDueUnits { .. } => "schedule.due",
+        Command::PauseRepository { .. } => "schedule.pause",
+        Command::ResumeRepository { .. } => "schedule.resume",
+        Command::ReleaseUnitNow { .. } => "schedule.release_now",
+        Command::PreviewSchedule { .. } => "schedule.preview",
         Command::GetReleaseAttempt { .. } => "release.attempt",
         Command::ListReleaseAttempts { .. } => "release.attempts",
         Command::GetPackage { .. } => "package.show",
@@ -1670,6 +1704,154 @@ fn get_schedule_slot(
     Ok(ResponseData::ScheduleSlot {
         slot: schedule_slot_view(slot),
     })
+}
+
+fn withdraw_schedule_slot(
+    release_unit_id: reccursive_protocol::ReleaseUnitId,
+    reason: &str,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let withdrawn = lock_store(store)?
+        .invalidate_schedule_slot(release_unit_id, reason, now)
+        .map_err(store_api_error)?;
+    // Reported as a recalculation rather than a slot, because after this call there is no live
+    // slot to return: the unit is back in the queue awaiting a fresh selection.
+    Ok(ResponseData::ScheduleRecalculated {
+        recalculation: ScheduleRecalculationView {
+            withdrawn: withdrawn.map(|_| vec![release_unit_id]).unwrap_or_default(),
+            retained: Vec::new(),
+        },
+    })
+}
+
+fn recalculate_schedule(
+    repository_id: RepositoryId,
+    reason: &str,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let outcome = lock_store(store)?
+        .invalidate_repository_schedule(repository_id, reason, now)
+        .map_err(store_api_error)?;
+    Ok(ResponseData::ScheduleRecalculated {
+        recalculation: ScheduleRecalculationView {
+            withdrawn: outcome.withdrawn,
+            retained: outcome.retained,
+        },
+    })
+}
+
+fn reconcile_missed_windows(
+    repository_id: RepositoryId,
+    seed: u64,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let mut store = lock_store(store)?;
+    let outcome = Scheduler::reconcile_missed_windows(&mut store, repository_id, seed, now)
+        .map_err(scheduler_api_error)?;
+    Ok(ResponseData::MissedWindowsReconciled {
+        outcome: MissedWindowView {
+            released_now: outcome.released_now,
+            rescheduled: outcome.rescheduled,
+            retained: outcome.retained,
+        },
+    })
+}
+
+fn set_schedule_override(
+    repository_id: RepositoryId,
+    override_policy: &reccursive_protocol::SchedulePolicyOverride,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let revision = lock_store(store)?
+        .activate_schedule_override(repository_id, override_policy, now)
+        .map_err(store_api_error)?;
+    Ok(ResponseData::ScheduleOverrideActivated {
+        repository_id,
+        revision,
+    })
+}
+
+fn list_due_units(
+    concurrency_limit: usize,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let store = lock_store(store)?;
+    let units = Scheduler::due_units(&store, now, concurrency_limit)
+        .map_err(scheduler_api_error)?
+        .into_iter()
+        .map(|unit| DueUnitView {
+            release_unit_id: unit.release_unit_id,
+            repository_id: unit.repository_id,
+            package_id: unit.package_id,
+            package_revision: unit.package_revision,
+            selected_at_unix_ms: unit.selected_at_unix_ms,
+        })
+        .collect();
+    Ok(ResponseData::DueUnits { units })
+}
+
+fn pause_repository(
+    repository_id: RepositoryId,
+    reason: &str,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    lock_store(store)?
+        .pause_repository(repository_id, reason, now)
+        .map_err(store_api_error)?;
+    Ok(ResponseData::RepositoryPaused {
+        repository_id,
+        reason: reason.to_owned(),
+    })
+}
+
+fn resume_repository(
+    repository_id: RepositoryId,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let was_paused = lock_store(store)?
+        .resume_repository(repository_id)
+        .map_err(store_api_error)?;
+    Ok(ResponseData::RepositoryResumed {
+        repository_id,
+        was_paused,
+    })
+}
+
+fn release_unit_now(
+    release_unit_id: reccursive_protocol::ReleaseUnitId,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let slot = lock_store(store)?
+        .release_unit_now(release_unit_id, now)
+        .map_err(store_api_error)?;
+    Ok(ResponseData::ScheduleSlot {
+        slot: schedule_slot_view(slot),
+    })
+}
+
+fn preview_schedule(
+    repository_id: RepositoryId,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let store = lock_store(store)?;
+    let slots = store
+        .schedule_slots(repository_id)
+        .map_err(store_api_error)?
+        .into_iter()
+        .map(schedule_slot_view)
+        .collect();
+    let paused = store
+        .repository_pause(repository_id)
+        .map_err(store_api_error)?
+        .map(|pause| pause.reason);
+    Ok(ResponseData::SchedulePreview { slots, paused })
 }
 
 fn schedule_slot_view(slot: reccursive_store::ScheduleSlot) -> ScheduleSlotView {

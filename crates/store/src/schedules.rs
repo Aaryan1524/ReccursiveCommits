@@ -673,7 +673,6 @@ mod tests {
                 feature_id,
                 Revision::FIRST,
                 BTreeSet::from([task_id]),
-                BTreeSet::new(),
                 4,
             )
             .unwrap();
@@ -871,7 +870,6 @@ mod recalculation_tests {
                     feature_id,
                     Revision::FIRST,
                     BTreeSet::from([*task_id]),
-                    BTreeSet::new(),
                     4,
                 )
                 .unwrap();
@@ -1157,7 +1155,6 @@ mod concurrency_tests {
                 feature_id,
                 Revision::FIRST,
                 BTreeSet::from([task_id]),
-                BTreeSet::new(),
                 4,
             )
             .unwrap();

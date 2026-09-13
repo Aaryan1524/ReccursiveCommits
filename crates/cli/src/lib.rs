@@ -162,9 +162,6 @@ enum TaskCommand {
         revision: Option<Revision>,
         #[arg(long = "task", required = true)]
         task_ids: Vec<TaskId>,
-        /// Checks the release must pass before publication.
-        #[arg(long = "check")]
-        required_checks: Vec<String>,
         /// Seed for the deterministic release-time selection.
         #[arg(long, default_value_t = 0)]
         seed: u64,
@@ -213,8 +210,6 @@ enum ReleaseCommand {
         revision: Revision,
         #[arg(long = "task", required = true)]
         task_ids: Vec<TaskId>,
-        #[arg(long = "check")]
-        required_checks: Vec<String>,
     },
     /// Show one durable release unit.
     ShowUnit { release_unit_id: ReleaseUnitId },
@@ -618,7 +613,6 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 feature_id,
                 revision,
                 task_ids,
-                required_checks,
                 seed,
             } => {
                 let data = send(
@@ -627,7 +621,6 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                         feature_id,
                         plan_revision: revision,
                         task_ids: task_ids.into_iter().collect(),
-                        required_checks: required_checks.into_iter().collect(),
                         seed,
                     }),
                 )?;
@@ -683,7 +676,6 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 feature_id,
                 revision,
                 task_ids,
-                required_checks,
             } => {
                 let data = send(
                     &session,
@@ -692,7 +684,6 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                         feature_id,
                         plan_revision: revision,
                         task_ids: task_ids.into_iter().collect(),
-                        required_checks: required_checks.into_iter().collect(),
                     }),
                 )?;
                 output_data(data, cli.json, stdout)
@@ -1505,7 +1496,7 @@ fn output_package(out: &mut impl Write, package: &PackageView) -> io::Result<()>
 fn output_release_unit(out: &mut impl Write, unit: &ReleaseUnitView) -> io::Result<()> {
     writeln!(
         out,
-        "Unit: {}\nFeature: {} revision {}\nTasks: {}\nRequired checks: {}",
+        "Unit: {}\nFeature: {} revision {}\nTasks: {}",
         unit.unit_id,
         unit.feature_id,
         unit.plan_revision.get(),
@@ -1514,15 +1505,6 @@ fn output_release_unit(out: &mut impl Write, unit: &ReleaseUnitView) -> io::Resu
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", "),
-        if unit.required_checks.is_empty() {
-            "none".to_owned()
-        } else {
-            unit.required_checks
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        },
     )
 }
 

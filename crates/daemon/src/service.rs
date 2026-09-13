@@ -446,6 +446,10 @@ fn execute_command(
 
     match claim {
         IdempotencyClaim::Settled { outcome } => return replay_outcome(key, &outcome),
+        // Reachable: each connection is handled on its own thread, and the store lock is released
+        // for the duration of the command. A duplicate is refused rather than queued behind the
+        // original, because holding a connection open for the length of a publication is a worse
+        // answer than telling the caller to ask again.
         IdempotencyClaim::InProgress => {
             return Err(ApiError::new(
                 ApiErrorCode::TemporarilyUnavailable,

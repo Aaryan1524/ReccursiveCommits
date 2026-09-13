@@ -1183,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn every_command_that_writes_is_classified_as_writing() {
+    fn queries_and_writes_are_classified_distinctly() {
         assert!(!Command::Ping.changes_state());
         assert!(!Command::Status.changes_state());
         assert!(!Command::AuditQueue.changes_state());

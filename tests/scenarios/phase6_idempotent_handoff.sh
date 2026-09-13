@@ -148,4 +148,38 @@ unit_id="$(cli --idempotency-key "agent-alpha/unit/$task_id" release create-unit
 first_status="$(cli --idempotency-key "agent-alpha/status" status)"
 grep -q '"repository_count":1' <<<"$first_status" || fail "status did not report the enrolled repository"
 
-printf 'PASS a retried request returned its first result, and a reused key for a different request was refused\n'
+# A recorded *failure* replays too. This is the half of the design that protects against a second
+# push, so the stored outcome has to survive the round-trip through storage, not just a success.
+missing_task="task_00000000-0000-4000-8000-0000000006ff"
+failure_key="agent-alpha/capture/$missing_task"
+cli --idempotency-key "$failure_key" package capture "$feature_id" --revision 1 --task "$missing_task" \
+  >"$fixture_root/first-failure.json" 2>&1 && fail "capturing an unknown task was accepted"
+cli --idempotency-key "$failure_key" package capture "$feature_id" --revision 1 --task "$missing_task" \
+  >"$fixture_root/replayed-failure.json" 2>&1 && fail "the replayed failure was returned as a success"
+first_code="$(json_field code <"$fixture_root/first-failure.json")"
+replayed_code="$(json_field code <"$fixture_root/replayed-failure.json")"
+[[ -n "$first_code" && "$replayed_code" == "$first_code" ]] || \
+  fail "the replayed failure was $replayed_code rather than the recorded $first_code"
+
+# A publication carries the highest cost of being repeated, so a retried publish must not start a
+# second attempt. Removing the remote is the cheapest way to make a real publication stop partway:
+# the attempt is created and recorded, then blocked. The publish still answers successfully — the
+# answer is the blocked attempt — so what is being checked is that the retry returns *that* attempt
+# rather than opening another one against the same package.
+mv "$fixture_root/remote.git" "$fixture_root/remote-gone.git"
+publish_key="agent-alpha/publish/$package_id"
+publish() {
+  cli --idempotency-key "$publish_key" release publish "$package_id" --revision 1 \
+    --message "Publish exactly once" --author-name "Scenario Fixture" \
+    --author-email fixture@example.invalid
+}
+first_attempt="$(publish | json_field attempt_id)"
+[[ "$first_attempt" == attempt_* ]] || fail "the publication did not record an attempt"
+replayed_attempt="$(publish | json_field attempt_id)"
+[[ "$replayed_attempt" == "$first_attempt" ]] || \
+  fail "the retried publication returned $replayed_attempt instead of the original $first_attempt"
+attempt_count="$(cli release attempts --limit 10 | grep -o '"attempt_id":"attempt_' | wc -l | tr -d ' ')"
+[[ "$attempt_count" == "1" ]] || \
+  fail "the retried publication left $attempt_count attempts instead of replaying the first"
+
+printf 'PASS a retried request returned its first result, a recorded failure replayed, and a reused key for a different request was refused\n'

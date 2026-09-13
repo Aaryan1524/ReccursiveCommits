@@ -61,6 +61,46 @@ impl TaskStatus {
         )
     }
 
+    /// How far along the ordinary path this state sits, or `None` if it is not on that path.
+    ///
+    /// Positions exist so callers can ask "is this already at or past X" instead of walking
+    /// forward hoping to land on X exactly. Walking is how a task that had already gone past the
+    /// requested state got marched to the end of its lifecycle.
+    ///
+    /// `Blocked`, `Cancelled` and `Superseded` are deliberately absent: they are not points on
+    /// the path, and ordering them against it would invite exactly the comparison that has no
+    /// sensible answer.
+    #[must_use]
+    pub const fn ordinary_position(self) -> Option<u8> {
+        match self {
+            Self::Planned => Some(0),
+            Self::Building => Some(1),
+            Self::Captured => Some(2),
+            Self::Validated => Some(3),
+            Self::Queued => Some(4),
+            Self::Scheduled => Some(5),
+            Self::Reconciling => Some(6),
+            Self::Verifying => Some(7),
+            Self::CommitPrepared => Some(8),
+            Self::PushPending => Some(9),
+            Self::RemoteConfirmed => Some(10),
+            Self::Published => Some(11),
+            Self::Blocked | Self::Cancelled | Self::Superseded => None,
+        }
+    }
+
+    /// Reports whether this state is at or beyond `other` on the ordinary path.
+    ///
+    /// `None` when either state is off the path, because "further along" is not a question with
+    /// an answer for a blocked or cancelled task.
+    #[must_use]
+    pub const fn is_at_or_past(self, other: Self) -> Option<bool> {
+        match (self.ordinary_position(), other.ordinary_position()) {
+            (Some(mine), Some(theirs)) => Some(mine >= theirs),
+            _ => None,
+        }
+    }
+
     /// The next state on the ordinary path, or `None` where progress needs an explicit decision.
     ///
     /// Callers use this to walk a task forward without restating the lifecycle, so a state added
@@ -473,6 +513,34 @@ mod tests {
         assert!(!TaskStatus::Verifying.may_have_reached_remote());
         assert!(TaskStatus::PushPending.may_have_reached_remote());
         assert!(TaskStatus::Published.may_have_reached_remote());
+    }
+
+    #[test]
+    fn ordinary_positions_order_the_path_and_refuse_to_order_what_is_off_it() {
+        assert_eq!(
+            TaskStatus::Queued.is_at_or_past(TaskStatus::Captured),
+            Some(true)
+        );
+        assert_eq!(
+            TaskStatus::Captured.is_at_or_past(TaskStatus::Queued),
+            Some(false)
+        );
+        // Equal counts as "at or past", which is what makes repeating a completed step a no-op.
+        assert_eq!(
+            TaskStatus::Queued.is_at_or_past(TaskStatus::Queued),
+            Some(true)
+        );
+        // A blocked or cancelled task is not somewhere on the path, so the question has no answer
+        // rather than a misleading one.
+        for off_path in [
+            TaskStatus::Blocked,
+            TaskStatus::Cancelled,
+            TaskStatus::Superseded,
+        ] {
+            assert_eq!(off_path.ordinary_position(), None, "{off_path:?}");
+            assert_eq!(off_path.is_at_or_past(TaskStatus::Queued), None);
+            assert_eq!(TaskStatus::Queued.is_at_or_past(off_path), None);
+        }
     }
 
     #[test]

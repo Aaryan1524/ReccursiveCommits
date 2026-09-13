@@ -1464,6 +1464,32 @@ fn capture_package(
         ));
     }
 
+    // A task that already reached `captured` has a package holding its work. Capturing again
+    // would produce a second package delivering the same task, which is the duplication an agent
+    // retrying a step must never cause. A blocked task is deliberately still capturable: that is
+    // the fix-and-resubmit path after a failed check, and its content has changed.
+    for task_id in &request.task_ids {
+        let existing = lock_store(store)?
+            .task(request.feature_id, request.plan_revision, *task_id)
+            .map_err(store_api_error)?;
+        if let Some(task) = existing
+            && task
+                .state
+                .status()
+                .is_at_or_past(reccursive_protocol::TaskStatus::Captured)
+                == Some(true)
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::Conflict,
+                format!(
+                    "task {task_id} is already {status:?} and its work is captured; capture a new plan revision, or cancel it first, rather than capturing it twice",
+                    status = task.state.status()
+                ),
+                false,
+            ));
+        }
+    }
+
     let package = SnapshotPackage::capture(SnapshotRequest {
         package_id: reccursive_protocol::PackageId::new(),
         revision: Revision::FIRST,
@@ -2421,11 +2447,10 @@ fn current_unix_ms() -> Result<i64, ApiError> {
 
 fn store_api_error(error: StoreError) -> ApiError {
     match error {
-        StoreError::Conflict(_) => ApiError::new(
-            ApiErrorCode::Conflict,
-            "repository or policy conflicts with an existing profile",
-            false,
-        ),
+        // The store's conflict messages name the actual thing that conflicted — a task, an
+        // attempt, a lease. Replacing all of them with one sentence about repositories and
+        // policies made every conflict report a problem the caller did not have.
+        StoreError::Conflict(message) => ApiError::new(ApiErrorCode::Conflict, message, false),
         StoreError::InvalidData(message) => {
             ApiError::new(ApiErrorCode::InvalidRequest, message, false)
         }

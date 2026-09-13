@@ -26,12 +26,28 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state workspace show feature
 cargo run -p reccursive-cli -- --state-dir /path/to/state package capture feature_<uuid> --revision 1 --task task_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state package show package_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state task cancel feature_<uuid> --revision 1 --task task_<uuid> --message "replaced by a newer approach"
+cargo run -p reccursive-cli -- --state-dir /path/to/state release publish package_<uuid> --revision 1 --message "feat: publish the unit" --author-name "Your Name" --author-email you@example.invalid
+cargo run -p reccursive-cli -- --state-dir /path/to/state release attempt attempt_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state release attempts --package-id package_<uuid> --limit 50
 cargo run -p reccursive-cli -- --state-dir /path/to/state release create-unit feature_<uuid> --revision 1 --task task_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state release show-unit unit_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule set-policy repo_<uuid> schedule-policy.json
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule show-policy repo_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule unit unit_<uuid> --package-id package_<uuid> --revision 1
 cargo run -p reccursive-cli -- --state-dir /path/to/state schedule show unit_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule withdraw unit_<uuid> --reason "policy under review"
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule recalculate repo_<uuid> --reason "policy revised"
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule catch-up repo_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule set-override repo_<uuid> schedule-override.json
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule due --concurrency-limit 10
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule preview repo_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule pause repo_<uuid> --reason "investigating a failure"
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule resume repo_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state schedule release-now unit_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state service install
+cargo run -p reccursive-cli -- --state-dir /path/to/state service status
+cargo run -p reccursive-cli -- --state-dir /path/to/state service show
+cargo run -p reccursive-cli -- --state-dir /path/to/state service uninstall
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue audit
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue export /absolute/path/to/queue-backup
 ```
@@ -89,6 +105,23 @@ export manifest containing the database SHA-256. It excludes mutable workspaces,
 tokens, and publication credentials. Import/restore into another installation is a
 later workflow, so an export itself cannot enable a second publisher.
 
+`release publish` runs one complete publication through the daemon-owned worker:
+it fetches the current target, reconciles the captured package against it, reruns
+the repository's trusted checks on the reconciled candidate, creates the candidate
+commit with the supplied message and identity, and pushes it as an ordinary
+fast-forward. Every stage is made durable before the operation it names, and the
+candidate SHA and push intent are recorded before the remote is contacted, so a
+crash mid-push is resolved against the remote rather than repeated as a second
+commit. A competing push is reconciled onto, never forced over. Conflicts, changed
+targets, failed checks, transport failures, and ambiguous remote states each stop
+the attempt with a durable classification rather than retrying blindly.
+
+`release attempt` shows one durable attempt, including its status, candidate SHA,
+observed remote SHA, failure classification, and the reason it stopped.
+`release attempts` lists recent attempts, optionally restricted to one package with
+`--package-id`. Both read durable state, so an attempt remains inspectable long
+after the process that created it exited.
+
 `release create-unit` groups tasks that cannot independently leave the target
 usable into one release unit; a task whose only remaining dependency is that its
 prerequisite be *captured* is coupled into the same unit, while a task waiting for
@@ -105,6 +138,78 @@ release unit against its repository's active policy, moving the unit's tasks fro
 slot rather than drawing a new one, so a restart or a retry never redraws a
 selection already made. `schedule show` inspects a previously selected slot without
 drawing one.
+
+`schedule withdraw` returns one unit's work to the queue so a fresh time can be
+selected; `schedule recalculate` does the same for every live selection in a
+repository, which is what a changed policy calls for. Neither deletes anything: a
+withdrawn selection is retained with the reason it stopped being valid, so what
+moved and why stays auditable. A unit whose attempt has already started is left
+alone and reported as retained rather than disturbed — once an attempt owns the
+work, its identity is not a schedule change's to discard. Cancelling or superseding
+a task withdraws the affected units' selections automatically for the same reason,
+and reports which units moved.
+
+`schedule catch-up` applies the repository's missed-window behaviour to every
+release time that has already passed — the case where the machine was asleep,
+offline, or simply not running through a window. Under the default
+`reschedule_forward`, nothing is released immediately and every overdue unit is
+given a new future time, so a multi-day gap cannot turn into a burst. Under
+`catch_up`, only as many units as `max_releases` allows are left due for immediate
+release, oldest first, and the rest still move forward. A replacement time is
+always drawn from the present moment onward, so an offline gap can never produce a
+commit dated earlier than the moment it was actually made.
+
+`schedule set-override` refines one repository's scheduling without changing the
+policy it shares — any subset of the policy's fields, in the same JSON shape. The
+override is stored unresolved and combined with whatever policy is active at the
+moment a selection is made, and the combination is validated as a whole, so an
+override cannot quietly produce an invalid effective policy.
+
+`schedule due` lists units whose release time has arrived, taken fairly across
+repositories rather than draining one at a time: each repository gets a turn before
+any repository gets a second, so a repository with a deep queue, or one that keeps
+failing and retrying, delays only itself. `--concurrency-limit` bounds how much work
+is listed at once, which is what keeps a large backlog from becoming a burst of
+simultaneous pushes.
+
+`schedule preview` reports a repository's upcoming release times, and whether it is
+paused, without changing anything.
+
+`schedule pause` stops a repository from *starting* new releases and records why;
+`schedule resume` lifts it. The distinction matters: pausing governs what begins,
+never what is already running. An attempt that has transmitted a push has an
+outcome on the remote that still has to be resolved, so pausing leaves it alone
+rather than orphaning it — and a unit is only ever handed out as due while every
+one of its tasks is still merely scheduled, so nothing an attempt already owns can
+be claimed twice. The pause is durable, so a daemon restart does not quietly resume
+publishing an operator deliberately stopped.
+
+`schedule release-now` moves one unit's release time to the present. It overrides
+the schedule, not the rules: the same eligibility checks apply, so a unit whose
+prerequisites have not reached their required milestone is refused rather than
+released early. To reschedule rather than release, use `schedule withdraw`
+followed by `schedule unit`.
+
+Enrollment refuses a second checkout of the same canonical remote that targets the
+same branch. Two checkouts publishing to one ref are two writers racing for it, so
+this is rejected at enrollment rather than surfacing later as a conflict. The live
+release lease is keyed on the remote and target themselves, not on the repository
+profile, for the same reason.
+
+`service install` registers the daemon as a macOS user-session agent so it keeps
+running after the terminal is closed. It runs in the user's own login session
+rather than as a system daemon on purpose: publishing uses the user's existing Git
+credentials and SSH agent, which a root-owned daemon would either lose access to or
+need a privileged copy of. The definition sets it to start at login and restart
+after a crash, and deliberately sets no timer — the daemon reconciles durable
+deadlines when it starts and when it wakes, rather than depending on a timer that
+does not fire while the machine is asleep.
+
+`service uninstall` stops the service and removes its definition but never deletes
+the state directory. Removing the service is not the same decision as discarding
+captured work that has not been published. `service status` reports whether it is
+installed and loaded; `service show` prints the definition without installing
+anything.
 
 ## Exit codes
 

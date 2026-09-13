@@ -7,15 +7,17 @@ use std::{collections::BTreeSet, fmt};
 pub use reccursive_core::{
     AcceptanceCheck, AttemptId, EventId, FeatureId, FeaturePlan, PLAN_SCHEMA_VERSION, PackageId,
     PlanPhase, PlanTask, PublicationMode, ReasonCode, ReleaseUnitId, RepositoryId,
-    RepositoryPolicy, RequestId, Revision, SchedulePolicy, StateReason, TargetMilestone, TargetRef,
-    TaskId, TaskStatus,
+    RepositoryPolicy, RequestId, Revision, SchedulePolicy, SchedulePolicyOverride, StateReason,
+    TargetMilestone, TargetRef, TaskId, TaskStatus,
 };
 use serde::{Deserialize, Serialize};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 4 adds release-unit grouping and durable release
-/// scheduling.
-pub const API_VERSION: u16 = 4;
+/// Local API protocol version. Version 8 adds pause, resume, release-now, and preview.
+pub const API_VERSION: u16 = 8;
+
+/// Stable service identifier shared by the daemon and by service installation.
+pub const SERVICE_NAME: &str = "reccursive-daemon";
 
 /// Maximum encoded request or response size accepted by the local transport.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -81,9 +83,21 @@ impl RequestEnvelope {
             Command::CancelTask(request) => request.validate(),
             Command::ReleasePackage(request) => request.validate(),
             Command::CreateReleaseUnit(request) => request.validate(),
+            Command::PauseRepository { reason, .. }
+                if reason.trim().is_empty() || reason.len() > 256 =>
+            {
+                Err(ProtocolValidationError::InvalidLifecycleMessage)
+            }
+            Command::PauseRepository { .. } => Ok(()),
             Command::ListReleaseAttempts { limit, .. } if !(1..=1_000).contains(limit) => {
                 Err(ProtocolValidationError::InvalidAttemptLimit)
             }
+            Command::ListDueUnits { concurrency_limit }
+                if !(1..=1_000).contains(concurrency_limit) =>
+            {
+                Err(ProtocolValidationError::InvalidConcurrencyLimit)
+            }
+            Command::ListDueUnits { .. } => Ok(()),
             Command::ExportQueue { destination }
                 if destination.is_empty() || destination.len() > 4_096 =>
             {
@@ -107,6 +121,13 @@ impl RequestEnvelope {
             | Command::GetSchedulePolicy { .. }
             | Command::ScheduleUnit(_)
             | Command::GetScheduleSlot { .. }
+            | Command::WithdrawScheduleSlot { .. }
+            | Command::RecalculateSchedule { .. }
+            | Command::ReconcileMissedWindows { .. }
+            | Command::SetScheduleOverride { .. }
+            | Command::ResumeRepository { .. }
+            | Command::ReleaseUnitNow { .. }
+            | Command::PreviewSchedule { .. }
             | Command::GetReleaseAttempt { .. }
             | Command::ListReleaseAttempts { .. }
             | Command::AuditQueue
@@ -163,6 +184,48 @@ pub enum Command {
     /// Inspect the durable slot previously selected for a release unit.
     GetScheduleSlot {
         release_unit_id: ReleaseUnitId,
+    },
+    /// Withdraw one unit's selected release time so it returns to the queue.
+    WithdrawScheduleSlot {
+        release_unit_id: ReleaseUnitId,
+        reason: String,
+    },
+    /// Withdraw every live selection for a repository, for use after its policy changes.
+    RecalculateSchedule {
+        repository_id: RepositoryId,
+        reason: String,
+    },
+    /// Apply the repository's missed-window policy to every release time that has already passed.
+    ReconcileMissedWindows {
+        repository_id: RepositoryId,
+        seed: u64,
+    },
+    /// Refine one repository's scheduling without changing the policy it shares.
+    SetScheduleOverride {
+        repository_id: RepositoryId,
+        #[serde(rename = "override")]
+        override_policy: SchedulePolicyOverride,
+    },
+    /// List units due for release now, fairly across repositories and within a global limit.
+    ListDueUnits {
+        concurrency_limit: usize,
+    },
+    /// Stop a repository from handing out new release work until it is resumed.
+    PauseRepository {
+        repository_id: RepositoryId,
+        reason: String,
+    },
+    /// Resume a paused repository.
+    ResumeRepository {
+        repository_id: RepositoryId,
+    },
+    /// Move one unit's release time to now, subject to the same eligibility rules.
+    ReleaseUnitNow {
+        release_unit_id: ReleaseUnitId,
+    },
+    /// Show a repository's upcoming release times without changing any of them.
+    PreviewSchedule {
+        repository_id: RepositoryId,
     },
     /// Inspect one durable publication attempt.
     GetReleaseAttempt {
@@ -483,6 +546,36 @@ pub struct SchedulePolicyView {
     pub created_at_unix_ms: i64,
 }
 
+/// One unit whose selected release time has arrived.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DueUnitView {
+    pub release_unit_id: ReleaseUnitId,
+    pub repository_id: RepositoryId,
+    pub package_id: PackageId,
+    pub package_revision: Revision,
+    pub selected_at_unix_ms: i64,
+}
+
+/// What applying a missed-window policy did to release times that had already passed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MissedWindowView {
+    /// Units left due for immediate release under an explicit catch-up allowance.
+    pub released_now: Vec<ReleaseUnitId>,
+    /// Units whose overdue time was replaced with a future one.
+    pub rescheduled: Vec<ReleaseUnitId>,
+    /// Units left alone because an attempt already owns them.
+    pub retained: Vec<ReleaseUnitId>,
+}
+
+/// What an adaptive recalculation moved, and what it deliberately left alone.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleRecalculationView {
+    /// Units returned to the queue for a fresh selection.
+    pub withdrawn: Vec<ReleaseUnitId>,
+    /// Units left untouched because an attempt already owns them.
+    pub retained: Vec<ReleaseUnitId>,
+}
+
 /// A selected, durable UTC release time for one release unit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScheduleSlotView {
@@ -638,6 +731,31 @@ pub enum ResponseData {
     ScheduleSlot {
         slot: ScheduleSlotView,
     },
+    ScheduleRecalculated {
+        recalculation: ScheduleRecalculationView,
+    },
+    MissedWindowsReconciled {
+        outcome: MissedWindowView,
+    },
+    ScheduleOverrideActivated {
+        repository_id: RepositoryId,
+        revision: Revision,
+    },
+    DueUnits {
+        units: Vec<DueUnitView>,
+    },
+    RepositoryPaused {
+        repository_id: RepositoryId,
+        reason: String,
+    },
+    RepositoryResumed {
+        repository_id: RepositoryId,
+        was_paused: bool,
+    },
+    SchedulePreview {
+        slots: Vec<ScheduleSlotView>,
+        paused: Option<String>,
+    },
     QueueAudit {
         audit: QueueAuditView,
     },
@@ -713,6 +831,8 @@ pub enum ProtocolValidationError {
     InvalidReleaseField(&'static str),
     #[error("release attempt limit must be between 1 and 1000")]
     InvalidAttemptLimit,
+    #[error("release concurrency limit must be between 1 and 1000")]
+    InvalidConcurrencyLimit,
     #[error("release unit must select between 1 and 1000 plan tasks")]
     InvalidReleaseUnitTasks,
     #[error(

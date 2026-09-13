@@ -28,7 +28,9 @@ pub use plans::StoredPlan;
 pub use redaction::{redact_json, redact_text};
 pub use repository::{RepositoryRegistration, StoredRepository, StoredSchedulePolicy};
 use rusqlite::{Connection, OpenFlags};
-pub use schedules::{NewScheduleSlot, ScheduleSlot};
+pub use schedules::{
+    NewScheduleSlot, RepositoryPause, ScheduleRecalculation, ScheduleSlot, WithdrawnSlot,
+};
 pub use snapshots::{SnapshotRecord, SnapshotRecoveryIssue};
 pub use tasks::{TaskDependency, TaskRecord};
 use thiserror::Error;

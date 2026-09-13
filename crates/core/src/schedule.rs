@@ -741,6 +741,192 @@ mod tests {
         );
     }
 
+    /// Converts a local civil time in a zone to a UTC millisecond instant, for test setup.
+    fn local(zone: &str, year: i16, month: i8, day: i8, hour: i8, minute: i8) -> i64 {
+        jiff::civil::date(year, month, day)
+            .at(hour, minute, 0, 0)
+            .in_tz(zone)
+            .unwrap()
+            .timestamp()
+            .as_millisecond()
+    }
+
+    fn local_clock(zone: &str, instant: i64) -> (i8, i8) {
+        let zoned = Timestamp::from_millisecond(instant)
+            .unwrap()
+            .in_tz(zone)
+            .unwrap();
+        (zoned.hour(), zoned.minute())
+    }
+
+    fn all_days() -> BTreeSet<Weekday> {
+        BTreeSet::from([
+            Weekday::Monday,
+            Weekday::Tuesday,
+            Weekday::Wednesday,
+            Weekday::Thursday,
+            Weekday::Friday,
+            Weekday::Saturday,
+            Weekday::Sunday,
+        ])
+    }
+
+    fn policy_in(zone: &str, windows: Vec<DailyWindow>, spacing: u16) -> SchedulePolicy {
+        SchedulePolicy::new(
+            IanaTimeZone::new(zone).unwrap(),
+            all_days(),
+            windows,
+            DailyReleaseRange::new(1, 1).unwrap(),
+            spacing,
+            MissedWindowBehavior::RescheduleForward,
+        )
+        .unwrap()
+    }
+
+    fn window(start: (u8, u8), end: (u8, u8)) -> DailyWindow {
+        DailyWindow::new(
+            DailyTime::new(start.0, start.1).unwrap(),
+            DailyTime::new(end.0, end.1).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_spring_forward_gap_never_selects_a_local_time_that_does_not_exist() {
+        // US eastern time jumps 02:00 -> 03:00 on 2027-03-14; 02:30 does not occur that day.
+        let zone = "America/New_York";
+        let policy = policy_in(zone, vec![window((1, 0), (4, 0))], 30);
+        let start = local(zone, 2027, 3, 14, 0, 0);
+
+        let selected = SlotGenerator::seeded(9)
+            .select(&policy, start, 1, &[])
+            .unwrap();
+        let instant = selected[0].selected_at_unix_ms;
+        let (hour, _) = local_clock(zone, instant);
+
+        assert!(
+            hour != 2,
+            "02:00-02:59 does not exist on this date; selected local hour was {hour}"
+        );
+        // Whatever was chosen is a real instant inside the window's actual span.
+        assert!(instant >= local(zone, 2027, 3, 14, 1, 0));
+        assert!(instant < local(zone, 2027, 3, 14, 4, 0));
+    }
+
+    #[test]
+    fn a_fall_back_fold_selects_one_unambiguous_instant() {
+        // 01:00-01:59 occurs twice on 2027-11-07 in US eastern time.
+        let zone = "America/New_York";
+        let policy = policy_in(zone, vec![window((0, 30), (3, 0))], 30);
+        let start = local(zone, 2027, 11, 7, 0, 0);
+
+        let selected = SlotGenerator::seeded(4)
+            .select(&policy, start, 1, &[])
+            .unwrap();
+        let instant = selected[0].selected_at_unix_ms;
+
+        // The instant is real and inside the day's window however the fold is resolved.
+        assert!(instant >= start);
+        assert!(instant < local(zone, 2027, 11, 7, 3, 0));
+        // Round-tripping it back to civil time must not land outside the policy's window.
+        let (hour, minute) = local_clock(zone, instant);
+        let minutes = i32::from(hour) * 60 + i32::from(minute);
+        assert!(
+            (30..=180).contains(&minutes),
+            "selected {hour:02}:{minute:02} is outside the configured window"
+        );
+    }
+
+    #[test]
+    fn a_window_ending_at_midnight_never_spills_into_the_next_day() {
+        let zone = "UTC";
+        let policy = policy_in(zone, vec![window((23, 0), (23, 59))], 30);
+        let start = local(zone, 2027, 6, 1, 22, 0);
+
+        let selected = SlotGenerator::seeded(2)
+            .select(&policy, start, 3, &[])
+            .unwrap();
+        for slot in &selected {
+            let (hour, minute) = local_clock(zone, slot.selected_at_unix_ms);
+            assert_eq!(hour, 23, "a 23:00-23:59 window must stay within its hour");
+            assert!(minute < 59);
+        }
+    }
+
+    #[test]
+    fn a_clock_that_jumps_backwards_still_only_selects_future_instants() {
+        let zone = "UTC";
+        let policy = policy_in(zone, vec![window((0, 0), (23, 59))], 60);
+        let later = local(zone, 2027, 6, 10, 12, 0);
+        let earlier = local(zone, 2027, 6, 10, 9, 0);
+
+        // A slot was already chosen against the later reading of the clock.
+        let ahead = SlotGenerator::seeded(6)
+            .select(&policy, later, 1, &[])
+            .unwrap()[0]
+            .selected_at_unix_ms;
+
+        // The clock is corrected backwards; a new selection must still be in the future of the
+        // moment it is made, and must not crowd the slot already chosen.
+        let after_jump = SlotGenerator::seeded(6)
+            .select(&policy, earlier, 1, &[ahead])
+            .unwrap()[0]
+            .selected_at_unix_ms;
+
+        assert!(after_jump >= earlier, "a selection must never be backdated");
+        assert!(
+            (after_jump - ahead).abs() >= 60 * 60_000,
+            "a corrected clock must not crowd an existing selection"
+        );
+    }
+
+    #[test]
+    fn a_policy_whose_windows_are_all_in_the_past_today_moves_to_the_next_day() {
+        let zone = "UTC";
+        let policy = policy_in(zone, vec![window((9, 0), (10, 0))], 30);
+        // Asked at 23:00, long after today's only window closed.
+        let start = local(zone, 2027, 6, 1, 23, 0);
+
+        let selected = SlotGenerator::seeded(1)
+            .select(&policy, start, 1, &[])
+            .unwrap();
+        let instant = selected[0].selected_at_unix_ms;
+
+        assert!(instant > start);
+        assert!(
+            instant >= local(zone, 2027, 6, 2, 9, 0),
+            "a closed window must roll forward to the next eligible day, not backfill today"
+        );
+        let (hour, _) = local_clock(zone, instant);
+        assert_eq!(hour, 9);
+    }
+
+    #[test]
+    fn a_day_with_no_remaining_capacity_reports_it_rather_than_overfilling() {
+        let zone = "UTC";
+        // One hour of window at 45-minute spacing holds a single slot per day.
+        let policy = SchedulePolicy::new(
+            IanaTimeZone::new(zone).unwrap(),
+            BTreeSet::from([Weekday::Tuesday]),
+            vec![window((9, 0), (10, 0))],
+            DailyReleaseRange::new(1, 1).unwrap(),
+            45,
+            MissedWindowBehavior::RescheduleForward,
+        )
+        .unwrap();
+        let start = local(zone, 2027, 6, 1, 0, 0);
+
+        // Well beyond the horizon's capacity for a single weekday with one slot each.
+        let outcome = SlotGenerator::seeded(3).select(&policy, start, 500, &[]);
+        assert!(
+            matches!(
+                outcome,
+                Err(SchedulePolicyError::InsufficientSchedulingCapacity { .. })
+            ),
+            "exceeding real capacity must be reported, not silently truncated: {outcome:?}"
+        );
+    }
+
     #[test]
     fn existing_slots_are_never_redrawn_or_crowded() {
         let not_before = unix_ms("2026-01-05T13:00:00Z");

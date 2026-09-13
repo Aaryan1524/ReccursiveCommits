@@ -7,17 +7,21 @@ use std::{
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
+use install::{InstallError, ServiceInstallation};
 use reccursive_protocol::{
     ApiError, ApiErrorCode, CancelTaskRequest, CapturePackageRequest, Command,
-    CreateReleaseUnitRequest, CreateWorkspaceRequest, EnrollRepositoryRequest, EventSeverityView,
-    EventView, FeatureId, FeaturePlan, LocalClient, PackageId, PackageView, PlanView,
-    PublicationMode, QueueAuditView, QueueExportView, ReleaseAttemptView, ReleasePackageRequest,
-    ReleaseUnitId, ReleaseUnitView, RepositoryId, RepositoryView, ResponseData, Revision,
-    SchedulePolicy, SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest,
-    SetSchedulePolicyRequest, TargetRef, TaskId, WorkspaceView,
+    CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
+    EventSeverityView, EventView, FeatureId, FeaturePlan, LocalClient, PackageId, PackageView,
+    PlanView, PublicationMode, QueueAuditView, QueueExportView, ReleaseAttemptView,
+    ReleasePackageRequest, ReleaseUnitId, ReleaseUnitView, RepositoryId, RepositoryView,
+    ResponseData, Revision, SchedulePolicy, SchedulePolicyOverride, SchedulePolicyView,
+    ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest, TargetRef, TaskId,
+    WorkspaceView,
 };
 use serde::Serialize;
 use serde_json::json;
+
+mod install;
 
 pub const EXIT_SUCCESS: u8 = 0;
 pub const EXIT_INTERNAL: u8 = 1;
@@ -87,6 +91,11 @@ enum TopLevelCommand {
     Queue {
         #[command(subcommand)]
         command: QueueCommand,
+    },
+    /// Install, remove, and inspect the background service.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
     },
     /// Show service and queue summary.
     Status,
@@ -194,6 +203,67 @@ enum ScheduleCommand {
     },
     /// Show the durable slot previously selected for a release unit.
     Show { release_unit_id: ReleaseUnitId },
+    /// Withdraw one unit's release time so it returns to the queue for a fresh selection.
+    Withdraw {
+        release_unit_id: ReleaseUnitId,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Withdraw every live selection for a repository after changing its policy.
+    Recalculate {
+        repository_id: RepositoryId,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Apply the repository's missed-window policy to release times that have already passed.
+    CatchUp {
+        repository_id: RepositoryId,
+        /// Deterministic selection seed; a random one is used when omitted.
+        #[arg(long)]
+        seed: Option<u64>,
+    },
+    /// Refine one repository's scheduling without changing the policy it shares.
+    SetOverride {
+        repository_id: RepositoryId,
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// List units due for release now, fairly across repositories and within a global limit.
+    Due {
+        #[arg(long, default_value_t = 10, value_parser = parse_event_limit)]
+        concurrency_limit: usize,
+    },
+    /// Stop a repository from starting new releases until it is resumed.
+    Pause {
+        repository_id: RepositoryId,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Resume a paused repository.
+    Resume { repository_id: RepositoryId },
+    /// Move one unit's release time to now, subject to the same eligibility rules.
+    ReleaseNow { release_unit_id: ReleaseUnitId },
+    /// Show a repository's upcoming release times without changing any of them.
+    Preview { repository_id: RepositoryId },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// Install the background service so it runs after the terminal is closed.
+    Install {
+        /// The daemon binary to run; defaults to reccursive-daemon beside this executable.
+        #[arg(long, value_name = "PATH")]
+        program: Option<PathBuf>,
+    },
+    /// Stop the service and remove its definition, keeping queued work on disk.
+    Uninstall,
+    /// Show whether the service is installed and loaded.
+    Status,
+    /// Print the service definition without installing it.
+    Show {
+        #[arg(long, value_name = "PATH")]
+        program: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -373,6 +443,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
     let paths = ClientPaths::new(state_dir);
     match cli.command {
         TopLevelCommand::Doctor => doctor(&paths, cli.json, stdout),
+        TopLevelCommand::Service { command } => service_command(command, &paths, cli.json, stdout),
         TopLevelCommand::Status => {
             let data = send(&paths, Command::Status)?;
             output_data(data, cli.json, stdout)
@@ -576,6 +647,89 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 let data = send(&paths, Command::GetScheduleSlot { release_unit_id })?;
                 output_data(data, cli.json, stdout)
             }
+            ScheduleCommand::Withdraw {
+                release_unit_id,
+                reason,
+            } => {
+                let data = send(
+                    &paths,
+                    Command::WithdrawScheduleSlot {
+                        release_unit_id,
+                        reason,
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::Pause {
+                repository_id,
+                reason,
+            } => {
+                let data = send(
+                    &paths,
+                    Command::PauseRepository {
+                        repository_id,
+                        reason,
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::Resume { repository_id } => {
+                let data = send(&paths, Command::ResumeRepository { repository_id })?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::ReleaseNow { release_unit_id } => {
+                let data = send(&paths, Command::ReleaseUnitNow { release_unit_id })?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::Preview { repository_id } => {
+                let data = send(&paths, Command::PreviewSchedule { repository_id })?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::SetOverride {
+                repository_id,
+                file,
+            } => {
+                let override_policy = load_schedule_override(&file)?;
+                let data = send(
+                    &paths,
+                    Command::SetScheduleOverride {
+                        repository_id,
+                        override_policy,
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::Due { concurrency_limit } => {
+                let data = send(&paths, Command::ListDueUnits { concurrency_limit })?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::CatchUp {
+                repository_id,
+                seed,
+            } => {
+                let seed = seed.unwrap_or_else(random_seed);
+                let data = send(
+                    &paths,
+                    Command::ReconcileMissedWindows {
+                        repository_id,
+                        seed,
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::Recalculate {
+                repository_id,
+                reason,
+            } => {
+                let data = send(
+                    &paths,
+                    Command::RecalculateSchedule {
+                        repository_id,
+                        reason,
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
         },
         TopLevelCommand::Queue { command } => match command {
             QueueCommand::Audit => {
@@ -631,6 +785,161 @@ fn load_plan(path: &Path) -> Result<FeaturePlan, CliFailure> {
         CliFailure::new(EXIT_ACTION_REQUIRED, "invalid_plan", error.to_string())
     })?;
     Ok(plan)
+}
+
+/// Runs one `service` subcommand.
+///
+/// Service management is the one part of the CLI that does not go through the daemon: it is what
+/// arranges for the daemon to exist in the first place, so it must work when nothing is running.
+fn service_command(
+    command: ServiceCommand,
+    paths: &ClientPaths,
+    json_output: bool,
+    out: &mut impl Write,
+) -> Result<(), CliFailure> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "home_unknown",
+            "HOME is not set, so the user's LaunchAgents directory cannot be located",
+        )
+    })?;
+    let resolve = |program: Option<PathBuf>| -> Result<PathBuf, CliFailure> {
+        match program {
+            Some(path) => Ok(path),
+            None => default_daemon_program(),
+        }
+    };
+
+    match command {
+        ServiceCommand::Show { program } => {
+            let installation =
+                ServiceInstallation::describe(resolve(program)?, &paths.state_dir, &home);
+            write!(out, "{}", installation.plist()).map_err(output_error)
+        }
+        ServiceCommand::Install { program } => {
+            let installation =
+                ServiceInstallation::describe(resolve(program)?, &paths.state_dir, &home);
+            installation.install().map_err(install_failure)?;
+            report_service(out, json_output, &installation, true, "installed")
+        }
+        ServiceCommand::Uninstall => {
+            let installation =
+                ServiceInstallation::describe(default_daemon_program()?, &paths.state_dir, &home);
+            installation.uninstall().map_err(install_failure)?;
+            report_service(out, json_output, &installation, false, "removed")
+        }
+        ServiceCommand::Status => {
+            let installation =
+                ServiceInstallation::describe(default_daemon_program()?, &paths.state_dir, &home);
+            let loaded = installation.is_loaded();
+            report_service(
+                out,
+                json_output,
+                &installation,
+                loaded,
+                if loaded { "running" } else { "not running" },
+            )
+        }
+    }
+}
+
+fn report_service(
+    out: &mut impl Write,
+    json_output: bool,
+    installation: &ServiceInstallation,
+    loaded: bool,
+    state: &str,
+) -> Result<(), CliFailure> {
+    if json_output {
+        let value = json!({
+            "ok": true,
+            "data": {
+                "type": "service",
+                "payload": {
+                    "label": installation.label,
+                    "state": state,
+                    "loaded": loaded,
+                    "definition": installation.plist_path.to_string_lossy(),
+                    "state_dir": installation.state_dir.to_string_lossy(),
+                    "log": installation.log_path.to_string_lossy(),
+                }
+            }
+        });
+        return writeln!(out, "{value}").map_err(output_error);
+    }
+    writeln!(
+        out,
+        "Service {} · {}\nDefinition: {}\nLog: {}",
+        installation.label,
+        state,
+        installation.plist_path.display(),
+        installation.log_path.display()
+    )
+    .map_err(output_error)
+}
+
+/// Finds the daemon binary shipped alongside this CLI.
+fn default_daemon_program() -> Result<PathBuf, CliFailure> {
+    let executable = std::env::current_exe().map_err(|error| {
+        CliFailure::new(
+            EXIT_INTERNAL,
+            "program_unknown",
+            format!("cannot locate this executable: {error}"),
+        )
+    })?;
+    let candidate = executable
+        .parent()
+        .map(|directory| directory.join("reccursive-daemon"))
+        .ok_or_else(|| {
+            CliFailure::new(
+                EXIT_INTERNAL,
+                "program_unknown",
+                "this executable has no parent directory",
+            )
+        })?;
+    if !candidate.exists() {
+        return Err(CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "daemon_not_found",
+            format!(
+                "no daemon binary at {}; pass --program to name one",
+                candidate.display()
+            ),
+        ));
+    }
+    Ok(candidate)
+}
+
+fn install_failure(error: InstallError) -> CliFailure {
+    let code = match error {
+        InstallError::MissingProgram(_) => "daemon_not_found",
+        InstallError::Io(_) => "service_unwritable",
+        InstallError::LaunchctlUnavailable(_) | InstallError::Launchctl { .. } => {
+            "service_manager_failed"
+        }
+    };
+    CliFailure::new(EXIT_ACTION_REQUIRED, code, error.to_string())
+}
+
+fn load_schedule_override(path: &Path) -> Result<SchedulePolicyOverride, CliFailure> {
+    let bytes = fs::read(path).map_err(|error| {
+        CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "schedule_override_unreadable",
+            format!("cannot read {}: {error}", path.display()),
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "invalid_schedule_override",
+            format!(
+                "{} is not a valid schedule override: {error}",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn load_schedule_policy(path: &Path) -> Result<SchedulePolicy, CliFailure> {
@@ -888,6 +1197,47 @@ fn output_data(
         ),
         ResponseData::SchedulePolicy { policy } => output_schedule_policy(out, &policy),
         ResponseData::ScheduleSlot { slot } => output_schedule_slot(out, &slot),
+        ResponseData::ScheduleOverrideActivated {
+            repository_id,
+            revision,
+        } => writeln!(
+            out,
+            "Activated schedule override revision {} for repository {repository_id}",
+            revision.get()
+        ),
+        ResponseData::DueUnits { units } => output_due_units(out, &units),
+        ResponseData::RepositoryPaused {
+            repository_id,
+            reason,
+        } => writeln!(out, "Paused {repository_id}: {reason}"),
+        ResponseData::RepositoryResumed {
+            repository_id,
+            was_paused,
+        } => writeln!(
+            out,
+            "{repository_id} is running{}",
+            if was_paused {
+                " again"
+            } else {
+                " (was not paused)"
+            }
+        ),
+        ResponseData::SchedulePreview { slots, paused } => {
+            output_schedule_preview(out, &slots, paused.as_deref())
+        }
+        ResponseData::MissedWindowsReconciled { outcome } => writeln!(
+            out,
+            "Released {} overdue unit(s) now, moved {} forward, left {} in flight",
+            outcome.released_now.len(),
+            outcome.rescheduled.len(),
+            outcome.retained.len()
+        ),
+        ResponseData::ScheduleRecalculated { recalculation } => writeln!(
+            out,
+            "Withdrew {} release time(s); left {} in-flight unit(s) untouched",
+            recalculation.withdrawn.len(),
+            recalculation.retained.len()
+        ),
         ResponseData::QueueAudit { audit } => output_queue_audit(out, &audit),
         ResponseData::QueueExported { export } => output_queue_export(out, &export),
     }
@@ -997,6 +1347,41 @@ fn output_schedule_policy(out: &mut impl Write, policy: &SchedulePolicyView) -> 
         policy.policy.daily_releases.maximum,
         policy.policy.minimum_spacing_minutes,
     )
+}
+
+fn output_schedule_preview(
+    out: &mut impl Write,
+    slots: &[ScheduleSlotView],
+    paused: Option<&str>,
+) -> io::Result<()> {
+    if let Some(reason) = paused {
+        writeln!(out, "Paused: {reason}")?;
+    }
+    if slots.is_empty() {
+        return writeln!(out, "No release times are scheduled.");
+    }
+    for slot in slots {
+        writeln!(
+            out,
+            "{} · package {} · {} ({})",
+            slot.release_unit_id, slot.package_id, slot.selected_at_unix_ms, slot.timezone
+        )?;
+    }
+    Ok(())
+}
+
+fn output_due_units(out: &mut impl Write, units: &[DueUnitView]) -> io::Result<()> {
+    if units.is_empty() {
+        return writeln!(out, "No units are due for release.");
+    }
+    for unit in units {
+        writeln!(
+            out,
+            "{} · repository {} · package {} · due {}",
+            unit.release_unit_id, unit.repository_id, unit.package_id, unit.selected_at_unix_ms
+        )?;
+    }
+    Ok(())
 }
 
 fn output_schedule_slot(out: &mut impl Write, slot: &ScheduleSlotView) -> io::Result<()> {

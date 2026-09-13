@@ -162,4 +162,58 @@ repeat_selected_at="$(json_number selected_at_unix_ms <<<"$repeat_json")"
 unit_show="$(cli release show-unit "$unit_id")"
 grep -q "\"unit_id\":\"$unit_id\"" <<<"$unit_show" || fail "release unit inspection returned the wrong unit"
 
-printf 'PASS release-unit creation, policy activation, deterministic scheduling, and restart-stable slots\n'
+# Adaptive recalculation: withdrawing a selection returns the work to the queue, and a fresh
+# selection can then be made. The withdrawn time must not simply reappear.
+withdraw_json="$(cli schedule withdraw "$unit_id" --reason "policy under review")"
+grep -q '"type":"schedule_recalculated"' <<<"$withdraw_json" || \
+  fail "withdrawing a slot did not return a recalculation"
+if cli schedule show "$unit_id" >/dev/null 2>&1; then
+  fail "a withdrawn unit must not still report a live release time"
+fi
+
+rescheduled_json="$(cli schedule unit "$unit_id" --package-id "$package_id" --revision 1 --seed 4242)"
+grep -q '"type":"schedule_slot"' <<<"$rescheduled_json" || \
+  fail "a withdrawn unit could not be scheduled again"
+rescheduled_at="$(json_number selected_at_unix_ms <<<"$rescheduled_json")"
+[[ -n "$rescheduled_at" ]] || fail "rescheduled slot did not record a selected time"
+
+# A repository-wide recalculation reports what it moved rather than moving things silently.
+recalculated_json="$(cli schedule recalculate "$repository_id" --reason "policy revised")"
+grep -q '"type":"schedule_recalculated"' <<<"$recalculated_json" || \
+  fail "repository recalculation did not return the expected payload"
+grep -q "\"withdrawn\":\[\"$unit_id\"\]" <<<"$recalculated_json" || \
+  fail "repository recalculation did not report the withdrawn unit: $recalculated_json"
+
+# The repository-wide recalculation above withdrew the selection, so give the unit a live one
+# again before exercising the controls that report and act on it.
+current_json="$(cli schedule unit "$unit_id" --package-id "$package_id" --revision 1 --seed 777)"
+current_at="$(json_number selected_at_unix_ms <<<"$current_json")"
+[[ -n "$current_at" ]] || fail "could not reschedule the unit after recalculation"
+
+# Schedule controls. Preview never changes anything; pause and resume are durable decisions.
+preview_json="$(cli schedule preview "$repository_id")"
+grep -q '"type":"schedule_preview"' <<<"$preview_json" || fail "preview did not return the expected payload"
+preview_at="$(json_number selected_at_unix_ms <<<"$preview_json")"
+[[ "$preview_at" == "$current_at" ]] || \
+  fail "preview reported a different time than the live selection: $preview_at vs $current_at"
+
+cli schedule pause "$repository_id" --reason "investigating" >/dev/null
+paused_preview="$(cli schedule preview "$repository_id")"
+grep -q '"paused":"investigating"' <<<"$paused_preview" || \
+  fail "a paused repository did not report why: $paused_preview"
+due_while_paused="$(cli schedule due --concurrency-limit 10)"
+grep -q '"units":\[\]' <<<"$due_while_paused" || \
+  fail "a paused repository still handed out due work: $due_while_paused"
+
+cli schedule resume "$repository_id" >/dev/null
+resumed_preview="$(cli schedule preview "$repository_id")"
+grep -q '"paused":null' <<<"$resumed_preview" || fail "resume did not clear the pause"
+
+# Release-now moves the unit to the front of the queue and it becomes claimable.
+release_now_json="$(cli schedule release-now "$unit_id")"
+grep -q '"type":"schedule_slot"' <<<"$release_now_json" || fail "release-now did not return a slot"
+due_json="$(cli schedule due --concurrency-limit 10)"
+grep -q "$unit_id" <<<"$due_json" || \
+  fail "a unit released now did not become due: $due_json"
+
+printf 'PASS release-unit creation, policy activation, deterministic scheduling, restart-stable slots, adaptive recalculation, and schedule controls\n'

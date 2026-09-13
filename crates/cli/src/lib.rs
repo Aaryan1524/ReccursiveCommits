@@ -22,6 +22,7 @@ use serde::Serialize;
 use serde_json::json;
 
 mod install;
+mod setup;
 
 pub const EXIT_SUCCESS: u8 = 0;
 pub const EXIT_INTERNAL: u8 = 1;
@@ -110,6 +111,38 @@ enum TopLevelCommand {
     },
     /// Show service and queue summary.
     Status,
+    /// Set up a repository end to end: enrollment, schedule, and the background service.
+    Setup {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Canonical remote URL; defaults to origin.
+        #[arg(long)]
+        remote: Option<String>,
+        /// Target branch name or full refs/heads ref.
+        #[arg(long, default_value = "main")]
+        target: String,
+        /// Publication behavior.
+        #[arg(long, value_enum, default_value = "scheduled")]
+        mode: PublicationModeArgument,
+        /// Development branch, required by immediate mode.
+        #[arg(long)]
+        development_target: Option<String>,
+        /// Activate this schedule policy instead of the built-in weekday default.
+        #[arg(long, value_name = "FILE")]
+        schedule: Option<PathBuf>,
+        /// Enroll without activating any schedule policy.
+        #[arg(long, conflicts_with = "schedule")]
+        no_schedule: bool,
+        /// Time zone for the built-in default policy; defaults to this machine's.
+        #[arg(long)]
+        timezone: Option<String>,
+        /// Install the background service as part of setup.
+        #[arg(long)]
+        install_service: bool,
+        /// Never prompt. Every value must come from a flag or a safe default.
+        #[arg(long)]
+        non_interactive: bool,
+    },
     /// Check local prerequisites and service connectivity.
     Doctor,
     /// Show integrations that are currently failing and when each may be retried.
@@ -518,6 +551,34 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
     let state_dir = resolve_state_dir(cli.state_dir)?;
     let session = Session::new(state_dir, cli.idempotency_key);
     match cli.command {
+        TopLevelCommand::Setup {
+            path,
+            remote,
+            target,
+            mode,
+            development_target,
+            schedule,
+            no_schedule,
+            timezone,
+            install_service,
+            non_interactive,
+        } => run_setup(
+            &session,
+            SetupArguments {
+                path,
+                remote,
+                target,
+                mode,
+                development_target,
+                schedule,
+                no_schedule,
+                timezone,
+                install_service,
+                non_interactive,
+            },
+            cli.json,
+            stdout,
+        ),
         TopLevelCommand::Doctor => doctor(&session, cli.json, stdout),
         TopLevelCommand::Diagnose { repository_id } => {
             let data = send(&session, Command::DiagnoseRepository { repository_id })?;
@@ -1331,7 +1392,12 @@ fn output_data(
             repository_count,
         } => writeln!(
             out,
-            "Service {service_version} · schema {schema_version} · {repository_count} repositories"
+            "Service {service_version} · schema {schema_version} · {repository_count} {}",
+            if repository_count == 1 {
+                "repository"
+            } else {
+                "repositories"
+            }
         ),
         ResponseData::RepositoryEnrolled { repository } => {
             writeln!(
@@ -1871,6 +1937,327 @@ fn table_cell(value: String) -> String {
     } else {
         shortened
     }
+}
+
+/// Everything `setup` was asked for on the command line.
+struct SetupArguments {
+    path: PathBuf,
+    remote: Option<String>,
+    target: String,
+    mode: PublicationModeArgument,
+    development_target: Option<String>,
+    schedule: Option<PathBuf>,
+    no_schedule: bool,
+    timezone: Option<String>,
+    install_service: bool,
+    non_interactive: bool,
+}
+
+fn setup_refusal(refusal: &setup::SetupRefusal) -> CliFailure {
+    let code = match refusal {
+        setup::SetupRefusal::NotATerminal => "not_a_terminal",
+        setup::SetupRefusal::MissingRemote => "remote_missing",
+        setup::SetupRefusal::MissingDevelopmentTarget => "development_target_missing",
+        setup::SetupRefusal::MissingIdentity { .. } => "identity_missing",
+        setup::SetupRefusal::NotARepository { .. } => "invalid_repository",
+    };
+    // Usage for a flag the caller can add, action-required for state on their machine.
+    let exit = match refusal {
+        setup::SetupRefusal::NotATerminal
+        | setup::SetupRefusal::MissingRemote
+        | setup::SetupRefusal::MissingDevelopmentTarget => EXIT_USAGE,
+        setup::SetupRefusal::MissingIdentity { .. }
+        | setup::SetupRefusal::NotARepository { .. } => EXIT_ACTION_REQUIRED,
+    };
+    CliFailure::new(exit, code, refusal.message())
+}
+
+/// Runs first-run setup: decide everything, then act, then say what stands.
+///
+/// Nothing is sent until every question is answered, so a refusal leaves the installation exactly
+/// as it was rather than half-configured.
+fn run_setup(
+    session: &Session,
+    arguments: SetupArguments,
+    json_output: bool,
+    out: &mut impl Write,
+) -> Result<(), CliFailure> {
+    let interactive = setup::interaction_mode(arguments.non_interactive)
+        .map_err(|refusal| setup_refusal(&refusal))?;
+    let plan = decide_setup(session, &arguments, interactive, out)?;
+    if interactive {
+        let mut input = io::stdin().lock();
+        writeln!(out, "\nAbout to:").map_err(output_error)?;
+        writeln!(out, "  enroll   {}", plan.repository.display()).map_err(output_error)?;
+        writeln!(out, "  publish  {} on {}", plan.target, plan.remote).map_err(output_error)?;
+        match &plan.schedule {
+            setup::ScheduleChoice::Default { timezone } => {
+                writeln!(out, "  schedule weekday releases in {timezone}")
+            }
+            setup::ScheduleChoice::File(path) => {
+                writeln!(out, "  schedule from {}", path.display())
+            }
+            setup::ScheduleChoice::None => writeln!(out, "  schedule nothing yet"),
+        }
+        .map_err(output_error)?;
+        if plan.install_service {
+            writeln!(out, "  install  the background service").map_err(output_error)?;
+        }
+        if !setup::confirm(out, &mut input, "\nProceed?", true).map_err(output_error)? {
+            return Err(CliFailure::new(
+                EXIT_USAGE,
+                "cancelled",
+                "setup was cancelled; nothing was changed",
+            ));
+        }
+    }
+    apply_setup(session, &plan, json_output, out)
+}
+
+/// Resolves every value setup needs, asking only where it may and refusing where it cannot.
+fn decide_setup(
+    session: &Session,
+    arguments: &SetupArguments,
+    interactive: bool,
+    out: &mut impl Write,
+) -> Result<setup::SetupPlan, CliFailure> {
+    let requested = fs::canonicalize(&arguments.path).map_err(|_| {
+        setup_refusal(&setup::SetupRefusal::NotARepository {
+            path: arguments.path.clone(),
+        })
+    })?;
+    let checkout = git_repository_root(&requested)
+        .map_err(|_| setup_refusal(&setup::SetupRefusal::NotARepository { path: requested }))?;
+
+    // Checked before anything else is asked. A checkout with no identity can be enrolled and
+    // scheduled and will still never publish, because the release pass skips a unit it cannot
+    // attribute — and it does so without an error anyone sees.
+    if setup::checkout_identity(&checkout).is_none() {
+        return Err(setup_refusal(&setup::SetupRefusal::MissingIdentity {
+            checkout,
+        }));
+    }
+
+    let discovered_remote = git_stdout(&checkout, &["remote", "get-url", "origin"]).ok();
+    let remote = match arguments.remote.clone().or(discovered_remote) {
+        Some(remote) => remote,
+        None => return Err(setup_refusal(&setup::SetupRefusal::MissingRemote)),
+    };
+
+    let mut target = arguments.target.clone();
+    let mut development_target = arguments.development_target.clone();
+    let immediate = matches!(arguments.mode, PublicationModeArgument::Immediate);
+    let mut install_service = arguments.install_service;
+    let mut schedule = match (&arguments.schedule, arguments.no_schedule) {
+        (Some(path), _) => setup::ScheduleChoice::File(path.clone()),
+        (None, true) => setup::ScheduleChoice::None,
+        (None, false) => setup::ScheduleChoice::Default {
+            timezone: arguments
+                .timezone
+                .clone()
+                .unwrap_or_else(setup::local_timezone),
+        },
+    };
+
+    if interactive {
+        let mut input = io::stdin().lock();
+        writeln!(out, "Setting up {}", checkout.display()).map_err(output_error)?;
+        writeln!(out, "Publishing to {remote}\n").map_err(output_error)?;
+        target = setup::ask(out, &mut input, "Target branch", &target).map_err(output_error)?;
+        if immediate {
+            let suggested = development_target.clone().unwrap_or_default();
+            let answer = setup::ask(out, &mut input, "Development branch", &suggested)
+                .map_err(output_error)?;
+            development_target = (!answer.is_empty()).then_some(answer);
+        }
+        if matches!(schedule, setup::ScheduleChoice::Default { .. }) {
+            let timezone = match &schedule {
+                setup::ScheduleChoice::Default { timezone } => timezone.clone(),
+                _ => setup::local_timezone(),
+            };
+            let timezone = setup::ask(out, &mut input, "Time zone for releases", &timezone)
+                .map_err(output_error)?;
+            schedule = if setup::confirm(
+                out,
+                &mut input,
+                "Release on weekday afternoons, up to three times a day",
+                true,
+            )
+            .map_err(output_error)?
+            {
+                setup::ScheduleChoice::Default { timezone }
+            } else {
+                setup::ScheduleChoice::None
+            };
+        }
+        install_service = setup::confirm(
+            out,
+            &mut input,
+            "Install the background service so releases happen with the terminal closed",
+            true,
+        )
+        .map_err(output_error)?;
+    }
+
+    if immediate && development_target.is_none() {
+        return Err(setup_refusal(
+            &setup::SetupRefusal::MissingDevelopmentTarget,
+        ));
+    }
+    let _ = session;
+    Ok(setup::SetupPlan {
+        repository: checkout,
+        remote,
+        target,
+        development_target,
+        immediate,
+        schedule,
+        install_service,
+    })
+}
+
+/// Carries out a decided plan, reporting exactly how far it got.
+fn apply_setup(
+    session: &Session,
+    plan: &setup::SetupPlan,
+    json_output: bool,
+    out: &mut impl Write,
+) -> Result<(), CliFailure> {
+    let mut progress = setup::SetupProgress::default();
+    let outcome = apply_setup_steps(session, plan, &mut progress);
+    let repository_id = progress.enrolled.clone().unwrap_or_default();
+    match outcome {
+        Ok(()) => {
+            if json_output {
+                let value = json!({
+                    "ok": true,
+                    "data": {
+                        "type": "setup_complete",
+                        "payload": {
+                            "repository_id": repository_id,
+                            "target": plan.target,
+                            "schedule_activated": progress.policy_activated,
+                            "service_installed": progress.service_installed,
+                        }
+                    }
+                });
+                writeln!(out, "{value}").map_err(output_error)
+            } else {
+                writeln!(out, "\nReady. {repository_id} publishes to {}", plan.target)
+                    .map_err(output_error)?;
+                if progress.policy_activated {
+                    writeln!(
+                        out,
+                        "A schedule is active; nothing publishes until work is submitted."
+                    )
+                    .map_err(output_error)?;
+                }
+                writeln!(
+                    out,
+                    "\nNext:\n  reccursive status\n  reccursive diagnose {repository_id}"
+                )
+                .map_err(output_error)
+            }
+        }
+        Err(failure) => {
+            // A later step failing does not undo an earlier one. Enrollment is atomic by itself,
+            // and quietly reversing a repository the user may already be using would be worse than
+            // saying plainly what stands and what is left.
+            let remaining = progress.remaining_advice(plan);
+            let mut message = failure.message.clone();
+            if progress.enrolled.is_some() {
+                message.push_str(&format!(
+                    "\n{repository_id} is enrolled and stays enrolled."
+                ));
+            }
+            if !remaining.is_empty() {
+                message.push_str("\nFinish with:");
+                for line in remaining {
+                    message.push_str(&format!("\n  {line}"));
+                }
+            }
+            Err(CliFailure::new(failure.exit_code, failure.code, message))
+        }
+    }
+}
+
+fn apply_setup_steps(
+    session: &Session,
+    plan: &setup::SetupPlan,
+    progress: &mut setup::SetupProgress,
+) -> Result<(), CliFailure> {
+    let mode = if plan.immediate {
+        PublicationModeArgument::Immediate
+    } else {
+        PublicationModeArgument::Scheduled
+    };
+    let request = enrollment_request(
+        plan.repository.clone(),
+        Some(plan.remote.clone()),
+        plan.target.clone(),
+        mode,
+        plan.development_target.clone(),
+    )?;
+    let enrolled = send(session, Command::EnrollRepository(request))?;
+    let repository_id = match enrolled {
+        ResponseData::RepositoryEnrolled { repository } => repository.id,
+        _ => {
+            return Err(CliFailure::new(
+                EXIT_INTERNAL,
+                "unexpected_response",
+                "enrollment returned an unexpected result",
+            ));
+        }
+    };
+    progress.enrolled = Some(repository_id.to_string());
+
+    match &plan.schedule {
+        setup::ScheduleChoice::None => {}
+        setup::ScheduleChoice::File(path) => {
+            let policy = load_schedule_policy(path)?;
+            send(
+                session,
+                Command::SetSchedulePolicy(SetSchedulePolicyRequest {
+                    repository_id,
+                    policy,
+                }),
+            )?;
+            progress.policy_activated = true;
+        }
+        setup::ScheduleChoice::Default { timezone } => {
+            let document = setup::default_policy_document(timezone);
+            let policy: SchedulePolicy = serde_json::from_str(&document).map_err(|error| {
+                CliFailure::new(
+                    EXIT_ACTION_REQUIRED,
+                    "invalid_timezone",
+                    format!("the default schedule is not valid for time zone {timezone}: {error}"),
+                )
+            })?;
+            send(
+                session,
+                Command::SetSchedulePolicy(SetSchedulePolicyRequest {
+                    repository_id,
+                    policy,
+                }),
+            )?;
+            progress.policy_activated = true;
+        }
+    }
+
+    if plan.install_service {
+        let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+            CliFailure::new(
+                EXIT_ACTION_REQUIRED,
+                "home_unknown",
+                "HOME is not set, so the user's LaunchAgents directory cannot be located",
+            )
+        })?;
+        let installation =
+            ServiceInstallation::describe(default_daemon_program()?, &session.state_dir, &home);
+        installation.install().map_err(install_failure)?;
+        progress.service_installed = true;
+    }
+    Ok(())
 }
 
 fn doctor(session: &Session, json_output: bool, out: &mut impl Write) -> Result<(), CliFailure> {

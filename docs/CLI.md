@@ -74,6 +74,47 @@ Human-readable list commands use headed tables. Cells are kept to a bounded
 single line so one unusually long path or diagnostic does not hide neighboring
 rows; use `--json` when a caller needs complete, untruncated values.
 
+## Setting up a repository
+
+`setup` is the guided first run. It checks what has to be true, asks what it
+cannot infer, and then enrolls the repository, activates a schedule policy, and
+optionally installs the background service:
+
+```sh
+reccursive setup /path/to/repository
+```
+
+Everything it does is a command you could issue yourself; what it adds is order,
+defaults, and a preflight. The most valuable check is the one for a committer
+identity: a checkout without `user.name` and `user.email` enrolls perfectly well
+and then never publishes, because the release pass skips a unit it cannot
+attribute and does so without an error anyone sees. Setup refuses instead, while
+there is someone to tell, and prints the two `git config` commands that fix it.
+
+For scripts, pass `--non-interactive` and supply what cannot be inferred:
+
+```sh
+reccursive setup /path/to/repository --non-interactive --timezone America/New_York
+```
+
+Without a terminal and without `--non-interactive`, setup **refuses** rather than
+falling back to defaults. Falling back would mean silently accepting a target
+branch, a schedule, and a publication mode nobody chose. `--mode immediate`
+requires `--development-target`; a repository whose `origin` has no readable URL
+requires `--remote`.
+
+The schedule is the built-in weekday policy — weekday afternoons, up to three
+releases a day, 45 minutes apart — in this machine's time zone unless
+`--timezone` says otherwise. Use `--schedule FILE` to activate your own document
+in the format described in
+[`SCHEDULE_POLICY_FORMAT.md`](SCHEDULE_POLICY_FORMAT.md), or `--no-schedule` to
+enroll without one.
+
+Setup never publishes anything. If a later step fails after an earlier one
+succeeded, nothing is rolled back: enrollment is atomic on its own, and quietly
+reversing a repository you may already be using would be worse than reporting
+what stands and naming the commands that finish the job.
+
 An agent driving the CLI should start from
 [`AGENT_HANDOFF.md`](AGENT_HANDOFF.md), which specifies the whole sequence.
 

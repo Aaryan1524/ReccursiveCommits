@@ -442,7 +442,6 @@ mod tests {
                     feature_id,
                     Revision::FIRST,
                     BTreeSet::from([*task_id]),
-                    BTreeSet::new(),
                     4,
                 )
                 .unwrap();
@@ -565,7 +564,6 @@ mod tests {
                 feature_id,
                 Revision::FIRST,
                 BTreeSet::from([task_id]),
-                BTreeSet::new(),
                 4,
             )
             .unwrap();

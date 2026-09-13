@@ -23,7 +23,6 @@ pub struct ReleaseUnitRecord {
     pub feature_id: FeatureId,
     pub plan_revision: Revision,
     pub task_ids: BTreeSet<TaskId>,
-    pub required_checks: BTreeSet<String>,
     pub created_at_unix_ms: i64,
 }
 
@@ -50,7 +49,6 @@ impl Store {
         feature_id: FeatureId,
         plan_revision: Revision,
         task_ids: BTreeSet<TaskId>,
-        required_checks: BTreeSet<String>,
         created_at_unix_ms: i64,
     ) -> Result<ReleaseUnitRecord, StoreError> {
         if created_at_unix_ms < 0 {
@@ -71,7 +69,7 @@ impl Store {
         }
 
         let coupling = self.coupling_dependencies(feature_id, plan_revision)?;
-        let unit = ReleaseUnit::new(unit_id, task_ids, &coupling, required_checks)
+        let unit = ReleaseUnit::new(unit_id, task_ids, &coupling)
             .map_err(|error| StoreError::Conflict(error.to_string()))?;
 
         // Grouping the same work again returns the group it is already in, the way selecting a
@@ -96,7 +94,10 @@ impl Store {
                     unit.id.to_string(),
                     feature_id.to_string(),
                     plan_revision.get(),
-                    serde_json::to_string(&unit.required_checks)?,
+                    // The column is retained because migrations here are append-only, but no
+                    // client names checks any more: the repository's own registered checks are
+                    // the authority, and they already run on every attempt.
+                    "[]",
                     created_at_unix_ms,
                 ],
             )
@@ -122,7 +123,6 @@ impl Store {
             feature_id,
             plan_revision,
             task_ids: unit.task_ids,
-            required_checks: unit.required_checks,
             created_at_unix_ms,
         })
     }
@@ -141,9 +141,7 @@ impl Store {
             else {
                 continue;
             };
-            if existing.task_ids == proposed.task_ids
-                && existing.required_checks == proposed.required_checks
-            {
+            if existing.task_ids == proposed.task_ids {
                 return Ok(Some(existing));
             }
             return Err(StoreError::Conflict(format!(
@@ -193,16 +191,16 @@ impl Store {
         &self,
         unit_id: ReleaseUnitId,
     ) -> Result<Option<ReleaseUnitRecord>, StoreError> {
-        let row: Option<(String, u32, String, i64)> = self
+        let row: Option<(String, u32, i64)> = self
             .connection
             .query_row(
-                "SELECT feature_id, plan_revision, required_checks_json, created_at_unix_ms
+                "SELECT feature_id, plan_revision, created_at_unix_ms
                  FROM release_units WHERE unit_id = ?1",
                 [unit_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((feature_id, plan_revision, checks, created_at_unix_ms)) = row else {
+        let Some((feature_id, plan_revision, created_at_unix_ms)) = row else {
             return Ok(None);
         };
 
@@ -228,7 +226,6 @@ impl Store {
             plan_revision: Revision::new(plan_revision)
                 .map_err(|error| StoreError::InvalidData(error.to_string()))?,
             task_ids,
-            required_checks: serde_json::from_str(&checks)?,
             created_at_unix_ms,
         }))
     }
@@ -591,7 +588,6 @@ mod tests {
                 self.feature_id,
                 Revision::FIRST,
                 tasks,
-                BTreeSet::from(["integration".to_owned()]),
                 2,
             )
         }
@@ -706,7 +702,6 @@ mod tests {
             fixture.feature_id,
             Revision::FIRST,
             BTreeSet::from([fixture.interface, fixture.caller, fixture.docs]),
-            BTreeSet::from(["integration".to_owned()]),
             3,
         );
         let Err(StoreError::Conflict(message)) = overlapping else {
@@ -719,29 +714,6 @@ mod tests {
         assert!(
             !message.contains("UNIQUE constraint"),
             "the refusal must not leak storage internals: {message}"
-        );
-    }
-
-    #[test]
-    fn the_same_tasks_with_different_required_checks_are_a_different_grouping() {
-        let mut fixture = fixture();
-        fixture
-            .unit(BTreeSet::from([fixture.interface, fixture.caller]))
-            .unwrap();
-
-        // The checks a unit must pass are part of what the unit is, so changing them is not a
-        // repeat of the same submission.
-        let different_checks = fixture.store.create_release_unit(
-            ReleaseUnitId::new(),
-            fixture.feature_id,
-            Revision::FIRST,
-            BTreeSet::from([fixture.interface, fixture.caller]),
-            BTreeSet::from(["lint".to_owned()]),
-            3,
-        );
-        assert!(
-            matches!(different_checks, Err(StoreError::Conflict(_))),
-            "changed required checks must not silently reuse the existing unit: {different_checks:?}"
         );
     }
 

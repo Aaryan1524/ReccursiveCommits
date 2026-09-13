@@ -77,7 +77,7 @@ impl SnapshotPackage {
         validate_git_workspace(request.workspace)?;
         let package_root = prepare_root(request.package_root)?;
         let parent = package_root.join(request.package_id.to_string());
-        prepare_package_parent(&parent)?;
+        let created_parent = prepare_package_parent(&parent)?;
         let destination = parent.join(format!("revision-{}", request.revision.get()));
         if fs::symlink_metadata(&destination).is_ok() {
             return Err(SnapshotError::AlreadyExists { path: destination });
@@ -196,6 +196,15 @@ impl SnapshotPackage {
         })();
         if capture.is_err() {
             let _ = fs::remove_dir_all(&temporary);
+            // A refused capture must leave the queue exactly as it found it. The partial directory
+            // is removed above; without this the package's own directory survives as an empty
+            // husk, so every rejected capture — a blocked secret, a failed check — would leave a
+            // permanent trace of work that never existed. Only a directory this call created is
+            // removed, and only while it is empty, so an earlier revision of the same package is
+            // never touched.
+            if created_parent {
+                let _ = fs::remove_dir(&parent);
+            }
         }
         capture
     }
@@ -375,15 +384,19 @@ fn prepare_root(path: &Path) -> Result<PathBuf, SnapshotError> {
     Ok(fs::canonicalize(path)?)
 }
 
-fn prepare_package_parent(path: &Path) -> Result<(), SnapshotError> {
+/// Ensures a package's own directory exists, reporting whether this call created it.
+///
+/// The caller needs to know, because a capture that fails must remove what it made and nothing
+/// else: an existing directory holds earlier revisions of the same package.
+fn prepare_package_parent(path: &Path) -> Result<bool, SnapshotError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(false),
         Ok(_) => Err(SnapshotError::UnsafeRoot {
             path: path.to_path_buf(),
         }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir(path)?;
-            Ok(())
+            Ok(true)
         }
         Err(error) => Err(SnapshotError::Io(error)),
     }
@@ -566,10 +579,24 @@ fn command_output(mut command: Command) -> Result<String, SnapshotError> {
         .map_err(|_| SnapshotError::NonUtf8Output)
 }
 
+fn describe_violations(violations: &[ContentViolation]) -> String {
+    violations
+        .iter()
+        .map(|violation| format!("{} ({})", violation.path, violation.rule.description()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Immutable snapshot creation or verification failure.
 #[derive(Debug, Error)]
 pub enum SnapshotError {
-    #[error("capture content validation blocked {} item(s)", violations.len())]
+    // Names the rule and the repository-relative path of each blocked item, and nothing else. A
+    // caller — a person or an agent — cannot fix what it is not told; the matched content itself is
+    // never included, because reporting a secret to prove a secret was found defeats the check.
+    #[error(
+        "capture content validation blocked {}",
+        describe_violations(violations)
+    )]
     ContentBlocked { violations: Vec<ContentViolation> },
     #[error("snapshot must contain at least one task")]
     NoTasks,

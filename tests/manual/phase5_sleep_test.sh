@@ -22,12 +22,27 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 if [[ "${1:-setup}" == "check" ]]; then
   # ---- Run this after waking the machine. ----
   [[ -d "$root" ]] || fail "no test fixture at $root; run this script without arguments first"
-  head_now="$(git -C "$root/remote.git" rev-parse refs/heads/main)"
   head_before="$(cat "$root/head-before.txt")"
 
+  # The maintenance pass runs on an interval, and while the machine is asleep its timer is
+  # suspended — so after a wake the publish lands shortly *after* you get back to the keyboard,
+  # not at the scheduled time. Checking once and declaring failure turns "not yet" into "broken",
+  # so wait out a couple of passes before saying anything.
   printf '\n=== Phase 5 sleep test result ===\n\n'
+  head_now="$(git -C "$root/remote.git" rev-parse refs/heads/main)"
   if [[ "$head_now" == "$head_before" ]]; then
-    printf 'NOT PUBLISHED — the remote is unchanged.\n\n'
+    printf 'Nothing published yet. Waiting up to 3 minutes for the next maintenance pass'
+    for _ in {1..36}; do
+      sleep 5
+      printf '.'
+      head_now="$(git -C "$root/remote.git" rev-parse refs/heads/main)"
+      [[ "$head_now" != "$head_before" ]] && break
+    done
+    printf '\n\n'
+  fi
+
+  if [[ "$head_now" == "$head_before" ]]; then
+    printf 'NOT PUBLISHED — the remote is still unchanged after waiting.\n\n'
     printf 'Where to look:\n'
     cli schedule preview "$(cat "$root/repository-id.txt")" || true
     printf '\n'
@@ -165,13 +180,18 @@ cat <<INSTRUCTIONS
   2. Put the Mac to sleep, and leave it asleep past the scheduled time above
      (at least ${minutes} minutes from now).
 
-  3. Wake it, wait about a minute for the service's maintenance pass, then run:
+  3. Wake it and run:
 
        $0 check
 
-That last step reports whether the daemon published while you were away, and if it
-did not, shows you the schedule, integration health, credential state, and service
-log so the reason is visible rather than guessed at.
+     Run it whenever you like — it waits out a couple of maintenance passes before
+     reporting, because the publish lands shortly after you wake the machine rather
+     than at the scheduled time. While the Mac is asleep the pass's timer is
+     suspended, so the work is caught on wake; that is the behaviour being tested.
+
+If it still reports nothing after waiting, it shows you the schedule, integration
+health, credential state and service log so the reason is visible rather than
+guessed at.
 
 Nothing here touches any repository of yours. To remove it all:
 

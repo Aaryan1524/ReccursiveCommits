@@ -6,7 +6,7 @@ use std::{
     process::Command as ProcessCommand,
 };
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use install::{InstallError, ServiceInstallation};
 use reccursive_protocol::{
     ApiError, ApiErrorCode, CancelTaskRequest, CapturePackageRequest, Command,
@@ -35,7 +35,8 @@ pub const EXIT_INCOMPATIBLE: u8 = 13;
 #[command(
     name = "reccursive",
     version,
-    about = "Schedule verified software changes safely"
+    about = "Schedule verified software changes safely",
+    after_help = "Start here:\n  reccursive doctor\n  reccursive repository add /path/to/repository\n  reccursive status\n\nFor stable automation output, pass --json. For an agent workflow, see docs/AGENT_HANDOFF.md."
 )]
 struct Cli {
     /// Override the local service state directory.
@@ -453,11 +454,14 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
+    let arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
+    let json_requested = arguments
+        .iter()
+        .any(|argument| argument.to_string_lossy() == "--json");
     let cli = match Cli::try_parse_from(arguments) {
         Ok(cli) => cli,
         Err(error) => {
-            let _ = write!(stderr, "{error}");
-            return EXIT_USAGE;
+            return report_parse_error(error, json_requested, stdout, stderr);
         }
     };
     let json_output = cli.json;
@@ -477,6 +481,35 @@ where
                 let _ = writeln!(stderr, "error [{}]: {}", failure.code, failure.message);
             }
             failure.exit_code
+        }
+    }
+}
+
+fn report_parse_error(
+    error: clap::Error,
+    json_requested: bool,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> u8 {
+    match error.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+            let _ = write!(stdout, "{error}");
+            EXIT_SUCCESS
+        }
+        _ if json_requested => {
+            let value = json!({
+                "ok": false,
+                "error": {
+                    "code": "usage",
+                    "message": "Invalid command or arguments. Run `reccursive --help` for usage."
+                }
+            });
+            let _ = writeln!(stderr, "{value}");
+            EXIT_USAGE
+        }
+        _ => {
+            let _ = write!(stderr, "{error}");
+            EXIT_USAGE
         }
     }
 }
@@ -1903,6 +1936,42 @@ mod tests {
             EXIT_USAGE
         );
         assert!(!stderr.is_empty());
+    }
+
+    #[test]
+    fn invalid_json_command_has_a_stable_error_envelope() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            run(
+                ["reccursive", "--json", "unknown"],
+                &mut stdout,
+                &mut stderr,
+            ),
+            EXIT_USAGE
+        );
+        assert!(stdout.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+        assert_eq!(error["ok"], false);
+        assert_eq!(error["error"]["code"], "usage");
+        assert_eq!(
+            error["error"]["message"],
+            "Invalid command or arguments. Run `reccursive --help` for usage."
+        );
+    }
+
+    #[test]
+    fn help_is_successful_and_is_written_to_standard_output() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            run(["reccursive", "--help"], &mut stdout, &mut stderr),
+            EXIT_SUCCESS
+        );
+        assert!(stderr.is_empty());
+        let help = String::from_utf8(stdout).unwrap();
+        assert!(help.contains("Start here:"));
+        assert!(help.contains("For stable automation output, pass --json."));
     }
 
     #[test]

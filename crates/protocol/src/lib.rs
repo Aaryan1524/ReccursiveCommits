@@ -6,14 +6,16 @@ use std::{collections::BTreeSet, fmt};
 
 pub use reccursive_core::{
     AcceptanceCheck, AttemptId, EventId, FeatureId, FeaturePlan, PLAN_SCHEMA_VERSION, PackageId,
-    PlanPhase, PlanTask, PublicationMode, ReasonCode, RepositoryId, RepositoryPolicy, RequestId,
-    Revision, StateReason, TargetMilestone, TargetRef, TaskId, TaskStatus,
+    PlanPhase, PlanTask, PublicationMode, ReasonCode, ReleaseUnitId, RepositoryId,
+    RepositoryPolicy, RequestId, Revision, SchedulePolicy, StateReason, TargetMilestone, TargetRef,
+    TaskId, TaskStatus,
 };
 use serde::{Deserialize, Serialize};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 3 adds release control and attempt inspection.
-pub const API_VERSION: u16 = 3;
+/// Local API protocol version. Version 4 adds release-unit grouping and durable release
+/// scheduling.
+pub const API_VERSION: u16 = 4;
 
 /// Maximum encoded request or response size accepted by the local transport.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -78,6 +80,7 @@ impl RequestEnvelope {
             Command::CapturePackage(request) => request.validate(),
             Command::CancelTask(request) => request.validate(),
             Command::ReleasePackage(request) => request.validate(),
+            Command::CreateReleaseUnit(request) => request.validate(),
             Command::ListReleaseAttempts { limit, .. } if !(1..=1_000).contains(limit) => {
                 Err(ProtocolValidationError::InvalidAttemptLimit)
             }
@@ -99,6 +102,11 @@ impl RequestEnvelope {
             | Command::PlanHistory { .. }
             | Command::GetWorkspace { .. }
             | Command::GetPackage { .. }
+            | Command::GetReleaseUnit { .. }
+            | Command::SetSchedulePolicy(_)
+            | Command::GetSchedulePolicy { .. }
+            | Command::ScheduleUnit(_)
+            | Command::GetScheduleSlot { .. }
             | Command::GetReleaseAttempt { .. }
             | Command::ListReleaseAttempts { .. }
             | Command::AuditQueue
@@ -138,6 +146,24 @@ pub enum Command {
     CancelTask(CancelTaskRequest),
     /// Reconcile, validate, and publish one immutable package through the daemon-owned worker.
     ReleasePackage(ReleasePackageRequest),
+    /// Group tasks that cannot independently leave the target usable into one release unit.
+    CreateReleaseUnit(CreateReleaseUnitRequest),
+    /// Inspect one durable release unit.
+    GetReleaseUnit {
+        release_unit_id: ReleaseUnitId,
+    },
+    /// Activate a validated scheduling-policy revision for a repository.
+    SetSchedulePolicy(SetSchedulePolicyRequest),
+    /// Inspect a repository's active scheduling policy.
+    GetSchedulePolicy {
+        repository_id: RepositoryId,
+    },
+    /// Select a durable future release time for one captured release unit.
+    ScheduleUnit(ScheduleUnitRequest),
+    /// Inspect the durable slot previously selected for a release unit.
+    GetScheduleSlot {
+        release_unit_id: ReleaseUnitId,
+    },
     /// Inspect one durable publication attempt.
     GetReleaseAttempt {
         attempt_id: AttemptId,
@@ -185,6 +211,53 @@ pub struct ReleasePackageRequest {
     pub message: String,
     pub author_name: String,
     pub author_email: String,
+}
+
+/// Groups tasks that cannot independently leave the target usable into one release unit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateReleaseUnitRequest {
+    pub release_unit_id: ReleaseUnitId,
+    pub feature_id: FeatureId,
+    pub plan_revision: Revision,
+    pub task_ids: BTreeSet<TaskId>,
+    #[serde(default)]
+    pub required_checks: BTreeSet<String>,
+}
+
+impl CreateReleaseUnitRequest {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.task_ids.is_empty() || self.task_ids.len() > 1_000 {
+            return Err(ProtocolValidationError::InvalidReleaseUnitTasks);
+        }
+        for check in &self.required_checks {
+            if check.trim().is_empty() || check.len() > 256 {
+                return Err(ProtocolValidationError::InvalidRequiredCheck);
+            }
+        }
+        if self.required_checks.len() > 64 {
+            return Err(ProtocolValidationError::InvalidRequiredCheck);
+        }
+        Ok(())
+    }
+}
+
+/// Activates one validated scheduling-policy revision for a repository.
+///
+/// The policy itself is validated at deserialization by its own domain type; nothing here
+/// re-checks the fields serde has already accepted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SetSchedulePolicyRequest {
+    pub repository_id: RepositoryId,
+    pub policy: SchedulePolicy,
+}
+
+/// Explicitly selects a durable future release time for one captured release unit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleUnitRequest {
+    pub release_unit_id: ReleaseUnitId,
+    pub package_id: PackageId,
+    pub package_revision: Revision,
+    pub seed: u64,
 }
 
 impl ReleasePackageRequest {
@@ -390,6 +463,40 @@ pub struct TaskCancellationView {
     pub invalidated_evidence: usize,
 }
 
+/// A durable release unit and the tasks it publishes together.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseUnitView {
+    pub unit_id: ReleaseUnitId,
+    pub feature_id: FeatureId,
+    pub plan_revision: Revision,
+    pub task_ids: BTreeSet<TaskId>,
+    pub required_checks: BTreeSet<String>,
+    pub created_at_unix_ms: i64,
+}
+
+/// One immutable revision of a repository's active scheduling policy.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SchedulePolicyView {
+    pub repository_id: RepositoryId,
+    pub revision: Revision,
+    pub policy: SchedulePolicy,
+    pub created_at_unix_ms: i64,
+}
+
+/// A selected, durable UTC release time for one release unit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleSlotView {
+    pub release_unit_id: ReleaseUnitId,
+    pub repository_id: RepositoryId,
+    pub package_id: PackageId,
+    pub package_revision: Revision,
+    pub policy_revision: Revision,
+    pub timezone: String,
+    pub eligible_at_unix_ms: i64,
+    pub selected_at_unix_ms: i64,
+    pub created_at_unix_ms: i64,
+}
+
 /// Durable publication state returned to local clients without exposing credentials.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReleaseAttemptView {
@@ -516,6 +623,21 @@ pub enum ResponseData {
     ReleaseAttempts {
         attempts: Vec<ReleaseAttemptView>,
     },
+    ReleaseUnitCreated {
+        unit: ReleaseUnitView,
+    },
+    ReleaseUnit {
+        unit: ReleaseUnitView,
+    },
+    SchedulePolicyActivated {
+        policy: SchedulePolicyView,
+    },
+    SchedulePolicy {
+        policy: SchedulePolicyView,
+    },
+    ScheduleSlot {
+        slot: ScheduleSlotView,
+    },
     QueueAudit {
         audit: QueueAuditView,
     },
@@ -591,6 +713,12 @@ pub enum ProtocolValidationError {
     InvalidReleaseField(&'static str),
     #[error("release attempt limit must be between 1 and 1000")]
     InvalidAttemptLimit,
+    #[error("release unit must select between 1 and 1000 plan tasks")]
+    InvalidReleaseUnitTasks,
+    #[error(
+        "a required check name must be 1-256 non-whitespace bytes, and at most 64 may be named"
+    )]
+    InvalidRequiredCheck,
     #[error("queue export destination must contain 1-4096 bytes")]
     InvalidExportDestination,
 }

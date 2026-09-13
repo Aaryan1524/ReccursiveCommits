@@ -9,10 +9,12 @@ use std::{
 use clap::{Parser, Subcommand, ValueEnum};
 use reccursive_protocol::{
     ApiError, ApiErrorCode, CancelTaskRequest, CapturePackageRequest, Command,
-    CreateWorkspaceRequest, EnrollRepositoryRequest, EventSeverityView, EventView, FeatureId,
-    FeaturePlan, LocalClient, PackageId, PackageView, PlanView, PublicationMode, QueueAuditView,
-    QueueExportView, ReleaseAttemptView, ReleasePackageRequest, RepositoryView, ResponseData,
-    Revision, TargetRef, TaskId, WorkspaceView,
+    CreateReleaseUnitRequest, CreateWorkspaceRequest, EnrollRepositoryRequest, EventSeverityView,
+    EventView, FeatureId, FeaturePlan, LocalClient, PackageId, PackageView, PlanView,
+    PublicationMode, QueueAuditView, QueueExportView, ReleaseAttemptView, ReleasePackageRequest,
+    ReleaseUnitId, ReleaseUnitView, RepositoryId, RepositoryView, ResponseData, Revision,
+    SchedulePolicy, SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest,
+    SetSchedulePolicyRequest, TargetRef, TaskId, WorkspaceView,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -75,6 +77,11 @@ enum TopLevelCommand {
     Release {
         #[command(subcommand)]
         command: ReleaseCommand,
+    },
+    /// Configure repository release timing and select durable release times.
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
     },
     /// Inspect package recovery state or create a portable queue backup.
     Queue {
@@ -150,6 +157,43 @@ enum ReleaseCommand {
         #[arg(long, default_value_t = 50, value_parser = parse_event_limit)]
         limit: usize,
     },
+    /// Group tasks that cannot independently leave the target usable into one release unit.
+    CreateUnit {
+        feature_id: FeatureId,
+        #[arg(long, value_parser = parse_revision)]
+        revision: Revision,
+        #[arg(long = "task", required = true)]
+        task_ids: Vec<TaskId>,
+        #[arg(long = "check")]
+        required_checks: Vec<String>,
+    },
+    /// Show one durable release unit.
+    ShowUnit { release_unit_id: ReleaseUnitId },
+}
+
+#[derive(Debug, Subcommand)]
+enum ScheduleCommand {
+    /// Activate a validated scheduling-policy revision for a repository.
+    SetPolicy {
+        repository_id: RepositoryId,
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Show a repository's active scheduling policy.
+    ShowPolicy { repository_id: RepositoryId },
+    /// Select a durable future release time for one captured release unit.
+    Unit {
+        release_unit_id: ReleaseUnitId,
+        #[arg(long)]
+        package_id: PackageId,
+        #[arg(long, value_parser = parse_revision, default_value = "1")]
+        revision: Revision,
+        /// Deterministic selection seed; a random one is used when omitted.
+        #[arg(long)]
+        seed: Option<u64>,
+    },
+    /// Show the durable slot previously selected for a release unit.
+    Show { release_unit_id: ReleaseUnitId },
 }
 
 #[derive(Debug, Subcommand)]
@@ -468,6 +512,70 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 let data = send(&paths, Command::ListReleaseAttempts { package_id, limit })?;
                 output_data(data, cli.json, stdout)
             }
+            ReleaseCommand::CreateUnit {
+                feature_id,
+                revision,
+                task_ids,
+                required_checks,
+            } => {
+                let data = send(
+                    &paths,
+                    Command::CreateReleaseUnit(CreateReleaseUnitRequest {
+                        release_unit_id: ReleaseUnitId::new(),
+                        feature_id,
+                        plan_revision: revision,
+                        task_ids: task_ids.into_iter().collect(),
+                        required_checks: required_checks.into_iter().collect(),
+                    }),
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            ReleaseCommand::ShowUnit { release_unit_id } => {
+                let data = send(&paths, Command::GetReleaseUnit { release_unit_id })?;
+                output_data(data, cli.json, stdout)
+            }
+        },
+        TopLevelCommand::Schedule { command } => match command {
+            ScheduleCommand::SetPolicy {
+                repository_id,
+                file,
+            } => {
+                let policy = load_schedule_policy(&file)?;
+                let data = send(
+                    &paths,
+                    Command::SetSchedulePolicy(SetSchedulePolicyRequest {
+                        repository_id,
+                        policy,
+                    }),
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::ShowPolicy { repository_id } => {
+                let data = send(&paths, Command::GetSchedulePolicy { repository_id })?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::Unit {
+                release_unit_id,
+                package_id,
+                revision,
+                seed,
+            } => {
+                let seed = seed.unwrap_or_else(random_seed);
+                let data = send(
+                    &paths,
+                    Command::ScheduleUnit(ScheduleUnitRequest {
+                        release_unit_id,
+                        package_id,
+                        package_revision: revision,
+                        seed,
+                    }),
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::Show { release_unit_id } => {
+                let data = send(&paths, Command::GetScheduleSlot { release_unit_id })?;
+                output_data(data, cli.json, stdout)
+            }
         },
         TopLevelCommand::Queue { command } => match command {
             QueueCommand::Audit => {
@@ -523,6 +631,33 @@ fn load_plan(path: &Path) -> Result<FeaturePlan, CliFailure> {
         CliFailure::new(EXIT_ACTION_REQUIRED, "invalid_plan", error.to_string())
     })?;
     Ok(plan)
+}
+
+fn load_schedule_policy(path: &Path) -> Result<SchedulePolicy, CliFailure> {
+    let bytes = fs::read(path).map_err(|error| {
+        CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "schedule_policy_unreadable",
+            format!("cannot read {}: {error}", path.display()),
+        )
+    })?;
+    // SchedulePolicy validates its own fields during deserialization, so a structurally invalid
+    // document and a semantically invalid one (overlapping windows, an empty day set, and so on)
+    // are both reported here with no separate validation pass required.
+    serde_json::from_slice(&bytes).map_err(|error| {
+        CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "invalid_schedule_policy",
+            format!("{} is not a valid schedule policy: {error}", path.display()),
+        )
+    })
+}
+
+/// A seed for deterministic slot selection. Real usage does not care which slot among the
+/// eligible ones is picked, only that a restart never redraws it — which the store guarantees
+/// independently of this value. Reused rather than adding a `rand` dependency for one call.
+fn random_seed() -> u64 {
+    uuid::Uuid::new_v4().as_u64_pair().0
 }
 
 fn parse_revision(value: &str) -> Result<Revision, String> {
@@ -736,6 +871,23 @@ fn output_data(
         ),
         ResponseData::ReleaseAttempt { attempt } => output_release_attempt(out, &attempt),
         ResponseData::ReleaseAttempts { attempts } => output_release_attempts(out, &attempts),
+        ResponseData::ReleaseUnitCreated { unit } => {
+            writeln!(
+                out,
+                "Created release unit {} with {} task(s)",
+                unit.unit_id,
+                unit.task_ids.len()
+            )
+        }
+        ResponseData::ReleaseUnit { unit } => output_release_unit(out, &unit),
+        ResponseData::SchedulePolicyActivated { policy } => writeln!(
+            out,
+            "Activated schedule policy revision {} for repository {}",
+            policy.revision.get(),
+            policy.repository_id
+        ),
+        ResponseData::SchedulePolicy { policy } => output_schedule_policy(out, &policy),
+        ResponseData::ScheduleSlot { slot } => output_schedule_slot(out, &slot),
         ResponseData::QueueAudit { audit } => output_queue_audit(out, &audit),
         ResponseData::QueueExported { export } => output_queue_export(out, &export),
     }
@@ -800,6 +952,63 @@ fn output_package(out: &mut impl Write, package: &PackageView) -> io::Result<()>
         package.result_tree,
         package.content_hash,
         package.task_ids.len()
+    )
+}
+
+fn output_release_unit(out: &mut impl Write, unit: &ReleaseUnitView) -> io::Result<()> {
+    writeln!(
+        out,
+        "Unit: {}\nFeature: {} revision {}\nTasks: {}\nRequired checks: {}",
+        unit.unit_id,
+        unit.feature_id,
+        unit.plan_revision.get(),
+        unit.task_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        if unit.required_checks.is_empty() {
+            "none".to_owned()
+        } else {
+            unit.required_checks
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    )
+}
+
+fn output_schedule_policy(out: &mut impl Write, policy: &SchedulePolicyView) -> io::Result<()> {
+    writeln!(
+        out,
+        "Repository: {}\nPolicy revision: {}\nTime zone: {}\nAllowed days: {}\nDaily releases: {}-{}\nMinimum spacing: {} minute(s)",
+        policy.repository_id,
+        policy.revision.get(),
+        policy.policy.timezone.as_str(),
+        policy
+            .policy
+            .allowed_days
+            .iter()
+            .map(|day| format!("{day:?}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        policy.policy.daily_releases.minimum,
+        policy.policy.daily_releases.maximum,
+        policy.policy.minimum_spacing_minutes,
+    )
+}
+
+fn output_schedule_slot(out: &mut impl Write, slot: &ScheduleSlotView) -> io::Result<()> {
+    writeln!(
+        out,
+        "Unit: {}\nPackage: {} revision {}\nSelected: {} ({})\nEligible since: {}",
+        slot.release_unit_id,
+        slot.package_id,
+        slot.package_revision.get(),
+        slot.selected_at_unix_ms,
+        slot.timezone,
+        slot.eligible_at_unix_ms,
     )
 }
 

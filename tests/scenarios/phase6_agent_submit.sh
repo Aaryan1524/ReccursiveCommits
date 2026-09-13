@@ -112,7 +112,10 @@ fi
 # and the response says which — an agent must carry that number forward.
 sealed_revision="$(cli plan seal "$feature_id" | sed -E 's/.*"revision":([0-9]+).*/\1/')"
 [[ "$sealed_revision" == "2" ]] || fail "sealing did not append revision 2, got $sealed_revision"
-cli plan show "$feature_id" --revision 1 | grep -q '"sealed":false' || \
+# Matched from a variable, not a pipe: a quiet grep that matches early would SIGPIPE the writer
+# and, under `pipefail`, turn a found match into a failed assertion.
+draft_revision="$(cli plan show "$feature_id" --revision 1)"
+grep -q '"sealed":false' <<<"$draft_revision" || \
   fail "sealing modified the draft revision instead of appending a new one"
 cli plan seal "$feature_id" >"$fixture_root/reseal.json" 2>&1 && fail "an already-sealed plan was sealed again"
 grep -q '"code":"conflict"' "$fixture_root/reseal.json" || \
@@ -170,6 +173,22 @@ grep -q '"status":"scheduled"' <<<"$status_after" || \
 
 # A second, genuinely different task is a different submission and is created normally.
 printf 'second unit\n' >"$workspace_path/second.txt"
+
+# Task order cannot turn a conflicting submission into a partial capture. The first task already
+# belongs to the first package, while the second has never been captured; asking for both is not a
+# repeat of either. In particular, naming the new task first proves the service checks the whole
+# set before it writes a package.
+packages_before_mixed="$(ls "$fixture_root/state/packages" | wc -l | tr -d ' ')"
+if cli task submit "$feature_id" --task "$second_task" --task "$first_task" \
+  >"$fixture_root/mixed-submission.json" 2>&1; then
+  fail "a mixed old/new task submission was accepted"
+fi
+grep -q '"code":"conflict"' "$fixture_root/mixed-submission.json" || \
+  fail "a mixed old/new task submission was not rejected as a conflict: $(cat "$fixture_root/mixed-submission.json")"
+packages_after_mixed="$(ls "$fixture_root/state/packages" | wc -l | tr -d ' ')"
+[[ "$packages_after_mixed" == "$packages_before_mixed" ]] || \
+  fail "a mixed old/new task submission created a package before being refused"
+
 second_submission="$(cli task submit "$feature_id" --task "$second_task")"
 grep -q '"created":true' <<<"$second_submission" || fail "a distinct task was not submitted as new work"
 [[ "$(json_field unit_id <<<"$second_submission")" != "$first_unit" ]] || \

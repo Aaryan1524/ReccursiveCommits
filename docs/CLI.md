@@ -18,6 +18,7 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state repository list
 cargo run -p reccursive-cli -- --state-dir /path/to/state status
 cargo run -p reccursive-cli -- --state-dir /path/to/state logs --limit 50
 cargo run -p reccursive-cli -- --state-dir /path/to/state plan import feature-plan.json
+cargo run -p reccursive-cli -- --state-dir /path/to/state plan seal feature_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state plan show feature_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state plan history feature_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state workspace create feature_<uuid>
@@ -25,7 +26,9 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state workspace create featu
 cargo run -p reccursive-cli -- --state-dir /path/to/state workspace show feature_<uuid> --revision 1
 cargo run -p reccursive-cli -- --state-dir /path/to/state package capture feature_<uuid> --revision 1 --task task_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state package show package_<uuid>
+cargo run -p reccursive-cli -- --state-dir /path/to/state task submit feature_<uuid> --revision 1 --task task_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state task cancel feature_<uuid> --revision 1 --task task_<uuid> --message "replaced by a newer approach"
+cargo run -p reccursive-cli -- --state-dir /path/to/state feature status feature_<uuid> --revision 1
 cargo run -p reccursive-cli -- --state-dir /path/to/state release publish package_<uuid> --revision 1 --message "feat: publish the unit" --author-name "Your Name" --author-email you@example.invalid
 cargo run -p reccursive-cli -- --state-dir /path/to/state release attempt attempt_<uuid>
 cargo run -p reccursive-cli -- --state-dir /path/to/state release attempts --package-id package_<uuid> --limit 50
@@ -54,8 +57,19 @@ cargo run -p reccursive-cli -- --state-dir /path/to/state queue audit
 cargo run -p reccursive-cli -- --state-dir /path/to/state queue export /absolute/path/to/queue-backup
 ```
 
-Pass `--json` for a stable JSON envelope with no prompts or spinners. The
+Pass `--json` for a stable JSON envelope with no prompts or spinners. Successful
+responses are written to standard output; failures are written to standard error
+with the same `{ "ok": false, "error": { "code": "...", "message": "..." } }` shape,
+including command and argument mistakes. `--help` and `--version` are successful
+commands and write their human-readable output to standard output. The
 `RECCURSIVE_STATE_DIR` environment variable can replace `--state-dir`.
+
+`doctor --json` intentionally writes its complete multi-check report to standard
+output even when it finds a problem, so callers always receive one report rather
+than an incomplete result plus a separate error object.
+
+Run `reccursive --help` for a short start-here path, or use
+`reccursive <command> --help` to inspect a command group before making changes.
 
 An agent driving the CLI should start from
 [`AGENT_HANDOFF.md`](AGENT_HANDOFF.md), which specifies the whole sequence.

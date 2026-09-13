@@ -1899,20 +1899,26 @@ fn submit_task(
                 )
             })?;
         let plan_revision = plan.plan.revision;
-        let first = *request.task_ids.iter().next().ok_or_else(|| {
-            ApiError::new(
+        if request.task_ids.is_empty() {
+            return Err(ApiError::new(
                 ApiErrorCode::InvalidRequest,
                 "a submission must name at least one task",
                 false,
-            )
-        })?;
-        let existing = store
-            .snapshot_package_for_task(request.feature_id, plan_revision, first)
-            .map_err(store_api_error)?;
-        // The package has to carry exactly the submitted tasks. A package carrying a different set
-        // is a different submission that happens to share a task, and handing it back would report
-        // work the caller did not submit as though it had been accepted.
-        if let Some(package) = &existing {
+            ));
+        }
+        let mut existing: Option<SnapshotRecord> = None;
+        // Inspect every requested task before capture. Looking at only the first made task order
+        // observable: `[new, already_captured]` could write a new package before the lifecycle
+        // rejected the second task. A repeat is valid only when every named task is already
+        // carried by one package with this exact set; anything else is a different submission and
+        // must leave the queue untouched.
+        for task_id in &request.task_ids {
+            let Some(package) = store
+                .snapshot_package_for_task(request.feature_id, plan_revision, *task_id)
+                .map_err(store_api_error)?
+            else {
+                continue;
+            };
             let carried: BTreeSet<_> = store
                 .package_task_ids(package.package_id, package.revision)
                 .map_err(store_api_error)?
@@ -1922,12 +1928,29 @@ fn submit_task(
                 return Err(ApiError::new(
                     ApiErrorCode::Conflict,
                     format!(
-                        "task {first} is already captured in package {}, which carries different \
-                         work; cancel it or submit a new plan revision",
+                        "task {task_id} is already captured in package {}, which carries \
+                         different work; cancel it or submit a new plan revision",
                         package.package_id
                     ),
                     false,
                 ));
+            }
+            if let Some(previous) = &existing {
+                if previous.package_id != package.package_id
+                    || previous.revision != package.revision
+                {
+                    return Err(ApiError::new(
+                        ApiErrorCode::Conflict,
+                        format!(
+                            "submitted tasks are already captured by different packages ({} and \
+                             {}); cancel them or submit a new plan revision",
+                            previous.package_id, package.package_id
+                        ),
+                        false,
+                    ));
+                }
+            } else {
+                existing = Some(package);
             }
         }
         (plan_revision, existing)
@@ -1973,7 +1996,6 @@ fn submit_task(
             request.feature_id,
             plan_revision,
             request.task_ids,
-            request.required_checks,
             now,
         )
         .map_err(store_api_error)?;
@@ -2078,7 +2100,6 @@ fn create_release_unit(
             request.feature_id,
             request.plan_revision,
             request.task_ids,
-            request.required_checks,
             now,
         )
         .map_err(store_api_error)?;
@@ -2112,7 +2133,6 @@ fn release_unit_view(unit: reccursive_store::ReleaseUnitRecord) -> ReleaseUnitVi
         feature_id: unit.feature_id,
         plan_revision: unit.plan_revision,
         task_ids: unit.task_ids,
-        required_checks: unit.required_checks,
         created_at_unix_ms: unit.created_at_unix_ms,
     }
 }

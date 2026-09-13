@@ -6,11 +6,14 @@ use thiserror::Error;
 use crate::{ReleaseUnitId, TaskId};
 
 /// An indivisible set of tasks that must be verified and released together.
+///
+/// A unit names *what* ships together. It deliberately does not name what must pass first: the
+/// checks a release runs belong to the repository and are registered when it is enrolled, so that
+/// what verifies a change is never something the change itself supplied.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReleaseUnit {
     pub id: ReleaseUnitId,
     pub task_ids: BTreeSet<TaskId>,
-    pub required_checks: BTreeSet<String>,
 }
 
 impl ReleaseUnit {
@@ -19,13 +22,9 @@ impl ReleaseUnit {
         id: ReleaseUnitId,
         task_ids: BTreeSet<TaskId>,
         dependencies: &BTreeMap<TaskId, BTreeSet<TaskId>>,
-        required_checks: BTreeSet<String>,
     ) -> Result<Self, ReleaseUnitError> {
         if task_ids.is_empty() {
             return Err(ReleaseUnitError::Empty);
-        }
-        if required_checks.iter().any(|check| check.trim().is_empty()) {
-            return Err(ReleaseUnitError::EmptyCheck);
         }
         for task in &task_ids {
             let missing: Vec<_> = dependencies
@@ -42,11 +41,7 @@ impl ReleaseUnit {
                 });
             }
         }
-        Ok(Self {
-            id,
-            task_ids,
-            required_checks,
-        })
+        Ok(Self { id, task_ids })
     }
 }
 
@@ -54,8 +49,6 @@ impl ReleaseUnit {
 pub enum ReleaseUnitError {
     #[error("release unit must contain at least one task")]
     Empty,
-    #[error("release unit checks must be named")]
-    EmptyCheck,
     #[error("release unit task {task} omits required prerequisite task(s) {missing:?}")]
     MissingPrerequisite { task: TaskId, missing: Vec<TaskId> },
 }
@@ -73,7 +66,6 @@ mod tests {
                 ReleaseUnitId::new(),
                 BTreeSet::from([caller]),
                 &dependencies,
-                BTreeSet::from(["integration".into()])
             ),
             Err(ReleaseUnitError::MissingPrerequisite { .. })
         ));
@@ -82,7 +74,6 @@ mod tests {
                 ReleaseUnitId::new(),
                 BTreeSet::from([api, caller]),
                 &dependencies,
-                BTreeSet::from(["integration".into()])
             )
             .is_ok()
         );

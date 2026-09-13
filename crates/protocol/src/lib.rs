@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 12 adds sealing, submission, and feature status.
-pub const API_VERSION: u16 = 12;
+/// Local API protocol version. Version 13 removes the unenforced client-named release checks.
+pub const API_VERSION: u16 = 13;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -468,22 +468,12 @@ pub struct CreateReleaseUnitRequest {
     pub feature_id: FeatureId,
     pub plan_revision: Revision,
     pub task_ids: BTreeSet<TaskId>,
-    #[serde(default)]
-    pub required_checks: BTreeSet<String>,
 }
 
 impl CreateReleaseUnitRequest {
     pub fn validate(&self) -> Result<(), ProtocolValidationError> {
         if self.task_ids.is_empty() || self.task_ids.len() > 1_000 {
             return Err(ProtocolValidationError::InvalidReleaseUnitTasks);
-        }
-        for check in &self.required_checks {
-            if check.trim().is_empty() || check.len() > 256 {
-                return Err(ProtocolValidationError::InvalidRequiredCheck);
-            }
-        }
-        if self.required_checks.len() > 64 {
-            return Err(ProtocolValidationError::InvalidRequiredCheck);
         }
         Ok(())
     }
@@ -502,8 +492,6 @@ pub struct SubmitTaskRequest {
     #[serde(default)]
     pub plan_revision: Option<Revision>,
     pub task_ids: BTreeSet<TaskId>,
-    #[serde(default)]
-    pub required_checks: BTreeSet<String>,
     /// Seed for the deterministic slot selection, so a submission is reproducible.
     pub seed: u64,
 }
@@ -512,14 +500,6 @@ impl SubmitTaskRequest {
     pub fn validate(&self) -> Result<(), ProtocolValidationError> {
         if self.task_ids.is_empty() || self.task_ids.len() > 1_000 {
             return Err(ProtocolValidationError::InvalidPackageTasks);
-        }
-        for check in &self.required_checks {
-            if check.trim().is_empty() || check.len() > 256 {
-                return Err(ProtocolValidationError::InvalidRequiredCheck);
-            }
-        }
-        if self.required_checks.len() > 64 {
-            return Err(ProtocolValidationError::InvalidRequiredCheck);
         }
         Ok(())
     }
@@ -797,7 +777,6 @@ pub struct ReleaseUnitView {
     pub feature_id: FeatureId,
     pub plan_revision: Revision,
     pub task_ids: BTreeSet<TaskId>,
-    pub required_checks: BTreeSet<String>,
     pub created_at_unix_ms: i64,
 }
 

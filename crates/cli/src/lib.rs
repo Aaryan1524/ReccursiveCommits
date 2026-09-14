@@ -18,7 +18,7 @@ use reccursive_protocol::{
     ResponseData, Revision, ScheduleChangeView, SchedulePolicy, SchedulePolicyOverride,
     SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest,
     SubmissionView, SubmitTaskRequest, TargetMilestone, TargetRef, TaskId, TaskProgressView,
-    WorkspaceView,
+    WorkspaceView, next_action_for_attempt,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -152,6 +152,11 @@ enum TopLevelCommand {
     Integrations,
     /// Check whether credentials and signing would let a repository publish right now.
     Diagnose { repository_id: RepositoryId },
+    /// Write a shareable diagnostic report, leaving the queue untouched.
+    Diagnostics {
+        #[command(subcommand)]
+        command: DiagnosticsCommand,
+    },
     /// Show recent sanitized daemon events.
     Logs {
         /// Maximum number of newest events to return.
@@ -190,6 +195,18 @@ enum PackageCommand {
         package_id: PackageId,
         #[arg(long, value_parser = parse_revision, default_value = "1")]
         revision: Revision,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DiagnosticsCommand {
+    /// Collect service state into a directory you can share.
+    Export {
+        #[arg(value_name = "DIRECTORY")]
+        destination: PathBuf,
+        /// How many recent events to include.
+        #[arg(long, default_value_t = 200, value_parser = parse_event_limit)]
+        limit: usize,
     },
 }
 
@@ -322,9 +339,13 @@ enum ScheduleCommand {
     },
     /// Stop a repository from starting new releases until it is resumed.
     Pause {
-        repository_id: RepositoryId,
+        /// The repository to pause. Omit only with --all.
+        repository_id: Option<RepositoryId>,
         #[arg(long)]
         reason: String,
+        /// Pause every enrolled repository.
+        #[arg(long, conflicts_with = "repository_id")]
+        all: bool,
     },
     /// Resume a paused repository.
     Resume { repository_id: RepositoryId },
@@ -362,6 +383,12 @@ enum QueueCommand {
         /// Restrict to one repository.
         #[arg(long)]
         repository_id: Option<RepositoryId>,
+        /// Show only units in this state.
+        #[arg(long, value_enum)]
+        state: Option<QueueStateFilter>,
+        /// Show only units that need a person: blocked, or whose release time was withdrawn.
+        #[arg(long, conflicts_with = "state")]
+        needs_attention: bool,
     },
     /// Redraw the queue on an interval until you stop watching.
     Watch {
@@ -642,6 +669,11 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             cli.json,
             stdout,
         ),
+        TopLevelCommand::Diagnostics { command } => match command {
+            DiagnosticsCommand::Export { destination, limit } => {
+                export_diagnostics(&session, &destination, limit, cli.json, stdout)
+            }
+        },
         TopLevelCommand::Doctor => doctor(&session, cli.json, stdout),
         TopLevelCommand::Diagnose { repository_id } => {
             let data = send(&session, Command::DiagnoseRepository { repository_id })?;
@@ -947,16 +979,8 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             ScheduleCommand::Pause {
                 repository_id,
                 reason,
-            } => {
-                let data = send(
-                    &session,
-                    Command::PauseRepository {
-                        repository_id,
-                        reason,
-                    },
-                )?;
-                output_data(data, cli.json, stdout)
-            }
+                all,
+            } => pause_repositories(&session, repository_id, &reason, all, cli.json, stdout),
             ScheduleCommand::Resume { repository_id } => {
                 let data = send(&session, Command::ResumeRepository { repository_id })?;
                 output_data(data, cli.json, stdout)
@@ -1020,8 +1044,13 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             }
         },
         TopLevelCommand::Queue { command } => match command {
-            QueueCommand::Status { repository_id } => {
+            QueueCommand::Status {
+                repository_id,
+                state,
+                needs_attention,
+            } => {
                 let data = send(&session, Command::SummarizeQueue { repository_id })?;
+                let data = filter_queue(data, state, needs_attention);
                 output_data(data, cli.json, stdout)
             }
             QueueCommand::Watch {
@@ -1743,6 +1772,263 @@ fn output_check_results(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum QueueStateFilter {
+    Ready,
+    Scheduled,
+    Due,
+    Publishing,
+    Blocked,
+    Cancelled,
+    Published,
+}
+
+impl QueueStateFilter {
+    const fn matches(self, state: QueuedUnitState) -> bool {
+        matches!(
+            (self, state),
+            (Self::Ready, QueuedUnitState::Ready)
+                | (Self::Scheduled, QueuedUnitState::Scheduled)
+                | (Self::Due, QueuedUnitState::Due)
+                | (Self::Publishing, QueuedUnitState::Publishing)
+                | (Self::Blocked, QueuedUnitState::Blocked)
+                | (Self::Cancelled, QueuedUnitState::Cancelled)
+                | (Self::Published, QueuedUnitState::Published)
+        )
+    }
+}
+
+/// Narrows a queue summary to the units a caller asked about.
+///
+/// Filtering happens here rather than in the daemon because it is a question about presentation,
+/// not about state: the same summary answers every filter, and pushing the predicate across the
+/// protocol would mean a new API shape each time someone wants a different view. Repositories are
+/// kept even when empty, so a filter that matches nothing still shows where it looked.
+fn filter_queue(
+    data: ResponseData,
+    state: Option<QueueStateFilter>,
+    needs_attention: bool,
+) -> ResponseData {
+    let ResponseData::QueueSummary { mut summary } = data else {
+        return data;
+    };
+    if state.is_none() && !needs_attention {
+        return ResponseData::QueueSummary { summary };
+    }
+    for repository in &mut summary.repositories {
+        repository.units.retain(|unit| {
+            if needs_attention {
+                // What a person has to look at: stopped work, and work that quietly lost its
+                // place in the schedule.
+                return unit.state == QueuedUnitState::Blocked
+                    || unit.last_schedule_change.is_some();
+            }
+            state.is_none_or(|filter| filter.matches(unit.state))
+        });
+    }
+    ResponseData::QueueSummary { summary }
+}
+
+/// Pauses one repository, or every enrolled one.
+///
+/// Pausing all of them is several calls, not one: pausing is per repository, and there is no
+/// durable "everything is paused" state to set. That is reported honestly — each repository is
+/// named as it is paused, and if one refuses, the ones already paused stay paused and are listed,
+/// because silently rolling them back would resume publishing an operator asked to stop.
+fn pause_repositories(
+    session: &Session,
+    repository_id: Option<RepositoryId>,
+    reason: &str,
+    all: bool,
+    json_output: bool,
+    out: &mut impl Write,
+) -> Result<(), CliFailure> {
+    if !all {
+        let repository_id = repository_id.ok_or_else(|| {
+            CliFailure::new(
+                EXIT_USAGE,
+                "repository_required",
+                "name a repository to pause, or pass --all to pause every enrolled repository",
+            )
+        })?;
+        let data = send(
+            session,
+            Command::PauseRepository {
+                repository_id,
+                reason: reason.to_owned(),
+            },
+        )?;
+        return output_data(data, json_output, out);
+    }
+
+    let repositories = match send(session, Command::ListRepositories)? {
+        ResponseData::Repositories { repositories } => repositories,
+        _ => {
+            return Err(CliFailure::new(
+                EXIT_INTERNAL,
+                "unexpected_response",
+                "listing repositories returned an unexpected result",
+            ));
+        }
+    };
+    if repositories.is_empty() {
+        return writeln!(out, "No repositories are enrolled.").map_err(output_error);
+    }
+
+    let mut paused = Vec::new();
+    for repository in &repositories {
+        match send(
+            session,
+            Command::PauseRepository {
+                repository_id: repository.id,
+                reason: reason.to_owned(),
+            },
+        ) {
+            Ok(_) => paused.push(repository.id),
+            Err(failure) => {
+                let mut message = format!("{}: {}", repository.id, failure.message);
+                if !paused.is_empty() {
+                    message.push_str("\nAlready paused and left paused:");
+                    for id in &paused {
+                        message.push_str(&format!("\n  {id}"));
+                    }
+                }
+                return Err(CliFailure::new(failure.exit_code, failure.code, message));
+            }
+        }
+    }
+
+    if json_output {
+        let value = json!({
+            "ok": true,
+            "data": {
+                "type": "repositories_paused",
+                "payload": {
+                    "paused": paused.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "reason": reason,
+                }
+            }
+        });
+        return writeln!(out, "{value}").map_err(output_error);
+    }
+    writeln!(out, "Paused {} repositories: {reason}", paused.len()).map_err(output_error)?;
+    for id in paused {
+        writeln!(out, "  {id}").map_err(output_error)?;
+    }
+    Ok(())
+}
+
+/// Collects service state into a directory the user can hand to someone else.
+///
+/// Everything written here is read back through the ordinary local API, which is what makes it
+/// safe to share: events are scrubbed for credential-shaped text on the way into storage, check
+/// output is scrubbed when it is recorded, and enrollment already refuses a remote with embedded
+/// credentials. Nothing reads the auth token, the database, or package contents.
+///
+/// It is a copy. The queue is never moved, trimmed, or otherwise disturbed by being described —
+/// exporting diagnostics must never cost someone the work they were trying to get help with.
+fn export_diagnostics(
+    session: &Session,
+    destination: &Path,
+    limit: usize,
+    json_output: bool,
+    out: &mut impl Write,
+) -> Result<(), CliFailure> {
+    if fs::symlink_metadata(destination).is_ok() {
+        return Err(CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "destination_exists",
+            format!(
+                "{} already exists; name a directory that does not yet exist",
+                destination.display()
+            ),
+        ));
+    }
+    fs::create_dir_all(destination).map_err(|error| {
+        CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "write_failed",
+            format!("cannot create {}: {error}", destination.display()),
+        )
+    })?;
+
+    // Read-only commands only. A diagnostic report that changed state would be a trap.
+    let sections: [(&str, Command); 5] = [
+        ("status.json", Command::Status),
+        ("repositories.json", Command::ListRepositories),
+        (
+            "queue.json",
+            Command::SummarizeQueue {
+                repository_id: None,
+            },
+        ),
+        ("integrations.json", Command::ListIntegrationHealth),
+        ("events.json", Command::ListEvents { limit }),
+    ];
+    let mut written = Vec::new();
+    for (name, command) in sections {
+        // One unavailable section must not lose the rest: a report from a half-broken
+        // installation is exactly the report worth having.
+        let body = match send(session, command) {
+            Ok(data) => json!({ "ok": true, "data": data }),
+            Err(failure) => json!({
+                "ok": false,
+                "error": { "code": failure.code, "message": failure.message }
+            }),
+        };
+        let path = destination.join(name);
+        fs::write(&path, format!("{body}\n")).map_err(|error| {
+            CliFailure::new(
+                EXIT_ACTION_REQUIRED,
+                "write_failed",
+                format!("cannot write {}: {error}", path.display()),
+            )
+        })?;
+        written.push(name);
+    }
+
+    let manifest = json!({
+        "kind": "reccursive-diagnostics",
+        "cli_version": env!("CARGO_PKG_VERSION"),
+        "api_version": reccursive_protocol::API_VERSION,
+        "sections": written,
+        "excluded": [
+            "the local API authentication token",
+            "the queue database",
+            "captured package contents and patches",
+        ],
+        "redaction": "event and check output are scrubbed for credential-shaped text when stored",
+    });
+    let manifest_path = destination.join("manifest.json");
+    fs::write(&manifest_path, format!("{manifest}\n")).map_err(|error| {
+        CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "write_failed",
+            format!("cannot write {}: {error}", manifest_path.display()),
+        )
+    })?;
+
+    if json_output {
+        let value = json!({
+            "ok": true,
+            "data": {
+                "type": "diagnostics_exported",
+                "payload": {
+                    "destination": destination.display().to_string(),
+                    "sections": written,
+                }
+            }
+        });
+        return writeln!(out, "{value}").map_err(output_error);
+    }
+    writeln!(
+        out,
+        "Wrote diagnostics to {}\nThe queue is unchanged. Review the files before sharing them.",
+        destination.display()
+    )
+    .map_err(output_error)
+}
+
 fn queued_state_label(state: QueuedUnitState) -> &'static str {
     match state {
         QueuedUnitState::Ready => "ready",
@@ -2343,6 +2629,14 @@ fn output_release_attempt(out: &mut impl Write, attempt: &ReleaseAttemptView) ->
     )?;
     if let Some(reason) = &attempt.reason {
         writeln!(out, "Reason: {:?}: {}", reason.code, reason.message)?;
+    }
+    // A blocked attempt that leaves the reader with nothing to do is the failure this is here to
+    // remove. Where no action is known, nothing is printed rather than something plausible.
+    if let Some(action) = next_action_for_attempt(attempt) {
+        writeln!(out, "\nNext:")?;
+        for line in action.lines() {
+            writeln!(out, "  {line}")?;
+        }
     }
     Ok(())
 }

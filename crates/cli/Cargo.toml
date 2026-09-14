@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 reccursive-protocol = { path = "../protocol" }
+reccursive-github = { path = "../github" }
 serde.workspace = true
 serde_json.workspace = true
 tempfile = "3.0"

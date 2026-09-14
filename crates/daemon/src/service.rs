@@ -23,13 +23,14 @@ use reccursive_protocol::{
     DueUnitView, EnrollRepositoryRequest, EventSeverityView, EventView, FeatureId,
     FeatureStatusView, IdempotencyKey, InitializeRepositoryRequest, IntegrationHealthView,
     MissedWindowView, PackageChangesView, PackageView, PlanView, ProtocolValidationError,
-    QueueAuditView, QueueExportView, QueueRecoveryIssueView, QueueSummaryView, QueuedUnitState,
-    QueuedUnitView, ReasonCode, ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView,
-    RepositoryId, RepositoryPolicy, RepositoryQueueView, RepositoryView, RequestEnvelope,
-    RequestId, ResponseData, ResponseEnvelope, Revision, ScheduleChangeView, SchedulePolicyView,
-    ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest,
-    StateReason, SubmissionView, TaskCancellationView, TaskProgressView, TaskStatus,
-    TransportError, WorkspacePrerequisiteView, WorkspaceView,
+    PublicationView, PullRequestView, QueueAuditView, QueueExportView, QueueRecoveryIssueView,
+    QueueSummaryView, QueuedUnitState, QueuedUnitView, ReasonCode, ReleaseAttemptView,
+    ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryQueueView,
+    RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision,
+    ScheduleChangeView, SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView,
+    ScheduleUnitRequest, SetSchedulePolicyRequest, StateReason, SubmissionView, TargetRef,
+    TaskCancellationView, TaskProgressView, TaskStatus, TransportError, WorkspacePrerequisiteView,
+    WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -139,6 +140,10 @@ impl LocalService {
         let shutdown = self.shutdown.clone();
         let managed_root = Arc::clone(&self.managed_root);
         let release_root = Arc::clone(&self.release_root);
+        let state_dir = Arc::new(self.owner.paths.state_dir.clone());
+        // Overridable so a scenario can point the adapter at a stand-in endpoint over a Unix
+        // socket. Unset — which is every real installation — means api.github.com over TLS.
+        let github_endpoint = github_endpoint_from_environment();
         let interval = MAINTENANCE_INTERVAL;
         let mut maintenance = crate::maintenance::Maintenance::new(
             shutdown.clone(),
@@ -171,6 +176,25 @@ impl LocalService {
                         &worker,
                         now,
                         RELEASE_CONCURRENCY_LIMIT,
+                    );
+                    // Work published early to a development branch still owes an integration.
+                    // Selecting its time here, after the pass that may have just published it,
+                    // means the integration is planned without anyone typing a command.
+                    let _ = maintenance.schedule_pending_integrations(&mut store, seed, now);
+                    // The pull-request half of integration. Both passes are no-ops for a
+                    // repository that publishes by direct push, which is every repository that
+                    // never opted in, so nothing here runs without a token having been stored.
+                    let _ = maintenance.open_pending_pull_requests(
+                        &mut store,
+                        state_dir.as_path(),
+                        &github_endpoint,
+                        now,
+                    );
+                    let _ = maintenance.observe_pull_requests(
+                        &mut store,
+                        state_dir.as_path(),
+                        &github_endpoint,
+                        now,
                     );
                 }
             }
@@ -295,6 +319,21 @@ impl ServiceOwner {
 impl Drop for ServiceOwner {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.paths.socket);
+    }
+}
+
+/// Where the GitHub adapter should send its requests.
+///
+/// `RECCURSIVE_GITHUB_SOCKET` exists for the scenario suite, which runs the real adapter and the
+/// real `curl` against a stand-in endpoint on a Unix socket — no network, no credential, and no
+/// separate code path that could pass while the real one is broken.
+fn github_endpoint_from_environment() -> reccursive_github::Endpoint {
+    match std::env::var_os("RECCURSIVE_GITHUB_SOCKET") {
+        Some(socket) => reccursive_github::Endpoint {
+            base_url: "http://localhost".to_owned(),
+            unix_socket: Some(PathBuf::from(socket)),
+        },
+        None => reccursive_github::Endpoint::github(),
     }
 }
 
@@ -2043,7 +2082,12 @@ fn summarize_queue(
             .release_units_for_repository(id)
             .map_err(store_api_error)?
         {
-            units.push(queued_unit_view(&store, &unit, now)?);
+            units.push(queued_unit_view(
+                &store,
+                &unit,
+                &repository.active_policy.target,
+                now,
+            )?);
         }
         summaries.push(RepositoryQueueView {
             repository_id: id,
@@ -2063,14 +2107,35 @@ fn summarize_queue(
     })
 }
 
+/// Presents stored publications with the one fact a reader needs: is this the target branch.
+///
+/// A repository that is no longer enrolled leaves no target to compare against. Reporting those
+/// publications as not-on-the-target is the safe reading: it never claims work has landed.
+fn publication_views(
+    publications: &[reccursive_store::TaskPublication],
+    repository_target: &Option<TargetRef>,
+) -> Vec<PublicationView> {
+    publications
+        .iter()
+        .map(|publication| PublicationView {
+            target: publication.target.clone(),
+            commit: publication.commit.clone(),
+            published_at_unix_ms: publication.published_at_unix_ms,
+            is_target: repository_target.as_ref() == Some(&publication.target),
+        })
+        .collect()
+}
+
 /// Places one unit in the queue, from the state its own parts are in.
 fn queued_unit_view(
     store: &Store,
     unit: &reccursive_store::ReleaseUnitRecord,
+    repository_target: &TargetRef,
     now_unix_ms: i64,
 ) -> Result<QueuedUnitView, ApiError> {
     let mut task_names = Vec::new();
     let mut statuses = Vec::new();
+    let mut publications = Vec::new();
     let mut reason = None;
     for task_id in &unit.task_ids {
         let Some(task) = store
@@ -2081,6 +2146,11 @@ fn queued_unit_view(
         };
         task_names.push(task.name);
         statuses.push(task.state.status());
+        for publication in store.task_publications(*task_id).map_err(store_api_error)? {
+            if !publications.contains(&publication) {
+                publications.push(publication);
+            }
+        }
         if reason.is_none()
             && let Some(state_reason) = task.state.reason()
         {
@@ -2088,6 +2158,16 @@ fn queued_unit_view(
         }
     }
 
+    let published_to = publication_views(&publications, &Some(repository_target.clone()));
+    let pull_request = store
+        .pull_request(unit.unit_id)
+        .map_err(store_api_error)?
+        .map(|record| PullRequestView {
+            number: record.number,
+            url: record.url,
+            state: record.state,
+            merged_at_unix_ms: record.merged_at_unix_ms,
+        });
     let slot = store.schedule_slot(unit.unit_id).map_err(store_api_error)?;
     let publishing = match &slot {
         Some(slot) => store
@@ -2110,10 +2190,23 @@ fn queued_unit_view(
         QueuedUnitState::Published
     } else if publishing {
         QueuedUnitState::Publishing
+    } else if pull_request
+        .as_ref()
+        .is_some_and(|request| request.merged_at_unix_ms.is_none() && request.state == "open")
+    {
+        // Waiting on a person, not on a time. Reporting this as `Ready` would invite somebody to
+        // schedule it again, which would do nothing: the work is already with its reviewer.
+        QueuedUnitState::AwaitingMerge
     } else {
         match &slot {
             Some(slot) if slot.selected_at_unix_ms <= now_unix_ms => QueuedUnitState::Due,
             Some(_) => QueuedUnitState::Scheduled,
+            // Nothing is scheduled — but work already on a development branch is not the same
+            // situation as work that has never been published, and a queue that showed both as
+            // `Ready` would be hiding a real publication from the person reading it.
+            None if published_to.iter().any(|entry| !entry.is_target) => {
+                QueuedUnitState::AvailableEarly
+            }
             None => QueuedUnitState::Ready,
         }
     };
@@ -2128,6 +2221,8 @@ fn queued_unit_view(
         .and_then(|change| change.invalidated_reason);
 
     Ok(QueuedUnitView {
+        published_to,
+        pull_request,
         release_unit_id: unit.unit_id,
         feature_id: unit.feature_id,
         plan_revision: unit.plan_revision,
@@ -2187,6 +2282,12 @@ fn get_feature_status(
             )
         })?;
     let plan_revision = plan.plan.revision;
+    // The repository's target is what separates "landed" from "available early", so it is read
+    // once here rather than re-derived per task.
+    let repository_target = store
+        .repository(plan.plan.repository_id)
+        .map_err(store_api_error)?
+        .map(|repository| repository.active_policy.target.clone());
 
     let mut tasks = Vec::new();
     for record in store
@@ -2216,6 +2317,12 @@ fn get_feature_status(
             package_id: package.map(|package| package.package_id),
             release_unit_id: unit.map(|unit| unit.unit_id),
             selected_at_unix_ms,
+            published_to: publication_views(
+                &store
+                    .task_publications(record.task_id)
+                    .map_err(store_api_error)?,
+                &repository_target,
+            ),
         });
     }
 
@@ -3145,7 +3252,24 @@ fn enroll_repository_inner(
         request.target,
         request.development_target,
     )
+    .and_then(|policy| policy.with_target_integration(request.target_integration))
     .map_err(|error| ApiError::new(ApiErrorCode::InvalidRequest, error.to_string(), false))?;
+    // A pull request can only be opened against a repository GitHub actually hosts. Refusing here
+    // means the mistake is caught at enrolment, rather than at the first scheduled integration
+    // with nobody watching.
+    if request.target_integration == reccursive_core::TargetIntegration::PullRequest
+        && reccursive_github::RepositorySlug::from_remote(&registration.canonical_remote).is_none()
+    {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            format!(
+                "the pull-request strategy needs a GitHub remote; {} is not one. \
+                 Publish by direct push instead, or enrol with a GitHub remote.",
+                registration.canonical_remote
+            ),
+            false,
+        ));
+    }
     let mut store = lock_store(store)?;
     let initial_schedule_policy = initial_schedule_policy.map(|policy| StoredSchedulePolicy {
         repository_id,
@@ -3190,6 +3314,7 @@ fn enroll_repository_inner(
 
 fn repository_view(stored: StoredRepository) -> RepositoryView {
     RepositoryView {
+        target_integration: stored.active_policy.target_integration,
         id: stored.registration.id,
         checkout_path: stored.registration.checkout_path,
         canonical_remote: stored.registration.canonical_remote,
@@ -3437,6 +3562,7 @@ mod tests {
             .send(
                 &paths.socket,
                 Command::EnrollRepository(EnrollRepositoryRequest {
+                    target_integration: reccursive_core::TargetIntegration::DirectPush,
                     checkout_path: checkout.to_string_lossy().into_owned(),
                     canonical_remote: "ssh://git@example.invalid/project.git".into(),
                     publication_mode: PublicationMode::ScheduledCreation,

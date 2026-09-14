@@ -9,8 +9,8 @@
 use std::str::FromStr;
 
 use reccursive_core::{
-    AttemptId, PackageId, ReasonCode, RepositoryId, Revision, StateReason, TargetRef, TaskState,
-    TaskStatus,
+    AttemptId, PackageId, ReasonCode, RepositoryId, Revision, StateReason, TargetRef, TaskId,
+    TaskState, TaskStatus,
 };
 use rusqlite::{OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,14 @@ pub struct NewReleaseAttempt {
     pub base_commit: String,
     pub lease: AttemptLease,
     pub created_at_unix_ms: i64,
+}
+
+/// One branch a task's work reached, and the commit that carries it there.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskPublication {
+    pub target: TargetRef,
+    pub commit: String,
+    pub published_at_unix_ms: i64,
 }
 
 /// One durable publication attempt and its observed remote outcome.
@@ -641,6 +649,77 @@ impl Store {
     /// The release worker advances the *attempt* through its stages and leaves the unit's tasks at
     /// `scheduled` for the whole flight, so task state cannot answer "is this already being
     /// published?". This can.
+    /// Reports whether a package has already been published to a given branch.
+    ///
+    /// This is how a publication decides whether it is the early one or the integration: a
+    /// package that already reached the development branch is not published there twice.
+    pub fn package_published_to(
+        &self,
+        package_id: PackageId,
+        package_revision: Revision,
+        target: &TargetRef,
+    ) -> Result<bool, StoreError> {
+        let found: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM release_attempts
+                 WHERE package_id = ?1 AND package_revision = ?2
+                   AND status = 'published' AND target_ref = ?3
+                 LIMIT 1",
+                params![
+                    package_id.to_string(),
+                    package_revision.get(),
+                    target.as_str()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Every branch a task's work has actually been published to, newest first.
+    ///
+    /// Read from the attempts, which record the branch and the commit they pushed. This is what
+    /// separates work that has landed on the target from work that is only available early on a
+    /// development branch — a distinction the task's own status cannot carry, because a unit
+    /// published to a development branch returns to the queue awaiting its integration and so
+    /// looks exactly like a unit that never published at all.
+    pub fn task_publications(&self, task_id: TaskId) -> Result<Vec<TaskPublication>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT attempt.target_ref, attempt.candidate_sha, attempt.updated_at_unix_ms
+             FROM snapshot_package_tasks AS carried
+             JOIN release_attempts AS attempt
+               ON attempt.package_id = carried.package_id
+              AND attempt.package_revision = carried.package_revision
+             WHERE carried.task_id = ?1
+               AND attempt.status = 'published'
+               AND attempt.candidate_sha IS NOT NULL
+             ORDER BY attempt.updated_at_unix_ms DESC, attempt.target_ref",
+        )?;
+        let rows = statement
+            .query_map([task_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(target, commit, published_at_unix_ms)| {
+                Ok(TaskPublication {
+                    target: TargetRef::new(target).map_err(|error| {
+                        StoreError::InvalidData(format!(
+                            "stored attempt target is invalid: {error}"
+                        ))
+                    })?,
+                    commit,
+                    published_at_unix_ms,
+                })
+            })
+            .collect()
+    }
+
     pub fn live_attempt_for_package(
         &self,
         package_id: PackageId,

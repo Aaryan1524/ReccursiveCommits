@@ -207,6 +207,84 @@ impl Maintenance {
         Ok(report)
     }
 
+    /// Selects a release time for work that is on a development branch but not on the target.
+    ///
+    /// Immediate mode promises two publications: an early one, and an integration later. The
+    /// first withdraws its own spent selection, so without this the integration would wait for
+    /// someone to schedule it by hand and "publish early, integrate on schedule" would be half a
+    /// feature.
+    ///
+    /// Run as its own pass rather than at the moment of publication, so a daemon that stops
+    /// between the two picks the integration up on the next tick instead of stranding it.
+    /// `Scheduler::schedule` returns an existing slot unchanged, so repeating this is free.
+    ///
+    /// A paused repository still has integrations scheduled. Pausing governs what is *started* —
+    /// `due_units` skips paused repositories — and selecting a time starts nothing. Refusing to
+    /// select would instead mean a pause silently erased the plan for work already published.
+    pub fn schedule_pending_integrations(
+        &self,
+        store: &mut Store,
+        seed: u64,
+        now_unix_ms: i64,
+    ) -> Result<usize, StoreError> {
+        let mut scheduled = 0;
+        for repository in store.repositories()? {
+            let Some(development_target) = repository.active_policy.development_target.clone()
+            else {
+                continue;
+            };
+            let target = repository.active_policy.target.clone();
+            for unit in store.release_units_for_repository(repository.registration.id)? {
+                if self.shutdown.is_requested() {
+                    return Ok(scheduled);
+                }
+                if store.schedule_slot(unit.unit_id)?.is_some() {
+                    continue;
+                }
+                // A unit's tasks are carried by one package, so any of them names it.
+                let Some(task_id) = unit.task_ids.iter().next().copied() else {
+                    continue;
+                };
+                let Some(package) = store.snapshot_package_for_task(
+                    unit.feature_id,
+                    unit.plan_revision,
+                    task_id,
+                )?
+                else {
+                    continue;
+                };
+                // On the development branch and not yet on the target is exactly the work this
+                // pass exists for. Both are read from the attempts, which recorded them.
+                if !store.package_published_to(
+                    package.package_id,
+                    package.revision,
+                    &development_target,
+                )? || store.package_published_to(
+                    package.package_id,
+                    package.revision,
+                    &target,
+                )? {
+                    continue;
+                }
+                // A unit whose tasks are not back in the queue is not waiting for a time; it is
+                // blocked, cancelled, or already owned by an attempt. Refusals here are ordinary.
+                if crate::scheduler::Scheduler::schedule(
+                    store,
+                    unit.unit_id,
+                    package.package_id,
+                    package.revision,
+                    seed,
+                    now_unix_ms,
+                )
+                .is_ok()
+                {
+                    scheduled += 1;
+                }
+            }
+        }
+        Ok(scheduled)
+    }
+
     /// Publishes every unit whose selected time has arrived.
     ///
     /// This is what makes a schedule mean anything without someone at the keyboard: the pass that

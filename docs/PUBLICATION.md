@@ -58,6 +58,13 @@ Immediate mode needs `--development-target`, and it must be a different branch
 from your target. The branch does not have to exist: the first publication
 creates it from your target branch, and every later one stacks on top of it.
 
+Integration happens on its own. Once work is on the development branch, the
+service selects a second release time from the same policy and, when it arrives,
+publishes the same work to your target branch. You do not schedule the second
+half by hand. Until that lands, `queue status` and `feature status` say where
+the work actually is — `available early on refs/heads/development` rather than
+anything that could be read as finished.
+
 This also makes dependencies between tasks more precise. A plan can say a task
 waits for another to be `development_available` — on the development branch —
 rather than `target_published`. The first is satisfied as soon as the

@@ -172,6 +172,10 @@ impl LocalService {
                         now,
                         RELEASE_CONCURRENCY_LIMIT,
                     );
+                    // Work published early to a development branch still owes an integration.
+                    // Selecting its time here, after the pass that may have just published it,
+                    // means the integration is planned without anyone typing a command.
+                    let _ = maintenance.schedule_pending_integrations(&mut store, seed, now);
                 }
             }
         })

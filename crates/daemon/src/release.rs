@@ -159,6 +159,23 @@ impl ReleaseWorker {
             }
             PublicationMode::ScheduledCreation => None,
         };
+        // Immediate mode publishes a package twice: early to the development branch, and later
+        // to the target. Which one this is follows from what the remote already has — a package
+        // that reached the development branch is not sent there again, it is integrated. Read
+        // from the attempts rather than tracked separately, so a restart between the two reaches
+        // the same conclusion.
+        let development_target = match development_target {
+            Some(branch)
+                if store.package_published_to(
+                    snapshot.package_id,
+                    snapshot.revision,
+                    &branch,
+                )? =>
+            {
+                None
+            }
+            other => other,
+        };
         let publication = match development_target {
             // A development branch does not exist until the first work reaches it, and it starts
             // from the target branch: the work is meant to be an early view of what will later be

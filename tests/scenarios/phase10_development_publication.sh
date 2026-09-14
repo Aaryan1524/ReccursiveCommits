@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Proves immediate-availability mode is real: work reaches a development branch at its release
-# time, the target branch is left alone, and dependencies waiting on either milestone are held or
-# released accordingly.
+# Proves immediate-availability mode is real end to end: work reaches a development branch at its
+# release time with the target left alone, the integration into the target is planned without
+# anyone asking and then lands, and dependencies waiting on either milestone are held or released
+# accordingly.
 #
 # This exists because every part of immediate mode except the acting on it was already shipped —
 # the flag was accepted, validated, stored and displayed while the release worker never read it,
@@ -185,28 +186,49 @@ subject="$(git -C "$fixture_root/verification" log -1 --format=%s)"
 [[ "$subject" == "Add the shared foundation" ]] || \
   fail "the development commit was not derived from the plan task: $subject"
 
-# --- The spent selection is gone, so no later pass republishes the same work. ---
-if cli schedule show "$foundation_unit" >/dev/null 2>&1; then
-  fail "a unit published to the development branch still holds a live release time"
-fi
-due_after="$(cli schedule due --concurrency-limit 10)"
-grep -q "$foundation_unit" <<<"$due_after" && \
-  fail "a unit published to the development branch is still reported as due"
+# --- The selection that published is spent, and recorded as spent. ---
+history="$(cli schedule history "$foundation_unit")"
+grep -q "published to the development branch" <<<"$history" || \
+  fail "the selection that published was not withdrawn with its reason: $history"
+
+# --- The integration is planned on its own: nobody schedules the second half by hand. ---
+integration_slot=''
+for _ in {1..60}; do
+  if integration_slot="$(cli schedule show "$foundation_unit" 2>/dev/null)"; then
+    break
+  fi
+  integration_slot=''
+  sleep 2
+done
+[[ -n "$integration_slot" ]] || \
+  fail "no release time was selected for integrating the development work into the target"
+grep -q '"type":"schedule_slot"' <<<"$integration_slot" || \
+  fail "the integration selection did not return a slot: $integration_slot"
+
+# Withdraw it for now. Its time is drawn at random from the policy window, so leaving it live
+# would let the target move at an unpredictable moment and make every later assertion here a
+# coin toss. It is scheduled again deliberately at the end.
+cli schedule withdraw "$foundation_unit" --reason "scenario integrates deliberately" >/dev/null
+
+# With the work on a development branch and no integration selected, the queue says so in its own
+# right rather than reporting the unit as though nothing had ever been published.
+withdrawn_queue="$(cli queue status)"
+grep -q '"state":"available_early"' <<<"$withdrawn_queue" || \
+  fail "a unit on a development branch with no integration scheduled is not reported as available early: $withdrawn_queue"
+withdrawn_text="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" queue status)"
+grep -q "available early" <<<"$withdrawn_text" || \
+  fail "the human-readable queue does not report early availability: $withdrawn_text"
 
 # And prove it rather than only inferring it: sit through a further maintenance pass.
 sleep 70
 [[ "$(remote_ref refs/heads/development)" == "$development_head" ]] || \
   fail "the development branch moved again after the unit was already published"
-[[ "$(remote_ref refs/heads/main)" == "$main_before" ]] || \
-  fail "a later maintenance pass moved the target branch"
 
 # --- The product has to *say* the work is available, not merely have published it. ---
 #
 # Withdrawing the spent slot returns the unit's tasks to the queue, so without this the unit would
 # render exactly like one that had never published at all.
 queue_json="$(cli queue status)"
-grep -q '"state":"available_early"' <<<"$queue_json" || \
-  fail "the queue does not distinguish work available on a development branch: $queue_json"
 grep -q "\"target\":\"refs/heads/development\"" <<<"$queue_json" || \
   fail "the queue does not report which branch the work reached: $queue_json"
 grep -q "\"commit\":\"$development_head\"" <<<"$queue_json" || \
@@ -215,8 +237,6 @@ grep -q '"is_target":false' <<<"$queue_json" || \
   fail "the queue does not distinguish a development branch from the target: $queue_json"
 
 queue_text="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" queue status)"
-grep -q "available early" <<<"$queue_text" || \
-  fail "the human-readable queue does not report early availability: $queue_text"
 grep -q "is available early on refs/heads/development" <<<"$queue_text" || \
   fail "the human-readable queue does not name the development branch: $queue_text"
 
@@ -259,7 +279,38 @@ done
 parent="$(git -C "$fixture_root/remote.git" rev-parse "$follow_up_head^")"
 [[ "$parent" == "$development_head" ]] || \
   fail "the second unit did not build on the development branch: parent $parent, expected $development_head"
-[[ "$(remote_ref refs/heads/main)" == "$main_before" ]] || \
-  fail "the second immediate-mode publication moved the target branch"
 
-printf 'PASS immediate mode publishes to the development branch, leaves the target alone, and settles both dependency milestones correctly\n'
+# --- Integration: the same work reaches the target, and only then is the task published. ---
+integration_package="$foundation_package"
+cli schedule unit "$foundation_unit" --package-id "$integration_package" --revision 1 >/dev/null
+cli schedule release-now "$foundation_unit" >/dev/null
+
+integrated=''
+for _ in {1..90}; do
+  if [[ "$(remote_ref refs/heads/main)" != "$main_before" ]]; then
+    integrated=yes
+    break
+  fi
+  sleep 2
+done
+[[ -n "$integrated" ]] || \
+  fail "the development work was never integrated into the target within 180 seconds"
+
+main_after="$(remote_ref refs/heads/main)"
+git -C "$fixture_root/remote.git" merge-base --is-ancestor "$main_before" "$main_after" || \
+  fail "the integration did not build on the target's existing history"
+git clone --quiet --branch main "$fixture_root/remote.git" "$fixture_root/integrated"
+[[ -f "$fixture_root/integrated/foundation.txt" ]] || \
+  fail "the target does not contain the integrated change"
+
+# The task is published only now — reaching a development branch was never enough.
+status_after="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" feature status "$feature_id" --revision 1)"
+grep -q "on target: refs/heads/main" <<<"$status_after" || \
+  fail "feature status does not report the work as being on the target: $status_after"
+
+# And the dependent that was waiting for the target is finally released.
+released="$(cli schedule unit "$dependent_target_unit" --package-id "$dependent_target_package" --revision 1)"
+grep -q '"type":"schedule_slot"' <<<"$released" || \
+  fail "a dependent waiting for the target was not released by the integration: $released"
+
+printf 'PASS immediate mode publishes early to a development branch, plans and performs its own integration into the target, and settles both dependency milestones correctly\n'

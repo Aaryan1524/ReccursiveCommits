@@ -649,6 +649,34 @@ impl Store {
     /// The release worker advances the *attempt* through its stages and leaves the unit's tasks at
     /// `scheduled` for the whole flight, so task state cannot answer "is this already being
     /// published?". This can.
+    /// Reports whether a package has already been published to a given branch.
+    ///
+    /// This is how a publication decides whether it is the early one or the integration: a
+    /// package that already reached the development branch is not published there twice.
+    pub fn package_published_to(
+        &self,
+        package_id: PackageId,
+        package_revision: Revision,
+        target: &TargetRef,
+    ) -> Result<bool, StoreError> {
+        let found: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM release_attempts
+                 WHERE package_id = ?1 AND package_revision = ?2
+                   AND status = 'published' AND target_ref = ?3
+                 LIMIT 1",
+                params![
+                    package_id.to_string(),
+                    package_revision.get(),
+                    target.as_str()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// Every branch a task's work has actually been published to, newest first.
     ///
     /// Read from the attempts, which record the branch and the commit they pushed. This is what

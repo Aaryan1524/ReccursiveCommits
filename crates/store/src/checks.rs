@@ -177,6 +177,51 @@ impl Store {
         Ok(())
     }
 
+    /// Returns the checks that ran against one package in its own workspace, at capture time.
+    ///
+    /// Recorded since Phase 2 and, until now, readable by nothing. Whether a change passed its
+    /// checks is the first question anyone asks about queued work, and the answer was already
+    /// durable — it simply had no way out of the database.
+    pub fn validation_evidence(
+        &self,
+        package_id: PackageId,
+        revision: Revision,
+    ) -> Result<Vec<ValidationEvidence>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT check_id, command_json, exit_code, timed_out, output_summary,
+                    executed_at_unix_ms
+             FROM validation_evidence
+             WHERE package_id = ?1 AND package_revision = ?2
+             ORDER BY check_id",
+        )?;
+        statement
+            .query_map(
+                rusqlite::params![package_id.to_string(), revision.get()],
+                |row| {
+                    Ok(ValidationEvidence {
+                        package_id,
+                        revision,
+                        check_id: row.get(0)?,
+                        command: serde_json::from_str(&row.get::<_, String>(1)?).map_err(
+                            |error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    1,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            },
+                        )?,
+                        exit_code: row.get(2)?,
+                        timed_out: row.get(3)?,
+                        output_summary: row.get(4)?,
+                        executed_at_unix_ms: row.get(5)?,
+                    })
+                },
+            )?
+            .map(|row| row.map_err(StoreError::from))
+            .collect()
+    }
+
     pub fn candidate_validation_evidence(
         &self,
         attempt_id: AttemptId,

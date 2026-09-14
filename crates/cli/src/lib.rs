@@ -9,15 +9,16 @@ use std::{
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use install::{InstallError, ServiceInstallation};
 use reccursive_protocol::{
-    ApiError, ApiErrorCode, CancelTaskRequest, CapturePackageRequest, Command,
+    ApiError, ApiErrorCode, CancelTaskRequest, CapturePackageRequest, CheckResultsView, Command,
     CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
     EventSeverityView, EventView, FeatureId, FeaturePlan, IdempotencyKey, IntegrationHealthView,
-    LocalClient, PackageId, PackageView, PlanView, PublicationMode, QueueAuditView,
-    QueueExportView, QueueSummaryView, QueuedUnitState, ReleaseAttemptView, ReleasePackageRequest,
-    ReleaseUnitId, ReleaseUnitView, RepositoryId, RepositoryView, ResponseData, Revision,
-    ScheduleChangeView, SchedulePolicy, SchedulePolicyOverride, SchedulePolicyView,
-    ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest, SubmissionView,
-    SubmitTaskRequest, TargetMilestone, TargetRef, TaskId, TaskProgressView, WorkspaceView,
+    LocalClient, PackageChangesView, PackageId, PackageView, PlanView, PublicationMode,
+    QueueAuditView, QueueExportView, QueueSummaryView, QueuedUnitState, ReleaseAttemptView,
+    ReleasePackageRequest, ReleaseUnitId, ReleaseUnitView, RepositoryId, RepositoryView,
+    ResponseData, Revision, ScheduleChangeView, SchedulePolicy, SchedulePolicyOverride,
+    SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest,
+    SubmissionView, SubmitTaskRequest, TargetMilestone, TargetRef, TaskId, TaskProgressView,
+    WorkspaceView,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -171,6 +172,21 @@ enum PackageCommand {
     },
     /// Verify and show an immutable snapshot package.
     Show {
+        package_id: PackageId,
+        #[arg(long, value_parser = parse_revision, default_value = "1")]
+        revision: Revision,
+    },
+    /// Show what a captured package changes, relative to the base it was captured against.
+    Changes {
+        package_id: PackageId,
+        #[arg(long, value_parser = parse_revision, default_value = "1")]
+        revision: Revision,
+        /// Include the patch text, not only which files changed.
+        #[arg(long)]
+        patch: bool,
+    },
+    /// Show the checks that ran for a package, at capture and against each release candidate.
+    Checks {
         package_id: PackageId,
         #[arg(long, value_parser = parse_revision, default_value = "1")]
         revision: Revision,
@@ -744,6 +760,34 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                         plan_revision: revision,
                         task_ids: task_ids.into_iter().collect(),
                     }),
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            PackageCommand::Changes {
+                package_id,
+                revision,
+                patch,
+            } => {
+                let data = send(
+                    &session,
+                    Command::InspectPackageChanges {
+                        package_id,
+                        revision,
+                        include_patch: patch,
+                    },
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            PackageCommand::Checks {
+                package_id,
+                revision,
+            } => {
+                let data = send(
+                    &session,
+                    Command::ListCheckResults {
+                        package_id,
+                        revision,
+                    },
                 )?;
                 output_data(data, cli.json, stdout)
             }
@@ -1616,6 +1660,89 @@ fn branch_ref(value: &str) -> Result<TargetRef, CliFailure> {
         .map_err(|error| CliFailure::new(EXIT_ACTION_REQUIRED, "invalid_branch", error.to_string()))
 }
 
+fn output_package_changes(
+    out: &mut impl Write,
+    changes: &PackageChangesView,
+) -> Result<(), CliFailure> {
+    writeln!(
+        out,
+        "{} revision {}\nBase: {}\n{} file(s) changed",
+        changes.package_id,
+        changes.revision.get(),
+        changes.base_commit,
+        changes.files.len()
+    )
+    .map_err(output_error)?;
+    if changes.files.is_empty() {
+        // A package that changes nothing should never have been captured, so say so plainly
+        // rather than printing an empty list that reads like a rendering failure.
+        writeln!(out, "This package changes nothing.").map_err(output_error)?;
+    }
+    for file in &changes.files {
+        writeln!(out, "  {:<2} {}", file.change, file.path).map_err(output_error)?;
+    }
+    if let Some(patch) = &changes.patch {
+        writeln!(out, "\n{patch}").map_err(output_error)?;
+        if changes.patch_truncated {
+            writeln!(
+                out,
+                "\n[patch cut short at the size limit; the file list above is complete]"
+            )
+            .map_err(output_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn output_check_results(
+    out: &mut impl Write,
+    results: &CheckResultsView,
+) -> Result<(), CliFailure> {
+    if results.at_capture.is_empty() && results.at_release.is_empty() {
+        return writeln!(out, "No checks have run for this package yet.").map_err(output_error);
+    }
+    for (heading, group) in [
+        (
+            "At capture, in the package's own workspace:",
+            &results.at_capture,
+        ),
+        (
+            "At release, against a reconciled candidate:",
+            &results.at_release,
+        ),
+    ] {
+        if group.is_empty() {
+            continue;
+        }
+        writeln!(out, "{heading}").map_err(output_error)?;
+        for result in group {
+            // Passed means exit zero and no timeout. A check that never returned has no exit code
+            // at all, which is a different answer from failing and is reported as one.
+            let verdict = if result.timed_out {
+                "timed out".to_owned()
+            } else {
+                match result.exit_code {
+                    Some(0) => "passed".to_owned(),
+                    Some(code) => format!("failed ({code})"),
+                    None => "did not return".to_owned(),
+                }
+            };
+            writeln!(out, "  {} · {verdict}", result.check_id).map_err(output_error)?;
+            writeln!(out, "    {}", result.command.join(" ")).map_err(output_error)?;
+            if let Some(attempt_id) = result.attempt_id {
+                writeln!(out, "    attempt {attempt_id}").map_err(output_error)?;
+            }
+            if let Some(reason) = &result.invalidated_reason {
+                writeln!(out, "    no longer stands: {reason}").map_err(output_error)?;
+            }
+            if !result.output_summary.trim().is_empty() {
+                writeln!(out, "    {}", result.output_summary.trim()).map_err(output_error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn queued_state_label(state: QueuedUnitState) -> &'static str {
     match state {
         QueuedUnitState::Ready => "ready",
@@ -1834,6 +1961,12 @@ fn output_data(
                 plan.plan.feature_id,
                 plan.plan.revision.get()
             )
+        }
+        ResponseData::PackageChanges { changes } => {
+            return output_package_changes(out, &changes);
+        }
+        ResponseData::CheckResults { results } => {
+            return output_check_results(out, &results);
         }
         ResponseData::QueueSummary { summary } => {
             return output_queue_summary(out, &summary);

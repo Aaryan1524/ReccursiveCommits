@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 15 adds the queue summary and schedule history.
-pub const API_VERSION: u16 = 15;
+/// Local API protocol version. Version 16 adds package change inspection and check results.
+pub const API_VERSION: u16 = 16;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -168,6 +168,8 @@ impl RequestEnvelope {
             | Command::ScheduleHistory { .. }
             | Command::GetWorkspace { .. }
             | Command::GetPackage { .. }
+            | Command::InspectPackageChanges { .. }
+            | Command::ListCheckResults { .. }
             | Command::GetReleaseUnit { .. }
             | Command::SetSchedulePolicy(_)
             | Command::GetSchedulePolicy { .. }
@@ -321,6 +323,18 @@ pub enum Command {
         package_id: PackageId,
         revision: Revision,
     },
+    /// Report what a captured package changes, relative to the base it was captured against.
+    InspectPackageChanges {
+        package_id: PackageId,
+        revision: Revision,
+        /// Include the patch text, not only which files changed.
+        include_patch: bool,
+    },
+    /// Report the checks that ran for one package: at capture, and against each release candidate.
+    ListCheckResults {
+        package_id: PackageId,
+        revision: Revision,
+    },
     /// Inspect package storage and any crash-recovery evidence.
     AuditQueue,
     /// Write a portable, verified backup of queue state and immutable packages.
@@ -379,6 +393,8 @@ impl Command {
             | Self::GetReleaseAttempt { .. }
             | Self::ListReleaseAttempts { .. }
             | Self::GetPackage { .. }
+            | Self::InspectPackageChanges { .. }
+            | Self::ListCheckResults { .. }
             | Self::AuditQueue
             | Self::Status => false,
         }
@@ -432,6 +448,8 @@ impl Command {
             | Self::GetReleaseAttempt { .. }
             | Self::ListReleaseAttempts { .. }
             | Self::GetPackage { .. }
+            | Self::InspectPackageChanges { .. }
+            | Self::ListCheckResults { .. }
             | Self::AuditQueue
             | Self::ExportQueue { .. }
             | Self::Status => false,
@@ -753,6 +771,62 @@ pub struct PackageView {
     pub created_at_unix_ms: i64,
 }
 
+/// One file a captured package changes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangedFileView {
+    /// Git's own status letter: A added, M modified, D deleted, R renamed.
+    pub change: String,
+    pub path: String,
+}
+
+/// What a captured package changes, relative to the base it was captured against.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackageChangesView {
+    pub package_id: PackageId,
+    pub revision: Revision,
+    pub base_commit: String,
+    pub base_tree: String,
+    pub result_tree: String,
+    pub files: Vec<ChangedFileView>,
+    /// The patch itself, only when asked for. Absent by default because a release unit's diff can
+    /// be large, and the question "what does this change" is usually answered by the file list.
+    pub patch: Option<String>,
+    /// True when the patch was cut short at the size limit. Reported rather than silently trimmed,
+    /// so nobody reviews a partial diff believing it is whole.
+    pub patch_truncated: bool,
+}
+
+/// One check that ran, and what it found.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckResultView {
+    pub check_id: String,
+    pub command: Vec<String>,
+    /// `None` for a check that never returned, which `timed_out` then explains.
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    /// Output as stored: already scrubbed for credential-shaped text on the way in.
+    pub output_summary: String,
+    pub executed_at_unix_ms: i64,
+    /// Set for a check that ran against a reconciled release candidate rather than at capture.
+    pub attempt_id: Option<AttemptId>,
+    /// The commit the candidate was built on, for a candidate check.
+    pub base_commit: Option<String>,
+    /// Why this result stopped standing — a changed base invalidates evidence rather than
+    /// overwriting it, so a superseded result stays visible with its reason.
+    pub invalidated_reason: Option<String>,
+}
+
+/// Every check recorded for one package.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckResultsView {
+    pub package_id: PackageId,
+    pub revision: Revision,
+    /// Checks run in the package's own workspace when it was captured.
+    pub at_capture: Vec<CheckResultView>,
+    /// Checks run against each reconciled release candidate, newest attempt first.
+    pub at_release: Vec<CheckResultView>,
+}
+
 /// Where one release unit stands right now.
 ///
 /// Derived when asked rather than stored, because every part of it already has an owner: the tasks
@@ -1068,6 +1142,12 @@ pub enum ResponseData {
     },
     QueueSummary {
         summary: QueueSummaryView,
+    },
+    PackageChanges {
+        changes: PackageChangesView,
+    },
+    CheckResults {
+        results: CheckResultsView,
     },
     ScheduleHistory {
         changes: Vec<ScheduleChangeView>,

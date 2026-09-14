@@ -315,6 +315,18 @@ Every classification the release worker can record has an action, and that is
 enforced rather than maintained: `ReleaseFailure` is an enum and the mapping
 matches on it exhaustively, so a new failure without guidance does not compile.
 
+`diagnose REPOSITORY` answers one question — can this repository publish right
+now — and names whichever part cannot. **Checkout** is reported first and
+deliberately: credentials and signing are probed against the managed mirror,
+which outlives your working copy, so a checkout that has been moved, deleted, or
+left without `user.name` and `user.email` would otherwise look perfectly healthy
+while nothing could ever publish from it. A commit needs an author, and this
+product will not invent one.
+
+When the daemon skips a repository for that reason it records
+`checkout_unattributable` in `logs`, naming the path and what to run. A queue
+that is stuck should never merely look idle.
+
 `repository set-policy REPOSITORY` changes where or how an enrolled repository
 publishes. Only what you name changes; omitting a flag leaves that setting alone,
 and removing the development branch has to be said out loud with

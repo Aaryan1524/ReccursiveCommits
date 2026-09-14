@@ -2682,6 +2682,8 @@ fn output_data(
         }
         ResponseData::RepositoryDiagnostics {
             repository_id,
+            checkout,
+            checkout_detail,
             credentials,
             credential_detail,
             signing,
@@ -2689,8 +2691,9 @@ fn output_data(
             can_publish,
         } => writeln!(
             out,
-            "Repository {repository_id}\nCredentials: {credentials}{}\nSigning: {signing}{}\n\
-             Can publish now: {}",
+            "Repository {repository_id}\nCheckout: {checkout}{}\nCredentials: {credentials}{}\n\
+             Signing: {signing}{}\nCan publish now: {}",
+            checkout_detail.map_or_else(String::new, |detail| format!(" ({detail})")),
             credential_detail.map_or_else(String::new, |detail| format!(" ({detail})")),
             signing_detail.map_or_else(String::new, |detail| format!(" ({detail})")),
             if can_publish { "yes" } else { "no" }

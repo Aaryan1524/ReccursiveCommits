@@ -2900,9 +2900,31 @@ fn diagnose_repository(
     );
     let signing =
         crate::diagnostics::probe_signing(&PathBuf::from(&repository.registration.checkout_path));
+    let checkout =
+        crate::diagnostics::probe_checkout(&PathBuf::from(&repository.registration.checkout_path));
     let diagnostics = crate::diagnostics::RepositoryDiagnostics {
+        checkout: checkout.clone(),
         credentials: credentials.clone(),
         signing: signing.clone(),
+    };
+    let (checkout_state, checkout_detail) = match &checkout {
+        crate::diagnostics::CheckoutStatus::Ready { author } => ("ready", Some(author.clone())),
+        crate::diagnostics::CheckoutStatus::Missing { path } => (
+            "missing",
+            Some(format!(
+                "{path} no longer exists; nothing can be captured or attributed"
+            )),
+        ),
+        crate::diagnostics::CheckoutStatus::NotARepository { path } => (
+            "not_a_repository",
+            Some(format!("{path} is no longer a Git repository")),
+        ),
+        crate::diagnostics::CheckoutStatus::IdentityMissing { path } => (
+            "identity_missing",
+            Some(format!(
+                "{path} has no user.name and user.email, so no commit can be attributed"
+            )),
+        ),
     };
 
     let (credential_state, credential_detail) = match &credentials {
@@ -2925,6 +2947,8 @@ fn diagnose_repository(
 
     Ok(ResponseData::RepositoryDiagnostics {
         repository_id,
+        checkout: checkout_state.to_owned(),
+        checkout_detail,
         credentials: credential_state.to_owned(),
         credential_detail,
         signing: signing_state.to_owned(),

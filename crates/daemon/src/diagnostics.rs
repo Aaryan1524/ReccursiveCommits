@@ -66,18 +66,83 @@ impl SigningStatus {
     }
 }
 
+/// Whether the enrolled checkout is still there and still usable.
+///
+/// Credentials and signing are probed against the managed mirror and survive the checkout being
+/// moved or deleted, so without this a repository whose working copy is gone reports itself
+/// perfectly healthy while nothing can publish — the release worker needs the checkout to read the
+/// author identity, and skips any repository it cannot read one from.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CheckoutStatus {
+    /// Present, a Git repository, and carrying an identity to attribute commits to.
+    Ready { author: String },
+    /// The enrolled path no longer exists.
+    Missing { path: String },
+    /// The path exists but is not a Git repository any more.
+    NotARepository { path: String },
+    /// Present, but with no `user.name`/`user.email` to attribute a commit to.
+    ///
+    /// Publication refuses rather than inventing an author, so this blocks releases exactly as
+    /// firmly as a missing checkout does.
+    IdentityMissing { path: String },
+}
+
+impl CheckoutStatus {
+    /// Reports whether a commit could be created and attributed from this checkout.
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+}
+
 /// What the daemon can and cannot do with one repository right now.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RepositoryDiagnostics {
+    pub checkout: CheckoutStatus,
     pub credentials: CredentialStatus,
     pub signing: SigningStatus,
 }
 
 impl RepositoryDiagnostics {
-    /// Reports whether publication would succeed as far as credentials and signing are concerned.
+    /// Reports whether publication would succeed as far as this machine is concerned.
     #[must_use]
     pub const fn can_publish(&self) -> bool {
-        self.credentials.is_ready() && !self.signing.blocks_release()
+        self.checkout.is_ready() && self.credentials.is_ready() && !self.signing.blocks_release()
+    }
+}
+
+/// Reports whether the enrolled checkout can still produce an attributed commit.
+pub fn probe_checkout(checkout_path: &Path) -> CheckoutStatus {
+    let path = checkout_path.to_string_lossy().into_owned();
+    if !checkout_path.exists() {
+        return CheckoutStatus::Missing { path };
+    }
+    // Asked of Git rather than by looking for a `.git` entry, so a worktree or a repository with a
+    // separate git dir is not mistaken for a broken one.
+    match git_config(checkout_path, "core.bare") {
+        Some(_) => {}
+        None => {
+            let invocation =
+                GitInvocation::new(checkout_path, ["rev-parse", "--git-dir"], PROBE_TIMEOUT);
+            let usable = invocation.is_ok_and(|invocation| {
+                GitRunner::run(&invocation, &CancellationToken::default()).is_ok()
+            });
+            if !usable {
+                return CheckoutStatus::NotARepository { path };
+            }
+        }
+    }
+    match (
+        git_config(checkout_path, "user.name"),
+        git_config(checkout_path, "user.email"),
+    ) {
+        (Some(name), Some(email)) if !name.is_empty() && !email.is_empty() => {
+            CheckoutStatus::Ready {
+                author: format!("{name} <{email}>"),
+            }
+        }
+        _ => CheckoutStatus::IdentityMissing { path },
     }
 }
 
@@ -344,11 +409,70 @@ mod tests {
         assert_eq!(status, CredentialStatus::Ready);
         assert!(
             RepositoryDiagnostics {
-                credentials: status,
+                checkout: probe_checkout(directory.path()),
+                credentials: status.clone(),
                 signing: SigningStatus::Disabled,
             }
             .can_publish()
         );
+    }
+
+    #[test]
+    fn a_checkout_that_is_gone_blocks_publication_however_healthy_the_remote_looks() {
+        let directory = repository();
+        let remote = directory.path().join("remote.git");
+        fs::create_dir(&remote).unwrap();
+        git(&remote, &["init", "--quiet", "--bare"]);
+        let credentials = probe_credentials(directory.path(), &remote.to_string_lossy());
+        assert_eq!(credentials, CredentialStatus::Ready);
+
+        // Credentials and signing are probed against the managed mirror, which outlives the
+        // working copy. Without the checkout probe this repository reports itself able to publish
+        // while the release worker silently skips it forever, because it cannot read an author.
+        let missing = directory.path().join("gone");
+        let status = probe_checkout(&missing);
+        assert!(
+            matches!(status, CheckoutStatus::Missing { .. }),
+            "{status:?}"
+        );
+        assert!(
+            !RepositoryDiagnostics {
+                checkout: status,
+                credentials,
+                signing: SigningStatus::Disabled,
+            }
+            .can_publish()
+        );
+    }
+
+    #[test]
+    fn a_checkout_with_no_identity_cannot_publish_either() {
+        // Publication refuses to invent an author, so this blocks a release exactly as firmly as
+        // a missing directory does — and saying "ready" here would send someone hunting the wrong
+        // problem.
+        let directory = repository();
+        // Set empty rather than unset: unsetting the local value falls through to the machine's
+        // global config, which on a developer's laptop is a real identity — so the test would
+        // pass locally for the wrong reason and mean nothing.
+        git(directory.path(), &["config", "user.name", ""]);
+        git(directory.path(), &["config", "user.email", ""]);
+        let status = probe_checkout(directory.path());
+        assert!(
+            matches!(status, CheckoutStatus::IdentityMissing { .. }),
+            "{status:?}"
+        );
+        assert!(!status.is_ready());
+    }
+
+    #[test]
+    fn a_healthy_checkout_reports_the_identity_commits_will_carry() {
+        let directory = repository();
+        match probe_checkout(directory.path()) {
+            CheckoutStatus::Ready { author } => {
+                assert!(author.contains('<') && author.contains('@'), "{author}");
+            }
+            other => panic!("expected a ready checkout, got {other:?}"),
+        }
     }
 
     #[test]

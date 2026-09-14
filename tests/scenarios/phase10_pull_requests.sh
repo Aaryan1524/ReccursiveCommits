@@ -156,7 +156,10 @@ grep -q "test-token" <<<"$stored" && fail "storing a token printed the token bac
 
 token_file="$fixture_root/state/credentials/github-$repository_id.token"
 [[ -f "$token_file" ]] || fail "no token file was written"
-mode="$(stat -f '%Lp' "$token_file" 2>/dev/null || stat -c '%a' "$token_file")"
+# GNU stat first, then BSD. The other order silently reports nonsense on Linux, where `stat -f`
+# means *filesystem* status and succeeds — so the fallback never runs and this assertion passes
+# against a value that is not a permission at all. It is a security check; it has to actually run.
+mode="$(stat -c '%a' "$token_file" 2>/dev/null || stat -f '%Lp' "$token_file")"
 [[ "$mode" == "600" ]] || fail "the stored token is readable by others: mode $mode"
 
 status_with="$(plain github status "$repository_id")"

@@ -14,9 +14,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 14 adds atomic repository initialization with its first
-/// schedule policy.
-pub const API_VERSION: u16 = 14;
+/// Local API protocol version. Version 15 adds the queue summary and schedule history.
+pub const API_VERSION: u16 = 15;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -165,6 +164,8 @@ impl RequestEnvelope {
             | Command::PlanHistory { .. }
             | Command::SealPlan { .. }
             | Command::GetFeatureStatus { .. }
+            | Command::SummarizeQueue { .. }
+            | Command::ScheduleHistory { .. }
             | Command::GetWorkspace { .. }
             | Command::GetPackage { .. }
             | Command::GetReleaseUnit { .. }
@@ -226,6 +227,14 @@ pub enum Command {
     CancelTask(CancelTaskRequest),
     /// Capture, group, and schedule one task's completed work in a single step.
     SubmitTask(SubmitTaskRequest),
+    /// Summarize queued release work, across every repository or one of them.
+    SummarizeQueue {
+        repository_id: Option<RepositoryId>,
+    },
+    /// List every release time ever selected for one unit, and why each stopped being valid.
+    ScheduleHistory {
+        release_unit_id: ReleaseUnitId,
+    },
     /// Report every task of one plan revision with the durable work attached to it.
     GetFeatureStatus {
         feature_id: FeatureId,
@@ -358,6 +367,8 @@ impl Command {
             | Self::PlanHistory { .. }
             | Self::GetWorkspace { .. }
             | Self::GetFeatureStatus { .. }
+            | Self::SummarizeQueue { .. }
+            | Self::ScheduleHistory { .. }
             | Self::GetReleaseUnit { .. }
             | Self::GetSchedulePolicy { .. }
             | Self::GetScheduleSlot { .. }
@@ -394,6 +405,8 @@ impl Command {
             | Self::GetPlan { .. }
             | Self::PlanHistory { .. }
             | Self::GetFeatureStatus { .. }
+            | Self::SummarizeQueue { .. }
+            | Self::ScheduleHistory { .. }
             | Self::SubmitTask(_)
             | Self::CreateWorkspace(_)
             | Self::GetWorkspace { .. }
@@ -740,6 +753,76 @@ pub struct PackageView {
     pub created_at_unix_ms: i64,
 }
 
+/// Where one release unit stands right now.
+///
+/// Derived when asked rather than stored, because every part of it already has an owner: the tasks
+/// own their status, the slot owns its selected time, and the attempt owns publication. A second
+/// stored copy would be a second thing to keep true.
+///
+/// Deliberately has no awaiting-merge variant. That state belongs to pull-request lifecycles, which
+/// arrive in Phase 10; inventing it now would mean a value nothing can ever produce.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedUnitState {
+    /// Captured and grouped, with no release time selected yet.
+    Ready,
+    /// A release time is selected and in the future.
+    Scheduled,
+    /// The release time has arrived and the daemon may act on it at any moment.
+    Due,
+    /// A publication attempt owns this unit now.
+    Publishing,
+    /// Something stopped it, and it will not move without a person.
+    Blocked,
+    /// Withdrawn from the target; it will not be published.
+    Cancelled,
+    /// On the target.
+    Published,
+}
+
+/// One release unit as it appears in the queue.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueuedUnitView {
+    pub release_unit_id: ReleaseUnitId,
+    pub feature_id: FeatureId,
+    pub plan_revision: Revision,
+    pub state: QueuedUnitState,
+    /// Plan task names, so a queue reads as work rather than as identifiers.
+    pub task_names: Vec<String>,
+    pub selected_at_unix_ms: Option<i64>,
+    /// Why the unit stopped, when it is blocked.
+    pub reason: Option<String>,
+    /// Why its most recent release time stopped being valid, if one was withdrawn.
+    pub last_schedule_change: Option<String>,
+}
+
+/// Queued work across one repository.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryQueueView {
+    pub repository_id: RepositoryId,
+    pub target: TargetRef,
+    /// Present when the repository is paused, carrying the reason it was.
+    pub paused: Option<String>,
+    pub units: Vec<QueuedUnitView>,
+}
+
+/// The whole queue, as of the moment it was asked for.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueueSummaryView {
+    pub generated_at_unix_ms: i64,
+    pub repositories: Vec<RepositoryQueueView>,
+}
+
+/// One release time that was selected for a unit, and what became of it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleChangeView {
+    pub selected_at_unix_ms: i64,
+    pub withdrawn_at_unix_ms: Option<i64>,
+    /// Why it stopped being valid. Retained rather than deleted, so what moved and why stays
+    /// answerable long after the fact.
+    pub reason: Option<String>,
+}
+
 /// Everything durable that one plan revision has produced so far.
 ///
 /// This is the view an agent polls. It reports each task's status verbatim rather than a derived
@@ -982,6 +1065,12 @@ pub enum ResponseData {
     },
     FeatureStatus {
         status: FeatureStatusView,
+    },
+    QueueSummary {
+        summary: QueueSummaryView,
+    },
+    ScheduleHistory {
+        changes: Vec<ScheduleChangeView>,
     },
     TaskSubmitted {
         submission: SubmissionView,

@@ -13,11 +13,11 @@ use reccursive_protocol::{
     CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
     EventSeverityView, EventView, FeatureId, FeaturePlan, IdempotencyKey, IntegrationHealthView,
     LocalClient, PackageId, PackageView, PlanView, PublicationMode, QueueAuditView,
-    QueueExportView, ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitId, ReleaseUnitView,
-    RepositoryId, RepositoryView, ResponseData, Revision, SchedulePolicy, SchedulePolicyOverride,
-    SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest,
-    SubmissionView, SubmitTaskRequest, TargetMilestone, TargetRef, TaskId, TaskProgressView,
-    WorkspaceView,
+    QueueExportView, QueueSummaryView, QueuedUnitState, ReleaseAttemptView, ReleasePackageRequest,
+    ReleaseUnitId, ReleaseUnitView, RepositoryId, RepositoryView, ResponseData, Revision,
+    ScheduleChangeView, SchedulePolicy, SchedulePolicyOverride, SchedulePolicyView,
+    ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest, SubmissionView,
+    SubmitTaskRequest, TargetMilestone, TargetRef, TaskId, TaskProgressView, WorkspaceView,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -316,6 +316,8 @@ enum ScheduleCommand {
     ReleaseNow { release_unit_id: ReleaseUnitId },
     /// Show a repository's upcoming release times without changing any of them.
     Preview { repository_id: RepositoryId },
+    /// List every release time selected for one unit, and why each stopped being valid.
+    History { release_unit_id: ReleaseUnitId },
 }
 
 #[derive(Debug, Subcommand)]
@@ -339,6 +341,23 @@ enum ServiceCommand {
 
 #[derive(Debug, Subcommand)]
 enum QueueCommand {
+    /// Show queued release work and where each unit stands.
+    Status {
+        /// Restrict to one repository.
+        #[arg(long)]
+        repository_id: Option<RepositoryId>,
+    },
+    /// Redraw the queue on an interval until you stop watching.
+    Watch {
+        #[arg(long)]
+        repository_id: Option<RepositoryId>,
+        /// Seconds between redraws.
+        #[arg(long, default_value_t = 5, value_parser = parse_watch_interval)]
+        interval: u64,
+        /// Stop after this many seconds instead of running until interrupted.
+        #[arg(long, value_name = "SECONDS")]
+        r#for: Option<u64>,
+    },
     /// Verify package storage and show unresolved crash-recovery evidence.
     Audit,
     /// Export verified queue state and immutable packages to a new directory.
@@ -906,6 +925,10 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 let data = send(&session, Command::PreviewSchedule { repository_id })?;
                 output_data(data, cli.json, stdout)
             }
+            ScheduleCommand::History { release_unit_id } => {
+                let data = send(&session, Command::ScheduleHistory { release_unit_id })?;
+                output_data(data, cli.json, stdout)
+            }
             ScheduleCommand::SetOverride {
                 repository_id,
                 file,
@@ -953,6 +976,15 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             }
         },
         TopLevelCommand::Queue { command } => match command {
+            QueueCommand::Status { repository_id } => {
+                let data = send(&session, Command::SummarizeQueue { repository_id })?;
+                output_data(data, cli.json, stdout)
+            }
+            QueueCommand::Watch {
+                repository_id,
+                interval,
+                r#for,
+            } => queue_watch(&session, repository_id, interval, r#for, cli.json, stdout),
             QueueCommand::Audit => {
                 let data = send(&session, Command::AuditQueue)?;
                 output_data(data, cli.json, stdout)
@@ -1004,6 +1036,58 @@ fn write_document(
             writeln!(out, "Wrote {}", path.display()).map_err(output_error)
         }
         None => write!(out, "{document}").map_err(output_error),
+    }
+}
+
+fn parse_watch_interval(value: &str) -> Result<u64, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "interval must be a whole number of seconds".to_owned())?;
+    if (1..=3_600).contains(&seconds) {
+        Ok(seconds)
+    } else {
+        Err("interval must be between 1 and 3600 seconds".to_owned())
+    }
+}
+
+/// Redraws the queue until the watcher is stopped.
+///
+/// Watching is a *display*. It holds no lease, claims no work, and tells the daemon nothing — it
+/// asks the same question `queue status` asks, repeatedly. Stopping it therefore cannot affect
+/// what is queued or whether the service publishes: the CLI is a protocol client with no authority
+/// to stop anything, so this is structural rather than careful.
+fn queue_watch(
+    session: &Session,
+    repository_id: Option<RepositoryId>,
+    interval_seconds: u64,
+    stop_after_seconds: Option<u64>,
+    json_output: bool,
+    out: &mut impl Write,
+) -> Result<(), CliFailure> {
+    let interval = std::time::Duration::from_secs(interval_seconds);
+    let deadline = stop_after_seconds
+        .map(|seconds| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
+    loop {
+        let data = send(session, Command::SummarizeQueue { repository_id })?;
+        if !json_output {
+            // Clear and home, so a terminal shows one queue that updates rather than a transcript.
+            // Harmless when redirected: it is two escape sequences, not a full-screen mode, and
+            // nothing here requires a TUI or a mouse.
+            let _ = write!(out, "\x1b[2J\x1b[H");
+        }
+        match output_data(data, json_output, out) {
+            Ok(()) => {}
+            // The reader went away — a pipe closed, a pager quit. That is the watch ending
+            // normally, not a failure worth an error message.
+            Err(failure) if failure.code == "output_failed" => return Ok(()),
+            Err(failure) => return Err(failure),
+        }
+        if let Some(deadline) = deadline
+            && std::time::Instant::now() + interval > deadline
+        {
+            return Ok(());
+        }
+        std::thread::sleep(interval);
     }
 }
 
@@ -1532,6 +1616,106 @@ fn branch_ref(value: &str) -> Result<TargetRef, CliFailure> {
         .map_err(|error| CliFailure::new(EXIT_ACTION_REQUIRED, "invalid_branch", error.to_string()))
 }
 
+fn queued_state_label(state: QueuedUnitState) -> &'static str {
+    match state {
+        QueuedUnitState::Ready => "ready",
+        QueuedUnitState::Scheduled => "scheduled",
+        QueuedUnitState::Due => "due now",
+        QueuedUnitState::Publishing => "publishing",
+        QueuedUnitState::Blocked => "blocked",
+        QueuedUnitState::Cancelled => "cancelled",
+        QueuedUnitState::Published => "published",
+    }
+}
+
+fn output_queue_summary(
+    out: &mut impl Write,
+    summary: &QueueSummaryView,
+) -> Result<(), CliFailure> {
+    if summary.repositories.is_empty() {
+        return writeln!(out, "No repositories are enrolled.").map_err(output_error);
+    }
+    for repository in &summary.repositories {
+        writeln!(
+            out,
+            "{} → {}{}",
+            repository.repository_id,
+            repository.target.as_str(),
+            match &repository.paused {
+                Some(reason) => format!("  [paused: {reason}]"),
+                None => String::new(),
+            }
+        )
+        .map_err(output_error)?;
+        if repository.units.is_empty() {
+            writeln!(out, "  nothing queued").map_err(output_error)?;
+            continue;
+        }
+        output_table(
+            out,
+            &["UNIT", "STATE", "DUE", "WORK"],
+            repository
+                .units
+                .iter()
+                .map(|unit| {
+                    vec![
+                        unit.release_unit_id.to_string(),
+                        queued_state_label(unit.state).to_owned(),
+                        unit.selected_at_unix_ms
+                            .map_or_else(|| "—".to_owned(), |at| at.to_string()),
+                        unit.task_names.join(", "),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map_err(output_error)?;
+        // Anything that needs a person is called out under the table rather than truncated into a
+        // column, because it is the only part of this view that asks for an action.
+        for unit in &repository.units {
+            if let Some(reason) = &unit.reason {
+                writeln!(out, "  {} blocked: {reason}", unit.release_unit_id)
+                    .map_err(output_error)?;
+            }
+            if let Some(change) = &unit.last_schedule_change {
+                writeln!(
+                    out,
+                    "  {} release time withdrawn: {change}",
+                    unit.release_unit_id
+                )
+                .map_err(output_error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn output_schedule_history(
+    out: &mut impl Write,
+    changes: &[ScheduleChangeView],
+) -> Result<(), CliFailure> {
+    if changes.is_empty() {
+        return writeln!(out, "No release time has been selected for this unit yet.")
+            .map_err(output_error);
+    }
+    output_table(
+        out,
+        &["SELECTED", "WITHDRAWN", "REASON"],
+        changes
+            .iter()
+            .map(|change| {
+                vec![
+                    change.selected_at_unix_ms.to_string(),
+                    change
+                        .withdrawn_at_unix_ms
+                        .map_or_else(|| "—  (live)".to_owned(), |at| at.to_string()),
+                    change.reason.clone().unwrap_or_else(|| "—".to_owned()),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(output_error)
+}
+
 fn output_feature_status(
     out: &mut impl Write,
     status: &reccursive_protocol::FeatureStatusView,
@@ -1650,6 +1834,12 @@ fn output_data(
                 plan.plan.feature_id,
                 plan.plan.revision.get()
             )
+        }
+        ResponseData::QueueSummary { summary } => {
+            return output_queue_summary(out, &summary);
+        }
+        ResponseData::ScheduleHistory { changes } => {
+            return output_schedule_history(out, &changes);
         }
         ResponseData::FeatureStatus { status } => {
             return output_feature_status(out, &status);

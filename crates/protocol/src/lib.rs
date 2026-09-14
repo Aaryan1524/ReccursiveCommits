@@ -771,6 +771,67 @@ pub struct PackageView {
     pub created_at_unix_ms: i64,
 }
 
+/// What a person should do about a blocked publication attempt.
+///
+/// Lives in the protocol crate rather than in one client because every client faces the same
+/// question, and because the mapping is a property of the failure classifications the daemon
+/// produces — not of any particular interface.
+///
+/// A classification with no known next action returns `None`. That is deliberate: inventing
+/// plausible-sounding advice for a failure nobody has characterised is worse than admitting there
+/// is none, because a command that does not help still costs the reader their attention.
+#[must_use]
+pub fn next_action_for_attempt(attempt: &ReleaseAttemptView) -> Option<String> {
+    let package = attempt.package_id;
+    let revision = attempt.package_revision.get();
+    let repository = attempt.repository_id;
+    let attempt_id = attempt.attempt_id;
+    let classification = attempt.failure_classification.as_deref()?;
+    Some(match classification {
+        // The captured change no longer applies to the target. Seeing what it changes is the only
+        // way to judge whether to re-capture it against the moved target.
+        "conflict" => format!(
+            "reccursive package changes {package} --revision {revision} --patch
+             then re-capture the work against the moved target with a new plan revision"
+        ),
+        // A check ran and said no. Which one, and what it printed, is already recorded.
+        "validation_failed" => format!(
+            "reccursive package checks {package} --revision {revision}
+             fix what the failing check reports, then submit the task again"
+        ),
+        // The check could not run at all, which is a problem with this machine rather than with
+        // the change.
+        "validation_unavailable" => "reccursive doctor
+the attempt retries on its own once checks can run again"
+            .to_owned(),
+        // Credentials. Never retried automatically, because presenting a rejected credential
+        // repeatedly is how an account gets locked.
+        "authentication" => format!(
+            "reccursive diagnose {repository}
+             fix the credential it reports, then run: reccursive schedule release-now <unit>"
+        ),
+        // Transport faults back off and retry by themselves; the useful thing is to see when.
+        "transport" | "remote" => "reccursive integrations
+the attempt retries on its own when the remote is reachable"
+            .to_owned(),
+        // The push may or may not have landed. This is the one case that genuinely needs a person
+        // to look at the remote, and saying so is more honest than suggesting a command.
+        "ambiguous_remote" => format!(
+            "reccursive release attempt {attempt_id}
+             check the remote yourself before acting: the push may or may not have landed"
+        ),
+        // The target moved under a valid attempt. Reconciliation handles it on the next pass.
+        "target_changed" => "reccursive queue status
+the attempt reconciles against the new target on its own"
+            .to_owned(),
+        "internal_error" => format!(
+            "reccursive logs --limit 50
+then: reccursive release attempt {attempt_id}"
+        ),
+        _ => return None,
+    })
+}
+
 /// One file a captured package changes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChangedFileView {
@@ -1493,5 +1554,87 @@ mod tests {
             }
             .may_reach_remote()
         );
+    }
+
+    #[test]
+    fn every_failure_the_release_worker_can_record_has_a_next_action() {
+        // These are the classifications `ReleaseWorker` actually writes. A blocked attempt a user
+        // cannot act on is the failure this task exists to remove, so the list is asserted rather
+        // than assumed — a new classification added without guidance fails here.
+        let attempt = |classification: &str| ReleaseAttemptView {
+            attempt_id: AttemptId::new(),
+            repository_id: RepositoryId::new(),
+            package_id: PackageId::new(),
+            package_revision: Revision::new(1).unwrap(),
+            target_remote: "ssh://git@example.invalid/p.git".into(),
+            target: TargetRef::new("refs/heads/main").unwrap(),
+            base_commit: "a".repeat(40),
+            candidate_sha: None,
+            candidate_parent_sha: None,
+            push_intent_at_unix_ms: None,
+            observed_remote_sha: None,
+            failure_classification: Some(classification.to_owned()),
+            failed_attempts: 1,
+            retry_not_before_unix_ms: None,
+            status: TaskStatus::Blocked,
+            reason: None,
+            blocked_from: None,
+            lease_expires_at_unix_ms: 0,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+        for classification in [
+            "conflict",
+            "validation_failed",
+            "validation_unavailable",
+            "authentication",
+            "transport",
+            "remote",
+            "ambiguous_remote",
+            "target_changed",
+            "internal_error",
+        ] {
+            let action = next_action_for_attempt(&attempt(classification));
+            assert!(
+                action.is_some(),
+                "{classification} leaves a user with nothing to do"
+            );
+            assert!(
+                action.as_deref().unwrap().contains("reccursive")
+                    || action.as_deref().unwrap().contains("check the remote"),
+                "{classification} suggests nothing actionable"
+            );
+        }
+    }
+
+    #[test]
+    fn an_attempt_that_has_not_failed_is_offered_no_advice() {
+        let mut attempt = ReleaseAttemptView {
+            attempt_id: AttemptId::new(),
+            repository_id: RepositoryId::new(),
+            package_id: PackageId::new(),
+            package_revision: Revision::new(1).unwrap(),
+            target_remote: "ssh://git@example.invalid/p.git".into(),
+            target: TargetRef::new("refs/heads/main").unwrap(),
+            base_commit: "a".repeat(40),
+            candidate_sha: None,
+            candidate_parent_sha: None,
+            push_intent_at_unix_ms: None,
+            observed_remote_sha: None,
+            failure_classification: None,
+            failed_attempts: 0,
+            retry_not_before_unix_ms: None,
+            status: TaskStatus::Published,
+            reason: None,
+            blocked_from: None,
+            lease_expires_at_unix_ms: 0,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+        assert_eq!(next_action_for_attempt(&attempt), None);
+
+        // An unfamiliar classification gets silence rather than invented advice.
+        attempt.failure_classification = Some("something_nobody_has_characterised".into());
+        assert_eq!(next_action_for_attempt(&attempt), None);
     }
 }

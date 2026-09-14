@@ -288,6 +288,36 @@ without an error. Forecasts of upcoming release times remain `schedule preview`.
 why each stopped being valid. Withdrawn selections are retained rather than
 deleted, so what moved and why stays answerable long after the fact.
 
+`queue status` accepts `--state` to show one kind of unit, and
+`--needs-attention` for the two that ask something of a person: blocked work,
+and work whose release time was withdrawn. Filtering happens in the CLI, because
+it is a question about presentation rather than about state — the same summary
+answers every filter.
+
+`release attempt` ends with a **Next:** block naming the commands that address
+whatever blocked it: `package checks` for a failed check, `package changes
+--patch` for a conflict, `diagnose` for a credential, `integrations` for a
+remote that is merely unreachable. Where a failure genuinely needs a person to
+look at the remote — an ambiguous push — it says that instead of suggesting a
+command. A classification with no known action prints nothing rather than
+something plausible.
+
+`diagnostics export DIRECTORY` writes a shareable report: service status,
+repositories, the queue, integration health, and recent events. Everything in it
+is read back through the ordinary local API, which is what makes it safe to
+share — events and check output are scrubbed for credential-shaped text when
+they are stored, and enrollment already refuses a remote with embedded
+credentials. The local API token, the queue database, and captured package
+contents are never included, and the manifest says so. It is a copy: describing
+the queue never consumes it. Review the files before sending them anywhere.
+
+`schedule pause` takes a repository, or `--all` to stop every enrolled one.
+Naming neither is a usage error rather than a guess. Pausing all of them is
+several calls, since pausing is per repository and there is no durable
+"everything is paused" state; if one refuses, the ones already paused stay
+paused and are listed, because silently resuming them would undo what an
+operator asked for.
+
 `queue audit` reconciles crash evidence with durable state. A fully authenticated
 package that was written before its database row is re-registered, and a complete
 partial directory is promoted atomically. Incomplete, invalid, missing, or unsafe

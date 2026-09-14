@@ -853,6 +853,7 @@ mod tests {
                 eligible_at_unix_ms: now_unix_ms - 4 * DAY_MS,
                 selected_at_unix_ms: now_unix_ms - 3 * DAY_MS,
                 created_at_unix_ms: now_unix_ms - 4 * DAY_MS,
+                released_on_request: false,
             })
             .unwrap();
         (store, unit_id, task_id, feature_id)

@@ -216,4 +216,34 @@ due_json="$(cli schedule due --concurrency-limit 10)"
 grep -q "$unit_id" <<<"$due_json" || \
   fail "a unit released now did not become due: $due_json"
 
+# --- A time a person asked for is not a missed window. ---
+#
+# `release-now` sets the time to now. Outside a release window the missed-window reconciler used
+# to treat that as overdue and withdraw it on the very next pass, so the command silently did
+# nothing. Both cases look identical here — a slot whose time has passed — which is why the
+# request is recorded durably rather than inferred.
+cat >"$fixture_root/business-hours.json" <<'JSON'
+{
+  "timezone": "UTC",
+  "allowed_days": ["monday"],
+  "windows": [{"start":{"hour":3,"minute":0},"end":{"hour":4,"minute":0}}],
+  "daily_releases": {"minimum": 1, "maximum": 1},
+  "minimum_spacing_minutes": 1,
+  "missed_window_behavior": {"kind": "reschedule_forward"}
+}
+JSON
+cli schedule set-policy "$repository_id" "$fixture_root/business-hours.json" >/dev/null
+cli schedule unit "$unit_id" --package-id "$package_id" --revision 1 >/dev/null
+forced="$(cli schedule release-now "$unit_id")"
+forced_at="$(json_number selected_at_unix_ms <<<"$forced")"
+[[ -n "$forced_at" ]] || fail "release-now did not return a selected time"
+
+# Reconcile explicitly rather than waiting for a pass: this is the step that used to undo it.
+cli schedule catch-up "$repository_id" >/dev/null 2>&1 || true
+still="$(cli schedule show "$unit_id" 2>&1)" || \
+  fail "a deliberately released unit lost its release time to missed-window reconciliation"
+still_at="$(json_number selected_at_unix_ms <<<"$still")"
+[[ "$still_at" == "$forced_at" ]] || \
+  fail "a deliberately released time was moved by reconciliation: $forced_at became $still_at"
+
 printf 'PASS release-unit creation, policy activation, deterministic scheduling, restart-stable slots, adaptive recalculation, and schedule controls\n'

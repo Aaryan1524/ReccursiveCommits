@@ -909,9 +909,23 @@ fn create_workspace(
         (plan.plan, repository)
     };
     if !plan.sealed {
+        // Sealing is what makes a revision safe to build against: it fixes the scope, so a
+        // workspace and every package captured in it belong to a plan that cannot change
+        // underneath them. Naming the command matters — this is the first wall a new user hits,
+        // between importing a plan and doing any work, and "requires a sealed revision" alone
+        // leaves them to discover both the concept and the command on their own.
         return Err(ApiError::new(
             ApiErrorCode::InvalidRequest,
-            "owned workspaces require a sealed plan revision",
+            format!(
+                "plan {} revision {} is not sealed, and a workspace must be built against a \
+                 revision whose scope cannot change. Seal it first:\n  \
+                 reccursive plan seal {}\n\
+                 That appends a sealed copy as the next revision — use that revision number from \
+                 here on.",
+                plan.feature_id,
+                plan.revision.get(),
+                plan.feature_id
+            ),
             false,
         ));
     }

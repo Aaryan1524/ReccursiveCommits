@@ -86,6 +86,35 @@ impl Store {
             .transpose()
     }
 
+    /// Names the release unit whose live slot holds a package, if one does.
+    ///
+    /// The release worker knows only the package it was asked to publish, but withdrawing a spent
+    /// selection is addressed by unit. A live slot is unique per package, so this is the one
+    /// direction the schema does not already index for.
+    pub fn live_slot_unit_for_package(
+        &self,
+        package_id: PackageId,
+        package_revision: Revision,
+    ) -> Result<Option<ReleaseUnitId>, StoreError> {
+        let found: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT release_unit_id FROM schedule_slots
+                 WHERE package_id = ?1 AND package_revision = ?2
+                   AND invalidated_at_unix_ms IS NULL",
+                params![package_id.to_string(), package_revision.get()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        found
+            .map(|value| {
+                value
+                    .parse::<ReleaseUnitId>()
+                    .map_err(|error| StoreError::InvalidData(error.to_string()))
+            })
+            .transpose()
+    }
+
     /// Lists retained slots for a repository in execution order.
     pub fn schedule_slots(
         &self,
@@ -434,11 +463,44 @@ impl Store {
             .collect()
     }
 
+    /// Reports whether a task's work already reached a repository's development branch.
+    ///
+    /// This is derived rather than stored. A development publication is exactly a published
+    /// attempt whose target ref is the development branch, and the attempt already records both
+    /// durably — so asking the attempts is asking the thing that actually happened, instead of
+    /// keeping a second marker that can disagree with it.
+    fn task_reached_development(
+        &self,
+        task_id: reccursive_core::TaskId,
+        development_target: &reccursive_core::TargetRef,
+    ) -> Result<bool, StoreError> {
+        let found: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM snapshot_package_tasks AS carried
+                 JOIN release_attempts AS attempt
+                   ON attempt.package_id = carried.package_id
+                  AND attempt.package_revision = carried.package_revision
+                 WHERE carried.task_id = ?1
+                   AND attempt.status = 'published'
+                   AND attempt.target_ref = ?2
+                 LIMIT 1",
+                params![task_id.to_string(), development_target.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     fn ensure_unit_is_eligible(
         &self,
         unit: &crate::ReleaseUnitRecord,
         repository_id: &reccursive_core::RepositoryId,
     ) -> Result<(), StoreError> {
+        let repository = self.repository(*repository_id)?.ok_or_else(|| {
+            StoreError::InvalidData("scheduled repository is not enrolled".into())
+        })?;
+        let development_target = repository.active_policy.development_target.clone();
         for task_id in &unit.task_ids {
             let task = self
                 .task(unit.feature_id, unit.plan_revision, *task_id)?
@@ -470,7 +532,19 @@ impl Store {
                     TargetMilestone::TargetPublished => {
                         dependency.state.status() == TaskStatus::Published
                     }
-                    TargetMilestone::DevelopmentAvailable => false,
+                    // A task published to the target has necessarily passed through being
+                    // available, so the target milestone satisfies this one too. Without that,
+                    // a scheduled-mode repository — which never publishes to a development
+                    // branch at all — could never satisfy a `development_available` dependency.
+                    TargetMilestone::DevelopmentAvailable => {
+                        dependency.state.status() == TaskStatus::Published
+                            || match &development_target {
+                                Some(branch) => {
+                                    self.task_reached_development(prerequisite, branch)?
+                                }
+                                None => false,
+                            }
+                    }
                 };
                 if !eligible {
                     return Err(StoreError::Conflict(format!(
@@ -478,11 +552,6 @@ impl Store {
                     )));
                 }
             }
-        }
-        if self.repository(*repository_id)?.is_none() {
-            return Err(StoreError::InvalidData(
-                "scheduled repository is not enrolled".into(),
-            ));
         }
         Ok(())
     }

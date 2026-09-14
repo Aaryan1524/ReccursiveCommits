@@ -649,6 +649,27 @@ impl Store {
     /// The release worker advances the *attempt* through its stages and leaves the unit's tasks at
     /// `scheduled` for the whole flight, so task state cannot answer "is this already being
     /// published?". This can.
+    /// Lists attempts for a repository that a publication still owns.
+    ///
+    /// What "in flight" means for a policy change: an attempt in one of these states may already
+    /// have transmitted a push, or be about to. Changing where work publishes underneath one is
+    /// how a unit ends up on a branch nobody chose.
+    pub fn live_attempts_for_repository(
+        &self,
+        repository_id: RepositoryId,
+    ) -> Result<Vec<ReleaseAttempt>, StoreError> {
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {ATTEMPT_COLUMNS} FROM release_attempts
+             WHERE repository_id = ?1
+               AND status NOT IN ('published', 'cancelled', 'superseded', 'blocked')
+             ORDER BY created_at_unix_ms"
+        ))?;
+        statement
+            .query_map([repository_id.to_string()], attempt_from_row)?
+            .map(|row| row.map_err(StoreError::from))
+            .collect()
+    }
+
     /// Reports whether a package has already been published to a given branch.
     ///
     /// This is how a publication decides whether it is the early one or the integration: a

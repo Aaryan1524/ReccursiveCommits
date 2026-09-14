@@ -18,11 +18,12 @@ use reccursive_capture::{
     SnapshotRequest, WorkspaceError, WorkspaceRequest as CaptureWorkspaceRequest,
 };
 use reccursive_protocol::{
-    ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest, ChangedFileView,
-    CheckResultView, CheckResultsView, Command, CreateReleaseUnitRequest, CreateWorkspaceRequest,
-    DueUnitView, EnrollRepositoryRequest, EventSeverityView, EventView, FeatureId,
-    FeatureStatusView, IdempotencyKey, InitializeRepositoryRequest, IntegrationHealthView,
-    MissedWindowView, PackageChangesView, PackageView, PlanView, ProtocolValidationError,
+    ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest,
+    ChangeRepositoryPolicyRequest, ChangedFileView, CheckResultView, CheckResultsView, Command,
+    CreateReleaseUnitRequest, CreateWorkspaceRequest, DevelopmentTargetChange, DueUnitView,
+    EnrollRepositoryRequest, EventSeverityView, EventView, FeatureId, FeatureStatusView,
+    IdempotencyKey, InitializeRepositoryRequest, IntegrationHealthView, MissedWindowView,
+    PackageChangesView, PackageView, PlanView, PolicyChangeView, ProtocolValidationError,
     PublicationView, PullRequestView, QueueAuditView, QueueExportView, QueueRecoveryIssueView,
     QueueSummaryView, QueuedUnitState, QueuedUnitView, ReasonCode, ReleaseAttemptView,
     ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryQueueView,
@@ -587,6 +588,7 @@ fn dispatch(
                 repository_count: store.repositories().map_err(store_api_error)?.len(),
             })
         }
+        Command::ChangeRepositoryPolicy(request) => change_repository_policy(request, store),
         Command::ListRepositories => {
             let store = lock_store(store)?;
             let repositories = store
@@ -718,6 +720,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Ping => "ping",
         Command::EnrollRepository(_) => "repository.add",
         Command::InitializeRepository(_) => "repository.initialize",
+        Command::ChangeRepositoryPolicy(..) => "repository.policy",
         Command::ListRepositories => "repository.list",
         Command::ListEvents { .. } => "logs",
         Command::ImportPlan { .. } => "plan.import",
@@ -3310,6 +3313,180 @@ fn enroll_repository_inner(
         }),
         None => Ok(ResponseData::RepositoryEnrolled { repository }),
     }
+}
+
+/// Changes where or how an enrolled repository publishes, or refuses and says why.
+///
+/// A policy change is only safe when nothing is mid-flight under the old one. Three situations
+/// make it unsafe, and each is refused with the thing to do about it rather than applied with a
+/// warning:
+///
+/// - a publication already owns a unit, so where it is going has already been decided;
+/// - a pull request is open, and it is aimed at the branch the old policy named;
+/// - work is on a development branch and not yet on the target, and the new policy has no
+///   development branch — its integration would never happen and the work would be stranded.
+///
+/// What it *does* move is schedule slots. A selected time was drawn under the old policy and may
+/// now point at a different branch, so live slots are withdrawn and chosen again from the new one.
+/// Nothing publishes in between, and no unit is duplicated: the same unit keeps its identity and
+/// simply gets a new time.
+fn change_repository_policy(
+    request: ChangeRepositoryPolicyRequest,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let mut store = lock_store(store)?;
+    let repository_id = request.repository_id;
+    let stored = store
+        .repository(repository_id)
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotFound,
+                format!("repository {repository_id} was not found"),
+                false,
+            )
+        })?;
+    let current = &stored.active_policy;
+
+    let publication_mode = request.publication_mode.unwrap_or(current.publication_mode);
+    let target = request
+        .target
+        .clone()
+        .unwrap_or_else(|| current.target.clone());
+    let development_target = match &request.development_target {
+        DevelopmentTargetChange::Keep => current.development_target.clone(),
+        DevelopmentTargetChange::Remove => None,
+        DevelopmentTargetChange::Set(branch) => Some(branch.clone()),
+    };
+    let target_integration = request
+        .target_integration
+        .unwrap_or(current.target_integration);
+
+    let refuse = |detail: String| ApiError::new(ApiErrorCode::Conflict, detail, false);
+
+    // Nothing may be mid-publication. A live attempt has already decided where it is going.
+    let live = store
+        .live_attempts_for_repository(repository_id)
+        .map_err(store_api_error)?;
+    if let Some(attempt) = live.first() {
+        return Err(refuse(format!(
+            "a publication is in flight for this repository (attempt {}, {:?}). Wait for it to \
+             finish, or resolve it with: reccursive release attempt {}",
+            attempt.attempt_id,
+            attempt.state.status(),
+            attempt.attempt_id
+        )));
+    }
+
+    for record in store.open_pull_requests().map_err(store_api_error)? {
+        if record.repository_id != repository_id {
+            continue;
+        }
+        // An open pull request is aimed at the branch the old policy named. Changing the target
+        // under it would leave a request pointing somewhere nobody chose.
+        return Err(refuse(format!(
+            "pull request #{} is open against {} and still waiting to be merged. Merge or close \
+             it first: {}",
+            record.number,
+            record.base.as_str(),
+            record.url
+        )));
+    }
+
+    // Work that is on a development branch has an integration still owed to it. Taking the
+    // development branch away would leave that work published but never integrated.
+    if development_target.is_none()
+        && let Some(previous_development) = &current.development_target
+    {
+        for unit in store
+            .release_units_for_repository(repository_id)
+            .map_err(store_api_error)?
+        {
+            let Some(task_id) = unit.task_ids.iter().next().copied() else {
+                continue;
+            };
+            let Some(package) = store
+                .snapshot_package_for_task(unit.feature_id, unit.plan_revision, task_id)
+                .map_err(store_api_error)?
+            else {
+                continue;
+            };
+            let on_development = store
+                .package_published_to(package.package_id, package.revision, previous_development)
+                .map_err(store_api_error)?;
+            let on_target = store
+                .package_published_to(package.package_id, package.revision, &current.target)
+                .map_err(store_api_error)?;
+            if on_development && !on_target {
+                return Err(refuse(format!(
+                    "unit {} is published to {} and has not reached the target yet; removing the \
+                     development branch would strand it. Let it integrate first.",
+                    unit.unit_id,
+                    previous_development.as_str()
+                )));
+            }
+        }
+    }
+
+    let revision = Revision::new(current.revision.get().saturating_add(1))
+        .map_err(|error| ApiError::new(ApiErrorCode::InvalidRequest, error.to_string(), false))?;
+    let policy = RepositoryPolicy::new(
+        repository_id,
+        revision,
+        publication_mode,
+        target.clone(),
+        development_target.clone(),
+    )
+    .and_then(|policy| policy.with_target_integration(target_integration))
+    .map_err(|error| ApiError::new(ApiErrorCode::InvalidRequest, error.to_string(), false))?;
+
+    if target_integration == reccursive_core::TargetIntegration::PullRequest
+        && reccursive_github::RepositorySlug::from_remote(&stored.registration.canonical_remote)
+            .is_none()
+    {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            format!(
+                "the pull-request strategy needs a GitHub remote; {} is not one",
+                stored.registration.canonical_remote
+            ),
+            false,
+        ));
+    }
+
+    // Selected times were drawn under the old policy and may now name a different branch.
+    let mut withdrawn = Vec::new();
+    for slot in store
+        .schedule_slots(repository_id)
+        .map_err(store_api_error)?
+    {
+        match store.invalidate_schedule_slot(
+            slot.release_unit_id,
+            "the repository's publication policy changed",
+            now,
+        ) {
+            Ok(Some(_)) => withdrawn.push(slot.release_unit_id),
+            Ok(None) => {}
+            Err(error) => return Err(store_api_error(error)),
+        }
+    }
+
+    store
+        .activate_policy_revision(&policy, now)
+        .map_err(store_api_error)?;
+
+    Ok(ResponseData::RepositoryPolicyChanged {
+        change: PolicyChangeView {
+            repository_id,
+            policy_revision: revision,
+            publication_mode,
+            target,
+            development_target,
+            target_integration,
+            withdrawn,
+        },
+    })
 }
 
 fn repository_view(stored: StoredRepository) -> RepositoryView {

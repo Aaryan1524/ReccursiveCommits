@@ -277,6 +277,16 @@ grep -q '"merged": false' <<<"$(github_pulls)" || \
 [[ "$(github_pulls | grep -c '"number"')" == "1" ]] || \
   fail "a second pull request was opened for work that already had one: $(github_pulls)"
 
+# --- While it waits, the policy cannot be changed out from under it. ---
+#
+# An open pull request is aimed at the branch the current policy names. Retargeting underneath one
+# would leave a request pointing somewhere nobody chose.
+if retarget="$(cli repository set-policy "$repository_id" --target release 2>&1)"; then
+  fail "the target was changed while a pull request was still open against the old one"
+fi
+grep -q "pull request #1 is open" <<<"$retarget" || \
+  fail "the refusal did not name the pull request holding the change back: $retarget"
+
 # --- A person merges. Only now is the work finished. ---
 github_control "/control/merge/1" >/dev/null
 

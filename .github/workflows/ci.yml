@@ -54,3 +54,4 @@ jobs:
       - run: ./tests/scenarios/phase10_development_publication.sh
       - run: ./tests/scenarios/phase10_branch_protections.sh
       - run: ./tests/scenarios/phase10_pull_requests.sh
+      - run: ./tests/scenarios/phase10_policy_changes.sh

@@ -8,8 +8,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use reccursive_core::{
-    FeatureId, ReasonCode, ReleaseUnit, ReleaseUnitId, Revision, StateReason, TargetMilestone,
-    TaskId, TaskStatus,
+    FeatureId, ReasonCode, ReleaseUnit, ReleaseUnitId, RepositoryId, Revision, StateReason,
+    TargetMilestone, TaskId, TaskStatus,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -151,6 +151,41 @@ impl Store {
             )));
         }
         Ok(None)
+    }
+
+    /// Lists every release unit belonging to one repository, newest first.
+    ///
+    /// Keyed on the units themselves rather than on their selected times. A unit whose slot was
+    /// withdrawn has no live slot row, and that is exactly the unit a queue view most needs to
+    /// show — listing by slot would hide the work that stopped moving.
+    pub fn release_units_for_repository(
+        &self,
+        repository_id: RepositoryId,
+    ) -> Result<Vec<ReleaseUnitRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT unit.unit_id
+             FROM release_units AS unit
+             JOIN feature_plans AS plan
+               ON plan.feature_id = unit.feature_id
+              AND plan.revision = unit.plan_revision
+             WHERE plan.repository_id = ?1
+             ORDER BY unit.created_at_unix_ms DESC, unit.unit_id",
+        )?;
+        let unit_ids = statement
+            .query_map([repository_id.to_string()], |row| row.get::<_, String>(0))?
+            .map(|row| {
+                row?.parse::<ReleaseUnitId>()
+                    .map_err(|error| StoreError::InvalidData(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut units = Vec::with_capacity(unit_ids.len());
+        for unit_id in unit_ids {
+            if let Some(unit) = self.release_unit(unit_id)? {
+                units.push(unit);
+            }
+        }
+        Ok(units)
     }
 
     /// Returns the unit a task publishes with, if it has been grouped.

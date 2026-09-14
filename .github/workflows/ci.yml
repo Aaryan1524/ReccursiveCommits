@@ -45,5 +45,6 @@ jobs:
       - run: ./tests/scenarios/phase6_capture_boundaries.sh
       - run: ./tests/scenarios/phase8_terminal_onboarding.sh
       - run: ./tests/scenarios/phase8_plan_authoring.sh
+      - run: ./tests/scenarios/phase8_queue_and_watch.sh
       - run: ./tests/scenarios/phase6_codex_integration.sh
       - run: ./tests/scenarios/phase6_agent_publication.sh

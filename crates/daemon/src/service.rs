@@ -22,12 +22,14 @@ use reccursive_protocol::{
     CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
     EventSeverityView, EventView, FeatureId, FeatureStatusView, IdempotencyKey,
     InitializeRepositoryRequest, IntegrationHealthView, MissedWindowView, PackageView, PlanView,
-    ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView, ReasonCode,
-    ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy,
+    ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView,
+    QueueSummaryView, QueuedUnitState, QueuedUnitView, ReasonCode, ReleaseAttemptView,
+    ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryQueueView,
     RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision,
-    SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest,
-    SetSchedulePolicyRequest, StateReason, SubmissionView, TaskCancellationView, TaskProgressView,
-    TaskStatus, TransportError, WorkspacePrerequisiteView, WorkspaceView,
+    ScheduleChangeView, SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView,
+    ScheduleUnitRequest, SetSchedulePolicyRequest, StateReason, SubmissionView,
+    TaskCancellationView, TaskProgressView, TaskStatus, TransportError, WorkspacePrerequisiteView,
+    WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -609,6 +611,8 @@ fn dispatch(
             feature_id,
             revision,
         } => get_feature_status(feature_id, revision, store),
+        Command::SummarizeQueue { repository_id } => summarize_queue(repository_id, store),
+        Command::ScheduleHistory { release_unit_id } => schedule_history(release_unit_id, store),
         Command::ReleasePackage(request) => {
             release_package(request, store, roots.managed, roots.release)
         }
@@ -672,6 +676,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::SealPlan { .. } => "plan.seal",
         Command::SubmitTask(_) => "task.submit",
         Command::GetFeatureStatus { .. } => "feature.status",
+        Command::SummarizeQueue { .. } => "queue.status",
+        Command::ScheduleHistory { .. } => "schedule.history",
         Command::GetPlan { .. } => "plan.show",
         Command::PlanHistory { .. } => "plan.history",
         Command::CreateWorkspace(_) => "workspace.create",
@@ -1802,6 +1808,167 @@ fn seal_plan(feature_id: FeatureId, store: &Mutex<Store>) -> Result<ResponseData
             created_at_unix_ms,
         },
     })
+}
+
+/// Summarizes queued work, across every repository or one of them.
+///
+/// Every value here is derived when asked. Task status, the selected slot, and the live attempt
+/// each already own part of the answer, so a stored summary would be a second copy to keep true —
+/// and the first one to go stale.
+fn summarize_queue(
+    repository_id: Option<RepositoryId>,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let store = lock_store(store)?;
+    let repositories = match repository_id {
+        Some(id) => vec![
+            store
+                .repository(id)
+                .map_err(store_api_error)?
+                .ok_or_else(|| {
+                    ApiError::new(
+                        ApiErrorCode::NotFound,
+                        format!("repository {id} was not found"),
+                        false,
+                    )
+                })?,
+        ],
+        None => store.repositories().map_err(store_api_error)?,
+    };
+
+    let mut summaries = Vec::new();
+    for repository in repositories {
+        let id = repository.registration.id;
+        let mut units = Vec::new();
+        for unit in store
+            .release_units_for_repository(id)
+            .map_err(store_api_error)?
+        {
+            units.push(queued_unit_view(&store, &unit, now)?);
+        }
+        summaries.push(RepositoryQueueView {
+            repository_id: id,
+            target: repository.active_policy.target.clone(),
+            paused: store
+                .repository_pause(id)
+                .map_err(store_api_error)?
+                .map(|pause| pause.reason),
+            units,
+        });
+    }
+    Ok(ResponseData::QueueSummary {
+        summary: QueueSummaryView {
+            generated_at_unix_ms: now,
+            repositories: summaries,
+        },
+    })
+}
+
+/// Places one unit in the queue, from the state its own parts are in.
+fn queued_unit_view(
+    store: &Store,
+    unit: &reccursive_store::ReleaseUnitRecord,
+    now_unix_ms: i64,
+) -> Result<QueuedUnitView, ApiError> {
+    let mut task_names = Vec::new();
+    let mut statuses = Vec::new();
+    let mut reason = None;
+    for task_id in &unit.task_ids {
+        let Some(task) = store
+            .task(unit.feature_id, unit.plan_revision, *task_id)
+            .map_err(store_api_error)?
+        else {
+            continue;
+        };
+        task_names.push(task.name);
+        statuses.push(task.state.status());
+        if reason.is_none()
+            && let Some(state_reason) = task.state.reason()
+        {
+            reason = Some(state_reason.message.clone());
+        }
+    }
+
+    let slot = store.schedule_slot(unit.unit_id).map_err(store_api_error)?;
+    let publishing = match &slot {
+        Some(slot) => store
+            .live_attempt_for_package(slot.package_id, slot.package_revision)
+            .map_err(store_api_error)?
+            .is_some(),
+        None => false,
+    };
+
+    // Read the worst-case status first: one blocked or cancelled task decides the unit, because a
+    // unit publishes together or not at all.
+    let state = if statuses.contains(&TaskStatus::Blocked) {
+        QueuedUnitState::Blocked
+    } else if statuses
+        .iter()
+        .any(|status| matches!(status, TaskStatus::Cancelled | TaskStatus::Superseded))
+    {
+        QueuedUnitState::Cancelled
+    } else if !statuses.is_empty() && statuses.iter().all(|s| *s == TaskStatus::Published) {
+        QueuedUnitState::Published
+    } else if publishing {
+        QueuedUnitState::Publishing
+    } else {
+        match &slot {
+            Some(slot) if slot.selected_at_unix_ms <= now_unix_ms => QueuedUnitState::Due,
+            Some(_) => QueuedUnitState::Scheduled,
+            None => QueuedUnitState::Ready,
+        }
+    };
+
+    // The reason the most recent release time stopped being valid, which is the question a unit
+    // that silently returned to the queue actually raises.
+    let last_schedule_change = store
+        .schedule_slot_history(unit.unit_id)
+        .map_err(store_api_error)?
+        .into_iter()
+        .find(|change| change.invalidated_at_unix_ms.is_some())
+        .and_then(|change| change.invalidated_reason);
+
+    Ok(QueuedUnitView {
+        release_unit_id: unit.unit_id,
+        feature_id: unit.feature_id,
+        plan_revision: unit.plan_revision,
+        state,
+        task_names,
+        selected_at_unix_ms: slot.map(|slot| slot.selected_at_unix_ms),
+        reason,
+        last_schedule_change,
+    })
+}
+
+/// Lists every release time selected for one unit, and what became of each.
+fn schedule_history(
+    release_unit_id: reccursive_protocol::ReleaseUnitId,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let store = lock_store(store)?;
+    if store
+        .release_unit(release_unit_id)
+        .map_err(store_api_error)?
+        .is_none()
+    {
+        return Err(ApiError::new(
+            ApiErrorCode::NotFound,
+            format!("release unit {release_unit_id} was not found"),
+            false,
+        ));
+    }
+    let changes = store
+        .schedule_slot_history(release_unit_id)
+        .map_err(store_api_error)?
+        .into_iter()
+        .map(|change| ScheduleChangeView {
+            selected_at_unix_ms: change.selected_at_unix_ms,
+            withdrawn_at_unix_ms: change.invalidated_at_unix_ms,
+            reason: change.invalidated_reason,
+        })
+        .collect();
+    Ok(ResponseData::ScheduleHistory { changes })
 }
 
 /// Reports every task of one plan revision with whatever durable work is attached to it.

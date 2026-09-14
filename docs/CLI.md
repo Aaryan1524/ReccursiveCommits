@@ -249,6 +249,28 @@ invalidates affected validation evidence without deleting its audit trail. It
 never cancels published work or silently releases a dependent whose prerequisite
 will not arrive.
 
+`queue status` shows queued release work across every enrolled repository, or
+one with `--repository-id`: each release unit, the plan task names it carries,
+where it stands, and when it is due. States are `ready` (captured and grouped,
+no time selected), `scheduled`, `due now`, `publishing`, `blocked`, `cancelled`,
+and `published`. There is deliberately no *awaiting-merge* state: that belongs to
+pull-request lifecycles, which arrive in Phase 10, and a value nothing can
+produce would be a lie in the interface. Anything blocked, and any release time
+that was withdrawn, is called out beneath the table with its reason, because
+those are the only lines that ask for an action.
+
+`queue watch` redraws that view on an interval. It is a *display*: it holds no
+lease, claims no work, and tells the daemon nothing — it asks the same question
+`queue status` asks, repeatedly. Stopping it therefore cannot affect what is
+queued or whether the service publishes, which is structural rather than
+careful, since the CLI is a protocol client with no authority to stop anything.
+`--for SECONDS` bounds a watch so a script can use one; a closed pipe ends it
+without an error. Forecasts of upcoming release times remain `schedule preview`.
+
+`schedule history <unit>` lists every release time ever selected for a unit and
+why each stopped being valid. Withdrawn selections are retained rather than
+deleted, so what moved and why stays answerable long after the fact.
+
 `queue audit` reconciles crash evidence with durable state. A fully authenticated
 package that was written before its database row is re-registered, and a complete
 partial directory is promoted atomically. Incomplete, invalid, missing, or unsafe

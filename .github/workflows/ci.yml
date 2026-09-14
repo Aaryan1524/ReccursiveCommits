@@ -51,3 +51,4 @@ jobs:
       - run: ./tests/scenarios/phase8_terminal_journeys.sh
       - run: ./tests/scenarios/phase6_codex_integration.sh
       - run: ./tests/scenarios/phase6_agent_publication.sh
+      - run: ./tests/scenarios/phase10_development_publication.sh

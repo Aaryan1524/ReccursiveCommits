@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
 /// Local API protocol version. Version 16 adds package change inspection and check results.
-pub const API_VERSION: u16 = 16;
+pub const API_VERSION: u16 = 17;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -911,8 +911,29 @@ pub enum QueuedUnitState {
     Blocked,
     /// Withdrawn from the target; it will not be published.
     Cancelled,
+    /// On a development branch and visible to others, but not yet on the target.
+    ///
+    /// Distinct from `Ready` on purpose. Both are waiting to be scheduled for the target, but one
+    /// has already published real work to a real branch, and reporting them identically would be
+    /// the difference between "nothing has happened yet" and "your collaborators can already see
+    /// this".
+    AvailableEarly,
     /// On the target.
     Published,
+}
+
+/// One branch a unit's or task's work has already reached.
+///
+/// The distinction `is_target` carries is the whole point of immediate mode: work on a
+/// development branch is available for others to see and build on, but the target branch does not
+/// have it, and nothing should be reported as finished on that basis.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PublicationView {
+    pub target: TargetRef,
+    pub commit: String,
+    pub published_at_unix_ms: i64,
+    /// Whether this branch is the repository's target.
+    pub is_target: bool,
 }
 
 /// One release unit as it appears in the queue.
@@ -929,6 +950,8 @@ pub struct QueuedUnitView {
     pub reason: Option<String>,
     /// Why its most recent release time stopped being valid, if one was withdrawn.
     pub last_schedule_change: Option<String>,
+    /// Branches this unit's work has already reached, newest first.
+    pub published_to: Vec<PublicationView>,
 }
 
 /// Queued work across one repository.
@@ -988,6 +1011,8 @@ pub struct TaskProgressView {
     pub release_unit_id: Option<ReleaseUnitId>,
     /// When this task's unit is due for release, if a time has been selected.
     pub selected_at_unix_ms: Option<i64>,
+    /// Branches this task's work has already reached, newest first.
+    pub published_to: Vec<PublicationView>,
 }
 
 /// The three durable results one submission produced.

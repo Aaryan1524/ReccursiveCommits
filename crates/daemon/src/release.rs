@@ -26,7 +26,7 @@ use reccursive_git::{
     PublicationRecovery, PublicationResolution, PublicationRetryPolicy,
 };
 use reccursive_protocol::{
-    AttemptId, PackageId, ReasonCode, Revision, StateReason, TargetRef, TaskStatus,
+    AttemptId, PackageId, PublicationMode, ReasonCode, Revision, StateReason, TargetRef, TaskStatus,
 };
 use reccursive_store::{
     AttemptLease, CandidateValidationEvidence, NewReleaseAttempt, ReleaseAttempt, SnapshotRecord,
@@ -149,7 +149,49 @@ impl ReleaseWorker {
         })?;
 
         let remote = repository.registration.canonical_remote.clone();
-        let target = repository.active_policy.target.clone();
+        // Where this package is published is the whole of what the publication mode decides.
+        // Immediate mode puts the work on a development branch as soon as its release time
+        // arrives, so it is visible and reviewable early; the target branch is left untouched
+        // until the work is integrated deliberately. Scheduled mode goes straight to the target.
+        let development_target = match repository.active_policy.publication_mode {
+            PublicationMode::ImmediateAvailability => {
+                repository.active_policy.development_target.clone()
+            }
+            PublicationMode::ScheduledCreation => None,
+        };
+        // Immediate mode publishes a package twice: early to the development branch, and later
+        // to the target. Which one this is follows from what the remote already has — a package
+        // that reached the development branch is not sent there again, it is integrated. Read
+        // from the attempts rather than tracked separately, so a restart between the two reaches
+        // the same conclusion.
+        let development_target = match development_target {
+            Some(branch)
+                if store.package_published_to(
+                    snapshot.package_id,
+                    snapshot.revision,
+                    &branch,
+                )? =>
+            {
+                None
+            }
+            other => other,
+        };
+        let publication = match development_target {
+            // A development branch does not exist until the first work reaches it, and it starts
+            // from the target branch: the work is meant to be an early view of what will later be
+            // integrated, so it has to be built on the same history.
+            Some(branch) => PublicationTarget {
+                base: repository.active_policy.target.clone(),
+                branch,
+                create_if_absent: true,
+            },
+            None => PublicationTarget {
+                base: repository.active_policy.target.clone(),
+                branch: repository.active_policy.target.clone(),
+                create_if_absent: false,
+            },
+        };
+        let target = publication.branch.clone();
 
         // Nothing has touched Git yet. Open the attempt first so the target is claimed and any
         // crash from here on leaves a record explaining what was underway.
@@ -173,7 +215,7 @@ impl ReleaseWorker {
             &attempt,
             &snapshot,
             &remote,
-            &target,
+            &publication,
             request,
             now_unix_ms,
         ) {
@@ -198,17 +240,31 @@ impl ReleaseWorker {
         attempt: &ReleaseAttempt,
         snapshot: &SnapshotRecord,
         remote: &str,
-        target: &TargetRef,
+        publication: &PublicationTarget,
         request: &ReleaseRequest,
         now_unix_ms: i64,
     ) -> Result<ReleaseOutcome, ReleaseError> {
         let id = attempt.attempt_id;
+        let target = &publication.branch;
 
         // Reconcile against whatever the remote holds right now.
         store.advance_release_attempt(id, TaskStatus::Reconciling, None, now_unix_ms)?;
         let clone = self.managed_clone(remote, attempt.repository_id.to_string().as_str())?;
-        clone.fetch_ref(remote, target.as_str(), GIT_TIMEOUT)?;
-        let target_commit = clone.resolve(target.as_str(), GIT_TIMEOUT)?;
+        // Which history this candidate is built on. Normally the branch being published to, but a
+        // development branch that does not exist yet is built on the target it will later be
+        // integrated into. The remote is asked rather than assumed, so the second package to
+        // reach a development branch stacks on the first instead of restarting from the target.
+        let base = if publication.create_if_absent
+            && clone
+                .remote_head(remote, target.as_str(), GIT_TIMEOUT)?
+                .is_none()
+        {
+            &publication.base
+        } else {
+            target
+        };
+        clone.fetch_ref(remote, base.as_str(), GIT_TIMEOUT)?;
+        let target_commit = clone.resolve(base.as_str(), GIT_TIMEOUT)?;
 
         let package = SnapshotPackage::open(snapshot.path.clone())
             .map_err(|error| ReleaseError::Unavailable(error.to_string()))?;
@@ -330,7 +386,7 @@ impl ReleaseWorker {
             &workspace,
             &candidate,
             remote,
-            target,
+            publication,
             now_unix_ms,
         )
     }
@@ -343,13 +399,14 @@ impl ReleaseWorker {
         workspace: &CandidateWorkspace,
         candidate: &PersistedCandidate,
         remote: &str,
-        target: &TargetRef,
+        publication: &PublicationTarget,
         now_unix_ms: i64,
     ) -> Result<ReleaseOutcome, ReleaseError> {
         let id = attempt.attempt_id;
         let publish_request = CandidatePublishRequest {
             remote: remote.to_owned(),
-            target_ref: target.as_str().to_owned(),
+            target_ref: publication.branch.as_str().to_owned(),
+            create_if_absent: publication.create_if_absent,
         };
 
         store.advance_release_attempt(id, TaskStatus::PushPending, None, now_unix_ms)?;
@@ -504,13 +561,32 @@ impl ReleaseWorker {
         self.publish_tasks(store, attempt, now_unix_ms)
     }
 
-    /// Marks the tasks a published package delivers as published.
+    /// Settles the tasks a published package delivers.
+    ///
+    /// A push to the target branch completes the work, so its tasks become published. A push to a
+    /// development branch does not: the work is available for review, but the target does not
+    /// contain it, and calling those tasks published would let a dependent waiting on
+    /// `target_published` be released onto a target that does not have its prerequisite. So the
+    /// development case withdraws the spent selection instead, returning the unit to the queue to
+    /// be scheduled again for its integration.
     fn publish_tasks(
         &self,
         store: &mut Store,
         attempt: &ReleaseAttempt,
         now_unix_ms: i64,
     ) -> Result<(), StoreError> {
+        if self.is_development_publication(store, attempt)? {
+            if let Some(unit_id) =
+                store.live_slot_unit_for_package(attempt.package_id, attempt.package_revision)?
+            {
+                store.invalidate_schedule_slot(
+                    unit_id,
+                    "published to the development branch",
+                    now_unix_ms,
+                )?;
+            }
+            return Ok(());
+        }
         let Some(snapshot) = store.snapshot(attempt.package_id, attempt.package_revision)? else {
             return Ok(());
         };
@@ -524,6 +600,27 @@ impl ReleaseWorker {
             )?;
         }
         Ok(())
+    }
+
+    /// Reports whether an attempt published somewhere other than its repository's target branch.
+    ///
+    /// Asked of the branch the attempt durably recorded, not of the mode the repository is in
+    /// now. A recovered attempt is resolved long after the run that opened it, and the question
+    /// that matters — did the target branch receive this work — is answered by where the push
+    /// went. Reading the mode instead would let a policy changed in between turn a development
+    /// publication into a target one, and then a dependent waiting on `target_published` would be
+    /// released onto a target that does not contain its prerequisite. Where the two could
+    /// disagree this errs towards "not on the target", which holds dependents rather than
+    /// releasing them early.
+    fn is_development_publication(
+        &self,
+        store: &Store,
+        attempt: &ReleaseAttempt,
+    ) -> Result<bool, StoreError> {
+        let Some(repository) = store.repository(attempt.repository_id)? else {
+            return Ok(false);
+        };
+        Ok(attempt.target != repository.active_policy.target)
     }
 
     /// Stops an attempt with a durable, machine-readable reason and blocks its tasks.
@@ -601,6 +698,19 @@ impl ReleaseWorker {
     }
 }
 
+/// Where one attempt publishes, and what that branch is allowed to be built on.
+///
+/// Carried as one value rather than three arguments because the three only make sense together:
+/// a branch that may be created is exactly the branch that needs a base to be created from.
+struct PublicationTarget {
+    /// The branch the candidate is pushed to.
+    branch: TargetRef,
+    /// The branch `branch` starts from when it does not exist yet.
+    base: TargetRef,
+    /// Whether this publication may create `branch`.
+    create_if_absent: bool,
+}
+
 /// Resolves attempts whose push may have reached the remote before the process stopped.
 ///
 /// Invariant 6: this runs before any new candidate is built, so a successful-but-unrecorded push
@@ -633,6 +743,26 @@ fn recover_interrupted_release(
         ReleaseError::Unavailable("transmitted push is missing its candidate commit".into())
     })?;
     let clone = worker.managed_clone(&attempt.remote, &attempt.repository_id.to_string())?;
+    // A development branch this attempt was going to create may simply not be there. That is the
+    // push not having landed — the same situation as finding the candidate's parent still at the
+    // target, and it gets the same treatment. Fetching an absent ref would fail instead, leaving
+    // the attempt unresolvable for as long as the branch stayed absent.
+    if worker.is_development_publication(store, attempt)?
+        && clone
+            .remote_head(&attempt.remote, attempt.target.as_str(), GIT_TIMEOUT)?
+            .is_none()
+    {
+        if attempt.retry_not_before_unix_ms.is_some() {
+            return Ok(());
+        }
+        let detail = format!(
+            "development branch {} was never created; candidate {candidate_sha} did not reach \
+             the remote",
+            attempt.target.as_str()
+        );
+        worker.block(store, attempt, "transport", &detail, now_unix_ms)?;
+        return Ok(());
+    }
     clone.fetch_ref(&attempt.remote, attempt.target.as_str(), GIT_TIMEOUT)?;
     let observed = clone.resolve(attempt.target.as_str(), GIT_TIMEOUT)?;
 

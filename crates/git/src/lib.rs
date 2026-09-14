@@ -208,6 +208,19 @@ impl ManagedClone {
         git_text(&self.path, ["rev-parse", reference], timeout)
     }
 
+    /// Reports the commit a remote branch points at, or `None` if the remote has no such branch.
+    ///
+    /// Asked before fetching, because fetching a ref that does not exist is an error and
+    /// "this branch has not been created yet" is an ordinary answer, not a fault.
+    pub fn remote_head(
+        &self,
+        remote: &str,
+        reference: &str,
+        timeout: Duration,
+    ) -> Result<Option<String>, GitError> {
+        remote_ref(&self.path, remote, reference, timeout)
+    }
+
     pub fn fetch_ref(
         &self,
         remote: &str,
@@ -401,6 +414,12 @@ pub enum CandidateCommitError {
 pub struct CandidatePublishRequest {
     pub remote: String,
     pub target_ref: String,
+    /// Whether a branch that does not exist yet may be created by this publication.
+    ///
+    /// Off for a repository's target branch: a target that has gone missing is a fault to report,
+    /// not a branch to invent. On only for a development branch, which by design does not exist
+    /// until the first piece of work is published to it.
+    pub create_if_absent: bool,
 }
 
 /// Evidence that a remote branch now points to the persisted candidate commit.
@@ -673,21 +692,26 @@ impl CandidateWorkspace {
     ) -> Result<PublishedCandidate, CandidatePublishError> {
         validate_publish_request(request)?;
         self.validate_persisted_candidate(candidate, timeout)?;
-        match remote_ref(&self.path, &request.remote, &request.target_ref, timeout)? {
-            Some(actual) if actual == self.target_commit => {}
-            Some(actual) => {
-                return Err(CandidatePublishError::TargetAdvanced {
-                    target_ref: request.target_ref.clone(),
-                    expected: self.target_commit.clone(),
-                    actual,
-                });
-            }
-            None => {
-                return Err(CandidatePublishError::TargetMissing {
-                    target_ref: request.target_ref.clone(),
-                });
-            }
-        }
+        // What the remote must still hold for this push to be the one that lands. Creating a
+        // branch leases against the absent ref rather than against a commit, so two publishers
+        // racing to create the same development branch still produce one winner.
+        let leased_commit =
+            match remote_ref(&self.path, &request.remote, &request.target_ref, timeout)? {
+                Some(actual) if actual == self.target_commit => self.target_commit.clone(),
+                Some(actual) => {
+                    return Err(CandidatePublishError::TargetAdvanced {
+                        target_ref: request.target_ref.clone(),
+                        expected: self.target_commit.clone(),
+                        actual,
+                    });
+                }
+                None if request.create_if_absent => ABSENT_REF_OID.to_owned(),
+                None => {
+                    return Err(CandidatePublishError::TargetMissing {
+                        target_ref: request.target_ref.clone(),
+                    });
+                }
+            };
         GitRunner::run(
             &GitInvocation::new(
                 &self.path,
@@ -696,7 +720,7 @@ impl CandidateWorkspace {
                     OsString::from("--porcelain"),
                     OsString::from(format!(
                         "--force-with-lease={}:{}",
-                        request.target_ref, self.target_commit
+                        request.target_ref, leased_commit
                     )),
                     OsString::from(&request.remote),
                     OsString::from(format!("{}:{}", candidate.commit, request.target_ref)),
@@ -743,6 +767,13 @@ impl CandidateWorkspace {
                 target_ref: request.target_ref.clone(),
                 expected_target: self.target_commit.clone(),
                 actual_commit: actual,
+            }),
+            // A branch this attempt was going to create simply is not there yet. That is the
+            // push not having landed, which is a retry — treating it as a missing target would
+            // leave the attempt permanently unresolvable after a crash mid-create.
+            None if request.create_if_absent => Ok(PublicationRecovery::PendingRetry {
+                target_ref: request.target_ref.clone(),
+                target_commit: self.target_commit.clone(),
             }),
             None => Err(CandidatePublishError::TargetMissing {
                 target_ref: request.target_ref.clone(),
@@ -836,6 +867,10 @@ fn validate_publish_request(
     }
     Ok(())
 }
+
+/// The object ID git uses to mean "this ref does not exist", which is how a create-only lease is
+/// expressed.
+const ABSENT_REF_OID: &str = "0000000000000000000000000000000000000000";
 
 fn remote_ref(
     workspace: &std::path::Path,
@@ -1265,6 +1300,7 @@ mod tests {
         let publish_request = CandidatePublishRequest {
             remote: remote.to_string_lossy().into_owned(),
             target_ref: "refs/heads/main".into(),
+            create_if_absent: false,
         };
         assert_eq!(
             candidate
@@ -1330,6 +1366,59 @@ mod tests {
                 actual_commit: concurrent,
             }
         );
+        // A branch that does not exist is a fault for a target branch and an ordinary first
+        // publication for a development branch. Only the second may create it.
+        let absent_target = CandidatePublishRequest {
+            remote: remote.to_string_lossy().into_owned(),
+            target_ref: "refs/heads/development".into(),
+            create_if_absent: false,
+        };
+        assert!(matches!(
+            candidate.publish(&persisted, &absent_target, Duration::from_secs(5)),
+            Err(CandidatePublishError::TargetMissing { target_ref })
+                if target_ref == "refs/heads/development"
+        ));
+        let creating = CandidatePublishRequest {
+            remote: remote.to_string_lossy().into_owned(),
+            target_ref: "refs/heads/development".into(),
+            create_if_absent: true,
+        };
+        // A crash before the push leaves the branch absent, which is the push not having landed.
+        assert_eq!(
+            candidate
+                .recover_publication(&persisted, &creating, Duration::from_secs(5))
+                .unwrap(),
+            PublicationRecovery::PendingRetry {
+                target_ref: "refs/heads/development".into(),
+                target_commit: target.clone(),
+            }
+        );
+        assert_eq!(
+            candidate
+                .publish(&persisted, &creating, Duration::from_secs(5))
+                .unwrap(),
+            PublishedCandidate {
+                commit: persisted.commit.clone(),
+                target_ref: "refs/heads/development".into(),
+            }
+        );
+        assert_eq!(
+            remote_ref(
+                &candidate.path,
+                &creating.remote,
+                &creating.target_ref,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            Some(persisted.commit.clone())
+        );
+        // The create-only lease is not a licence to overwrite: the branch now exists, so a second
+        // creating publish is refused rather than forcing past whatever is there.
+        assert!(matches!(
+            candidate.publish(&persisted, &creating, Duration::from_secs(5)),
+            Err(CandidatePublishError::TargetAdvanced { .. })
+        ));
+
         fixture_git(&candidate.path, &["reset", "--hard", base.as_str()]);
         assert!(matches!(
             candidate.verify(Duration::from_secs(5)),
@@ -1379,6 +1468,7 @@ mod tests {
             validate_publish_request(&CandidatePublishRequest {
                 remote: "\n".into(),
                 target_ref: "refs/heads/main".into(),
+                create_if_absent: false,
             }),
             Err(CandidatePublishError::InvalidRemote)
         ));
@@ -1386,6 +1476,7 @@ mod tests {
             validate_publish_request(&CandidatePublishRequest {
                 remote: "origin".into(),
                 target_ref: "main".into(),
+                create_if_absent: false,
             }),
             Err(CandidatePublishError::InvalidTargetRef)
         ));
@@ -1393,6 +1484,7 @@ mod tests {
             validate_publish_request(&CandidatePublishRequest {
                 remote: "origin".into(),
                 target_ref: "refs/heads/../main".into(),
+                create_if_absent: false,
             }),
             Err(CandidatePublishError::InvalidTargetRef)
         ));
@@ -1615,6 +1707,7 @@ mod tests {
         let request = CandidatePublishRequest {
             remote: remote.to_string_lossy().into_owned(),
             target_ref: "refs/heads/main".into(),
+            create_if_absent: false,
         };
 
         // Fault before persistence: no candidate can have reached the remote.

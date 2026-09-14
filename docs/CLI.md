@@ -243,6 +243,23 @@ carries the new revision number, and an agent must carry it forward — the revi
 drafted against is not the revision it works against. Sealing an already-sealed plan
 is a conflict.
 
+`package changes` shows what a captured package changes relative to the base it
+was captured against: which files, and with `--patch`, the patch itself. The
+patch is absent by default because a release unit's diff can be large and the
+usual question is answered by the file list; when it is included and exceeds the
+size limit it is cut short and *says so*, rather than presenting a partial diff
+as a whole one. The package is an immutable bundle, so this reconstructs it into
+throwaway storage and asks Git — nothing is written where the package lives, and
+the reconstruction is verified against the manifest before it is trusted.
+
+`package checks` shows the checks that actually ran: the command, whether it
+passed, failed, or never returned, and its scrubbed output. Checks appear in two
+groups — at capture, in the package's own workspace, and at release, against
+each reconciled candidate, since reconciliation changes the parent commit and so
+the checks run again. A candidate result that no longer stands is kept with the
+reason it was invalidated rather than overwritten, so the history of what was
+verified against what stays answerable.
+
 `task cancel` is explicit and durable: it accepts a required human explanation,
 cancels a task that has not been published, blocks every dependent task, and
 invalidates affected validation evidence without deleting its audit trail. It

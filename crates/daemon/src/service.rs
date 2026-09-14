@@ -18,18 +18,18 @@ use reccursive_capture::{
     SnapshotRequest, WorkspaceError, WorkspaceRequest as CaptureWorkspaceRequest,
 };
 use reccursive_protocol::{
-    ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest, Command,
-    CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
-    EventSeverityView, EventView, FeatureId, FeatureStatusView, IdempotencyKey,
-    InitializeRepositoryRequest, IntegrationHealthView, MissedWindowView, PackageView, PlanView,
-    ProtocolValidationError, QueueAuditView, QueueExportView, QueueRecoveryIssueView,
-    QueueSummaryView, QueuedUnitState, QueuedUnitView, ReasonCode, ReleaseAttemptView,
-    ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryQueueView,
-    RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision,
-    ScheduleChangeView, SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView,
-    ScheduleUnitRequest, SetSchedulePolicyRequest, StateReason, SubmissionView,
-    TaskCancellationView, TaskProgressView, TaskStatus, TransportError, WorkspacePrerequisiteView,
-    WorkspaceView,
+    ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest, ChangedFileView,
+    CheckResultView, CheckResultsView, Command, CreateReleaseUnitRequest, CreateWorkspaceRequest,
+    DueUnitView, EnrollRepositoryRequest, EventSeverityView, EventView, FeatureId,
+    FeatureStatusView, IdempotencyKey, InitializeRepositoryRequest, IntegrationHealthView,
+    MissedWindowView, PackageChangesView, PackageView, PlanView, ProtocolValidationError,
+    QueueAuditView, QueueExportView, QueueRecoveryIssueView, QueueSummaryView, QueuedUnitState,
+    QueuedUnitView, ReasonCode, ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView,
+    RepositoryId, RepositoryPolicy, RepositoryQueueView, RepositoryView, RequestEnvelope,
+    RequestId, ResponseData, ResponseEnvelope, Revision, ScheduleChangeView, SchedulePolicyView,
+    ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest,
+    StateReason, SubmissionView, TaskCancellationView, TaskProgressView, TaskStatus,
+    TransportError, WorkspacePrerequisiteView, WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -612,6 +612,15 @@ fn dispatch(
             revision,
         } => get_feature_status(feature_id, revision, store),
         Command::SummarizeQueue { repository_id } => summarize_queue(repository_id, store),
+        Command::InspectPackageChanges {
+            package_id,
+            revision,
+            include_patch,
+        } => inspect_package_changes(package_id, revision, include_patch, store),
+        Command::ListCheckResults {
+            package_id,
+            revision,
+        } => list_check_results(package_id, revision, store),
         Command::ScheduleHistory { release_unit_id } => schedule_history(release_unit_id, store),
         Command::ReleasePackage(request) => {
             release_package(request, store, roots.managed, roots.release)
@@ -677,6 +686,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::SubmitTask(_) => "task.submit",
         Command::GetFeatureStatus { .. } => "feature.status",
         Command::SummarizeQueue { .. } => "queue.status",
+        Command::InspectPackageChanges { .. } => "package.changes",
+        Command::ListCheckResults { .. } => "package.checks",
         Command::ScheduleHistory { .. } => "schedule.history",
         Command::GetPlan { .. } => "plan.show",
         Command::PlanHistory { .. } => "plan.history",
@@ -1806,6 +1817,193 @@ fn seal_plan(feature_id: FeatureId, store: &Mutex<Store>) -> Result<ResponseData
         plan: PlanView {
             plan: sealed,
             created_at_unix_ms,
+        },
+    })
+}
+
+/// The largest patch the daemon will return.
+///
+/// A release unit is meant to be a reviewable amount of change, but nothing enforces that, and a
+/// generated file or a vendored dependency can make one enormous. Cutting the patch off and saying
+/// so is better than returning something too large to send or too large to read.
+const MAX_PATCH_BYTES: usize = 1_000_000;
+
+/// Reports what a captured package changes, relative to the base it was captured against.
+///
+/// The package is an immutable bundle rather than a working tree, so this reconstructs it into
+/// throwaway storage and asks Git. Nothing is written where the package lives, and the
+/// reconstruction is verified against the manifest before it is trusted — a package whose objects
+/// do not match what it claims is an error, not a diff.
+fn inspect_package_changes(
+    package_id: reccursive_protocol::PackageId,
+    revision: Revision,
+    include_patch: bool,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let record = lock_store(store)?
+        .snapshot(package_id, revision)
+        .map_err(store_api_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotFound,
+                format!(
+                    "snapshot package {package_id} revision {} was not found",
+                    revision.get()
+                ),
+                false,
+            )
+        })?;
+    let package = SnapshotPackage::open(record.path.clone()).map_err(snapshot_api_error)?;
+
+    let scratch = tempfile::tempdir()
+        .map_err(|error| ApiError::new(ApiErrorCode::Internal, error.to_string(), false))?;
+    let restored = scratch.path().join("package");
+    package.reconstruct(&restored).map_err(snapshot_api_error)?;
+
+    let base_tree = package.manifest.base_tree.clone();
+    let result_tree = package.manifest.result_tree.clone();
+    let names = git_capture(
+        &restored,
+        &["diff", "--name-status", &base_tree, &result_tree],
+    )?;
+    let files = names
+        .lines()
+        .filter_map(|line| {
+            let (change, path) = line.split_once('\t')?;
+            Some(ChangedFileView {
+                change: change.trim().to_owned(),
+                path: path.trim().to_owned(),
+            })
+        })
+        .collect();
+
+    let (patch, patch_truncated) = if include_patch {
+        let text = git_capture(&restored, &["diff", &base_tree, &result_tree])?;
+        if text.len() > MAX_PATCH_BYTES {
+            let mut cut = MAX_PATCH_BYTES;
+            while cut > 0 && !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            (Some(text[..cut].to_owned()), true)
+        } else {
+            (Some(text), false)
+        }
+    } else {
+        (None, false)
+    };
+
+    Ok(ResponseData::PackageChanges {
+        changes: PackageChangesView {
+            package_id,
+            revision,
+            base_commit: package.manifest.base_commit.clone(),
+            base_tree,
+            result_tree,
+            files,
+            patch,
+            patch_truncated,
+        },
+    })
+}
+
+/// Runs one read-only Git command in reconstructed package storage.
+fn git_capture(directory: &Path, arguments: &[&str]) -> Result<String, ApiError> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(arguments)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|error| {
+            ApiError::new(
+                ApiErrorCode::TemporarilyUnavailable,
+                format!("git could not be run: {error}"),
+                true,
+            )
+        })?;
+    if !output.status.success() {
+        return Err(ApiError::new(
+            ApiErrorCode::Internal,
+            format!(
+                "git {} failed: {}",
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            false,
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Reports every check recorded for one package, at capture and at release.
+fn list_check_results(
+    package_id: reccursive_protocol::PackageId,
+    revision: Revision,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let store = lock_store(store)?;
+    if store
+        .snapshot(package_id, revision)
+        .map_err(store_api_error)?
+        .is_none()
+    {
+        return Err(ApiError::new(
+            ApiErrorCode::NotFound,
+            format!(
+                "snapshot package {package_id} revision {} was not found",
+                revision.get()
+            ),
+            false,
+        ));
+    }
+
+    let at_capture = store
+        .validation_evidence(package_id, revision)
+        .map_err(store_api_error)?
+        .into_iter()
+        .map(|evidence| CheckResultView {
+            check_id: evidence.check_id,
+            command: evidence.command,
+            exit_code: evidence.exit_code,
+            timed_out: evidence.timed_out,
+            output_summary: evidence.output_summary,
+            executed_at_unix_ms: evidence.executed_at_unix_ms,
+            attempt_id: None,
+            base_commit: None,
+            invalidated_reason: None,
+        })
+        .collect();
+
+    // Candidate checks belong to attempts, so they are gathered per attempt, newest first.
+    let mut at_release = Vec::new();
+    for attempt in store
+        .release_attempts(Some(package_id), 100)
+        .map_err(store_api_error)?
+    {
+        for evidence in store
+            .candidate_validation_evidence(attempt.attempt_id)
+            .map_err(store_api_error)?
+        {
+            at_release.push(CheckResultView {
+                check_id: evidence.check_id,
+                command: evidence.command,
+                exit_code: evidence.exit_code,
+                timed_out: evidence.timed_out,
+                output_summary: evidence.output_summary,
+                executed_at_unix_ms: evidence.executed_at_unix_ms,
+                attempt_id: Some(evidence.attempt_id),
+                base_commit: Some(evidence.base_commit),
+                invalidated_reason: evidence.invalidated_reason,
+            });
+        }
+    }
+
+    Ok(ResponseData::CheckResults {
+        results: CheckResultsView {
+            package_id,
+            revision,
+            at_capture,
+            at_release,
         },
     })
 }

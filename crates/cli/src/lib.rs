@@ -539,17 +539,17 @@ enum GithubCommand {
     /// the process list and saved in shell history.
     SetToken {
         /// The repository the token belongs to.
-        repository_id: String,
+        repository_id: RepositoryId,
     },
     /// Report whether a token is stored, without printing it.
     Status {
         /// The repository to check.
-        repository_id: String,
+        repository_id: RepositoryId,
     },
     /// Remove a stored token.
     ForgetToken {
         /// The repository to remove the token for.
-        repository_id: String,
+        repository_id: RepositoryId,
     },
 }
 
@@ -1815,7 +1815,7 @@ fn run_github(
                     "could not read the token from standard input: {error}"
                 ))
             })?;
-            reccursive_github::storage::store(state_dir, &repository_id, token.trim())
+            reccursive_github::storage::store(state_dir, &repository_id.to_string(), token.trim())
                 .map_err(|error| refusal(error.to_string()))?;
             writeln!(
                 stdout,
@@ -1827,7 +1827,8 @@ fn run_github(
             .map_err(output_error)
         }
         GithubCommand::Status { repository_id } => {
-            let present = reccursive_github::storage::is_present(state_dir, &repository_id);
+            let present =
+                reccursive_github::storage::is_present(state_dir, &repository_id.to_string());
             writeln!(
                 stdout,
                 "{}",
@@ -1843,7 +1844,7 @@ fn run_github(
             .map_err(output_error)
         }
         GithubCommand::ForgetToken { repository_id } => {
-            reccursive_github::storage::forget(state_dir, &repository_id)
+            reccursive_github::storage::forget(state_dir, &repository_id.to_string())
                 .map_err(|error| refusal(error.to_string()))?;
             writeln!(
                 stdout,

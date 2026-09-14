@@ -585,10 +585,16 @@ impl ReleaseWorker {
         Ok(())
     }
 
-    /// Reports whether an attempt published to its repository's development branch.
+    /// Reports whether an attempt published somewhere other than its repository's target branch.
     ///
-    /// Read back from the attempt and the repository rather than passed down from `release`, so a
-    /// recovered attempt resolved after a restart reaches the same conclusion as the original run.
+    /// Asked of the branch the attempt durably recorded, not of the mode the repository is in
+    /// now. A recovered attempt is resolved long after the run that opened it, and the question
+    /// that matters — did the target branch receive this work — is answered by where the push
+    /// went. Reading the mode instead would let a policy changed in between turn a development
+    /// publication into a target one, and then a dependent waiting on `target_published` would be
+    /// released onto a target that does not contain its prerequisite. Where the two could
+    /// disagree this errs towards "not on the target", which holds dependents rather than
+    /// releasing them early.
     fn is_development_publication(
         &self,
         store: &Store,
@@ -597,10 +603,7 @@ impl ReleaseWorker {
         let Some(repository) = store.repository(attempt.repository_id)? else {
             return Ok(false);
         };
-        Ok(
-            repository.active_policy.publication_mode == PublicationMode::ImmediateAvailability
-                && repository.active_policy.development_target.as_ref() == Some(&attempt.target),
-        )
+        Ok(attempt.target != repository.active_policy.target)
     }
 
     /// Stops an attempt with a durable, machine-readable reason and blocks its tasks.

@@ -57,7 +57,14 @@ impl Store {
             fs::create_dir_all(parent)?;
         }
         let connection = Connection::open(path)?;
-        Self::initialize(connection)
+        let store = Self::initialize(connection)?;
+        // The database holds every repository path, plan, captured change and event this
+        // installation knows about. SQLite creates it with the process umask, which is usually
+        // world-readable, and the owner-only state directory above it is the only thing that has
+        // been protecting it — a directory someone could later move it out of. The write-ahead
+        // log and shared-memory files carry the same content, so they are restricted too.
+        restrict_to_owner(path)?;
+        Ok(store)
     }
 
     /// Opens an isolated in-memory database.
@@ -74,6 +81,14 @@ impl Store {
         backfill_remote_identities(&mut connection)?;
         Self::verify_integrity(&connection)?;
         Ok(Self { connection })
+    }
+
+    /// Re-applies owner-only permissions to the database and its sidecar files.
+    ///
+    /// Called again after opening because SQLite recreates `-wal` and `-shm` as it pleases, so a
+    /// permission set once at creation does not stay set.
+    pub fn restrict_permissions(path: impl AsRef<Path>) -> Result<(), StoreError> {
+        restrict_to_owner(path.as_ref())
     }
 
     /// Returns the schema version recorded in the open database.
@@ -221,6 +236,33 @@ pub enum StoreError {
     RestoreDestinationExists { path: PathBuf },
 }
 
+/// Restricts a database file and its write-ahead sidecars to their owner.
+///
+/// A missing sidecar is not an error: SQLite creates `-wal` and `-shm` only in WAL mode and
+/// removes them on a clean close, so their absence is the ordinary case rather than a fault.
+fn restrict_to_owner(path: &Path) -> Result<(), StoreError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for candidate in [
+        path.to_path_buf(),
+        append_suffix(path, "-wal"),
+        append_suffix(path, "-shm"),
+    ] {
+        match fs::set_permissions(&candidate, fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StoreError::from(error)),
+        }
+    }
+    Ok(())
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +276,49 @@ mod tests {
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .unwrap();
         assert!(enabled);
+    }
+
+    #[test]
+    fn the_database_and_its_write_ahead_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let mut store = Store::open(&path).unwrap();
+
+        // Write something, so the write-ahead log actually exists. SQLite creates it lazily, and
+        // checking permissions before any write would be checking a file that is not there yet.
+        store
+            .record_event(
+                &crate::NewEvent::new(
+                    1,
+                    crate::EventContext::default(),
+                    "test.event",
+                    crate::EventSeverity::Info,
+                    None,
+                    "a write to force the write-ahead log into existence",
+                    serde_json::Value::Null,
+                )
+                .unwrap(),
+                10,
+            )
+            .unwrap();
+
+        // The database holds every repository path, plan and captured change this installation
+        // knows about; the sidecars hold the same content mid-flight. SQLite creates all three
+        // with the process umask, which is usually world-readable.
+        for suffix in ["", "-wal", "-shm"] {
+            let candidate = append_suffix(&path, suffix);
+            if !candidate.exists() {
+                continue;
+            }
+            let mode = fs::metadata(&candidate).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "{} is readable by others (mode {mode:o})",
+                candidate.display()
+            );
+        }
     }
 }

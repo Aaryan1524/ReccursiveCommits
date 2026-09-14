@@ -65,10 +65,32 @@ impl fmt::Display for IdempotencyKey {
     }
 }
 
-/// Installation-scoped credential. Debug output is always redacted.
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+/// Installation-scoped credential. Debug output is always redacted, and comparison does not
+/// reveal how much of a wrong token was right.
+///
+/// The socket is owner-only, so anyone able to reach it is already the same user and a timing
+/// side-channel buys them little. That is an argument for not worrying, not an argument for a
+/// comparison that returns early — the cost of the constant-time one is a few nanoseconds on a
+/// path that runs once per request.
+#[derive(Clone, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AuthToken(String);
+
+impl PartialEq for AuthToken {
+    fn eq(&self, other: &Self) -> bool {
+        let mine = self.0.as_bytes();
+        let theirs = other.0.as_bytes();
+        // Length is not secret — it is bounded and visible in the request — but the contents are,
+        // so every byte is examined even once a difference is known.
+        if mine.len() != theirs.len() {
+            return false;
+        }
+        mine.iter()
+            .zip(theirs)
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            == 0
+    }
+}
 
 impl AuthToken {
     pub fn new(value: impl Into<String>) -> Result<Self, ProtocolValidationError> {
@@ -1838,6 +1860,24 @@ mod tests {
             }
             .may_reach_remote()
         );
+    }
+
+    #[test]
+    fn auth_tokens_compare_by_value_and_never_print_themselves() {
+        // "z" rather than a letter appearing in "AuthToken", so the redaction check cannot pass
+        // or fail on a coincidence between the secret and the type name.
+        let token = AuthToken::new("z".repeat(40)).unwrap();
+        let same = AuthToken::new("z".repeat(40)).unwrap();
+        let different = AuthToken::new(format!("{}x", "z".repeat(39))).unwrap();
+        let shorter = AuthToken::new("z".repeat(39)).unwrap();
+        assert_eq!(token, same);
+        assert_ne!(token, different);
+        assert_ne!(token, shorter);
+
+        // A credential that prints itself ends up in a log, an event, or a bug report.
+        let rendered = format!("{token:?}");
+        assert!(!rendered.contains('z'), "{rendered}");
+        assert_eq!(rendered, "AuthToken(<redacted>)");
     }
 
     #[test]

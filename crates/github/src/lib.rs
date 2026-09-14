@@ -72,7 +72,11 @@ impl RepositorySlug {
         let remainder = remainder.strip_suffix(".git").unwrap_or(remainder);
         let remainder = remainder.trim_end_matches('/');
         let (owner, repository) = remainder.split_once('/')?;
-        if owner.is_empty() || repository.is_empty() || repository.contains('/') {
+        // Both halves are interpolated straight into a request path, so anything that is not a
+        // GitHub name is refused rather than sent. `..` is the one that matters: an owner of `..`
+        // would make `/repos/../x/pulls`, which curl normalises into a different endpoint
+        // entirely — so a remote URL someone else chose could redirect the request.
+        if !is_github_name(owner) || !is_github_name(repository) {
             return None;
         }
         Some(Self {
@@ -80,6 +84,21 @@ impl RepositorySlug {
             repository: repository.to_owned(),
         })
     }
+}
+
+/// Reports whether a string is usable as a GitHub owner or repository name.
+///
+/// Deliberately narrower than whatever GitHub currently accepts. Being too strict refuses a
+/// request that would have worked and says so; being too loose puts an attacker-chosen string
+/// into a URL path.
+fn is_github_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 /// One pull request, as much of it as this product has any business knowing.
@@ -427,6 +446,13 @@ mod tests {
             "https://github.com/",
             "https://github.com/only-an-owner",
             "https://notgithub.com/owner/project.git",
+            // Both halves are interpolated into a request path. An owner of `..` would make
+            // `/repos/../x/pulls`, which curl normalises into an endpoint nobody chose.
+            "https://github.com/../project.git",
+            "https://github.com/owner/...git",
+            "https://github.com/owner/pro ject.git",
+            "https://github.com/ow%2fner/project.git",
+            "https://github.com/owner/project?x=1",
         ] {
             assert_eq!(RepositorySlug::from_remote(remote), None, "{remote}");
         }

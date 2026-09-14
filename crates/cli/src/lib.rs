@@ -9,8 +9,9 @@ use std::{
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use install::{InstallError, ServiceInstallation};
 use reccursive_protocol::{
-    ApiError, ApiErrorCode, CancelTaskRequest, CapturePackageRequest, CheckResultsView, Command,
-    CreateReleaseUnitRequest, CreateWorkspaceRequest, DueUnitView, EnrollRepositoryRequest,
+    ApiError, ApiErrorCode, CancelTaskRequest, CapturePackageRequest,
+    ChangeRepositoryPolicyRequest, CheckResultsView, Command, CreateReleaseUnitRequest,
+    CreateWorkspaceRequest, DevelopmentTargetChange, DueUnitView, EnrollRepositoryRequest,
     EventSeverityView, EventView, FeatureId, FeaturePlan, IdempotencyKey, IntegrationHealthView,
     LocalClient, PackageChangesView, PackageId, PackageView, PlanView, PublicationMode,
     QueueAuditView, QueueExportView, QueueSummaryView, QueuedUnitState, ReleaseAttemptView,
@@ -157,6 +158,8 @@ enum TopLevelCommand {
     Integrations,
     /// Check whether credentials and signing would let a repository publish right now.
     Diagnose { repository_id: RepositoryId },
+    /// Explain what does and does not decide whether published work counts as a contribution.
+    Contributions { repository_id: RepositoryId },
     /// Write a shareable diagnostic report, leaving the queue untouched.
     Diagnostics {
         #[command(subcommand)]
@@ -501,6 +504,29 @@ enum RepositoryCommand {
         #[arg(long, value_enum, default_value = "direct-push")]
         integration: TargetIntegrationArgument,
     },
+    /// Change where or how an enrolled repository publishes.
+    ///
+    /// Only what you name changes. The change is refused, with the reason, if anything is
+    /// mid-publication under the old policy.
+    SetPolicy {
+        /// The repository to change.
+        repository_id: RepositoryId,
+        /// New publication behavior.
+        #[arg(long, value_enum)]
+        mode: Option<PublicationModeArgument>,
+        /// New target branch.
+        #[arg(long)]
+        target: Option<String>,
+        /// New development branch.
+        #[arg(long, conflicts_with = "no_development_target")]
+        development_target: Option<String>,
+        /// Remove the development branch.
+        #[arg(long)]
+        no_development_target: bool,
+        /// New way of reaching the target.
+        #[arg(long, value_enum)]
+        integration: Option<TargetIntegrationArgument>,
+    },
     /// List registered repositories.
     List,
 }
@@ -714,6 +740,10 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
             }
         },
         TopLevelCommand::Doctor => doctor(&session, cli.json, stdout),
+        TopLevelCommand::Contributions { repository_id } => {
+            let data = send(&session, Command::ListRepositories)?;
+            output_contributions(stdout, repository_id, data)
+        }
         TopLevelCommand::Diagnose { repository_id } => {
             let data = send(&session, Command::DiagnoseRepository { repository_id })?;
             output_data(data, cli.json, stdout)
@@ -1113,6 +1143,38 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
         },
         TopLevelCommand::Github { command } => run_github(command, &session.state_dir, stdout),
         TopLevelCommand::Repository { command } => match command {
+            RepositoryCommand::SetPolicy {
+                repository_id,
+                mode,
+                target,
+                development_target,
+                no_development_target,
+                integration,
+            } => {
+                let request = ChangeRepositoryPolicyRequest {
+                    repository_id,
+                    publication_mode: mode.map(|mode| match mode {
+                        PublicationModeArgument::Scheduled => PublicationMode::ScheduledCreation,
+                        PublicationModeArgument::Immediate => {
+                            PublicationMode::ImmediateAvailability
+                        }
+                    }),
+                    target: target.as_deref().map(branch_ref).transpose()?,
+                    // Absent means "leave it alone", so removing a branch has to be said out loud
+                    // rather than implied by omitting the flag.
+                    development_target: match (no_development_target, &development_target) {
+                        (true, _) => DevelopmentTargetChange::Remove,
+                        (false, Some(branch)) => DevelopmentTargetChange::Set(branch_ref(branch)?),
+                        (false, None) => DevelopmentTargetChange::Keep,
+                    },
+                    target_integration: integration.map(|integration| match integration {
+                        TargetIntegrationArgument::DirectPush => TargetIntegration::DirectPush,
+                        TargetIntegrationArgument::PullRequest => TargetIntegration::PullRequest,
+                    }),
+                };
+                let data = send(&session, Command::ChangeRepositoryPolicy(request))?;
+                output_data(data, cli.json, stdout)
+            }
             RepositoryCommand::List => {
                 let data = send(&session, Command::ListRepositories)?;
                 output_data(data, cli.json, stdout)
@@ -1641,6 +1703,103 @@ fn api_failure(error: ApiError) -> CliFailure {
 /// Handled entirely in the CLI, against the same state directory the service uses. The token never
 /// crosses the local API in either direction: the fewer places a secret travels, the fewer places
 /// it can be logged, cached, or exported by accident.
+/// Explains what this machine actually controls about a contribution, and what it does not.
+///
+/// The point of this command is a refusal: it will not tell you that scheduling a push for a date
+/// makes a green square on that date. Those are different things, decided by different systems,
+/// and a tool that blurred them would be selling a promise it cannot keep. So it reports the facts
+/// it can establish locally — the identity commits will carry, the branch they will land on, and
+/// which date Git will record — and names the conditions it cannot check from here, rather than
+/// guessing at them.
+fn output_contributions(
+    out: &mut impl Write,
+    repository_id: RepositoryId,
+    data: ResponseData,
+) -> Result<(), CliFailure> {
+    let ResponseData::Repositories { repositories } = data else {
+        return Err(CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "unexpected_response",
+            "the service did not return the repository list",
+        ));
+    };
+    let repository = repositories
+        .into_iter()
+        .find(|candidate| candidate.id == repository_id)
+        .ok_or_else(|| {
+            CliFailure::new(
+                EXIT_ACTION_REQUIRED,
+                "repository_missing",
+                format!("{repository_id} is not enrolled"),
+            )
+        })?;
+
+    let identity = setup::checkout_identity(std::path::Path::new(&repository.checkout_path));
+    writeln!(out, "Contributions for {repository_id}\n").map_err(output_error)?;
+
+    writeln!(out, "What this machine decides:").map_err(output_error)?;
+    match &identity {
+        Some((name, email)) => writeln!(
+            out,
+            "  author      {name} <{email}>\n\
+             \x20             read from the checkout; every commit published from here carries it",
+        ),
+        None => writeln!(
+            out,
+            "  author      not configured\n\
+             \x20             nothing can be published until the checkout has user.name and \
+             user.email"
+        ),
+    }
+    .map_err(output_error)?;
+    writeln!(
+        out,
+        "  branch      {}{}",
+        repository.target.as_str(),
+        match &repository.development_target {
+            Some(development) => format!(
+                "\n              work reaches {} first; only the target above is the \
+                 destination that finishes it",
+                development.as_str()
+            ),
+            None => String::new(),
+        }
+    )
+    .map_err(output_error)?;
+    writeln!(
+        out,
+        "  date        the commit is created at its release time, so the author date and the \
+         push are the same moment\n\
+         \x20             no commit is backdated, and none is invented to fill a day"
+    )
+    .map_err(output_error)?;
+
+    writeln!(
+        out,
+        "\nWhat GitHub decides, and this cannot check from here:\n\
+         \x20 - whether {} is linked to your GitHub account\n\
+         \x20 - whether {} is that repository's default branch\n\
+         \x20 - whether the repository is a fork, and whether private contributions are shown\n\
+         \x20 - how its own rules count a commit on any given day\n\
+         \x20\n\
+         \x20 These are GitHub's rules and they change without notice. Read them at\n\
+         \x20 https://docs.github.com/account-and-profile rather than trusting a summary here.",
+        identity
+            .as_ref()
+            .map_or("your commit email", |(_, email)| email.as_str()),
+        repository.target.as_str(),
+    )
+    .map_err(output_error)?;
+
+    // The sentence this whole command exists to say.
+    writeln!(
+        out,
+        "\nA release time is when this service will publish. It is not a promise about your\n\
+         contribution graph, and nothing here treats the two as the same thing."
+    )
+    .map_err(output_error)
+}
+
 fn run_github(
     command: GithubCommand,
     state_dir: &std::path::Path,
@@ -2389,6 +2548,37 @@ fn output_data(
                 "repositories"
             }
         ),
+        ResponseData::RepositoryPolicyChanged { change } => {
+            writeln!(
+                out,
+                "Updated {} to policy revision {}\nMode: {:?}\nTarget: {}\nDevelopment: {}\nIntegration: {:?}",
+                change.repository_id,
+                change.policy_revision.get(),
+                change.publication_mode,
+                change.target.as_str(),
+                change
+                    .development_target
+                    .as_ref()
+                    .map_or("none", |branch| branch.as_str()),
+                change.target_integration,
+            )
+            .map_err(output_error)?;
+            // A withdrawn time is the part a reader has to know about: their work has not been
+            // cancelled, but the time they were told to expect is no longer the time.
+            if !change.withdrawn.is_empty() {
+                writeln!(
+                    out,
+                    "\nRelease times withdrawn, because they were chosen under the old policy.\n\
+                     Each unit is scheduled again from the new one; nothing was published in \
+                     between and nothing was duplicated:"
+                )
+                .map_err(output_error)?;
+                for unit in &change.withdrawn {
+                    writeln!(out, "  {unit}").map_err(output_error)?;
+                }
+            }
+            Ok(())
+        }
         ResponseData::RepositoryEnrolled { repository } => {
             writeln!(
                 out,

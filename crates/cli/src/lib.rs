@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
@@ -1142,10 +1142,11 @@ fn queue_watch(
         .map(|seconds| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
     loop {
         let data = send(session, Command::SummarizeQueue { repository_id })?;
-        if !json_output {
-            // Clear and home, so a terminal shows one queue that updates rather than a transcript.
-            // Harmless when redirected: it is two escape sequences, not a full-screen mode, and
-            // nothing here requires a TUI or a mouse.
+        // Clear and home, so a terminal shows one queue that updates rather than a transcript.
+        // Only when a terminal is actually there: piping a watch into a file or another program
+        // should produce readable text, not control characters someone has to strip. Nothing here
+        // is a full-screen mode, and nothing requires a mouse.
+        if !json_output && io::stdout().is_terminal() {
             let _ = write!(out, "\x1b[2J\x1b[H");
         }
         match output_data(data, json_output, out) {

@@ -48,5 +48,6 @@ jobs:
       - run: ./tests/scenarios/phase8_queue_and_watch.sh
       - run: ./tests/scenarios/phase8_unit_inspection.sh
       - run: ./tests/scenarios/phase8_diagnostics_and_controls.sh
+      - run: ./tests/scenarios/phase8_terminal_journeys.sh
       - run: ./tests/scenarios/phase6_codex_integration.sh
       - run: ./tests/scenarios/phase6_agent_publication.sh

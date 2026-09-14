@@ -511,6 +511,7 @@ name = "reccursive-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "reccursive-github",
  "reccursive-protocol",
  "serde",
  "serde_json",
@@ -537,6 +538,7 @@ dependencies = [
  "reccursive-capture",
  "reccursive-core",
  "reccursive-git",
+ "reccursive-github",
  "reccursive-protocol",
  "reccursive-store",
  "serde",
@@ -554,6 +556,17 @@ version = "0.1.0"
 dependencies = [
  "reccursive-capture",
  "reccursive-core",
+ "tempfile",
+ "thiserror",
+ "wait-timeout",
+]
+
+[[package]]
+name = "reccursive-github"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "wait-timeout",

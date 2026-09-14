@@ -315,6 +315,17 @@ Every classification the release worker can record has an action, and that is
 enforced rather than maintained: `ReleaseFailure` is an enum and the mapping
 matches on it exhaustively, so a new failure without guidance does not compile.
 
+`github set-token REPOSITORY` stores the GitHub token the pull-request strategy
+uses, read from **standard input** — an argument would be visible in the process
+list and saved in your shell history. It is written owner-only beside the
+service's own credentials, and it never crosses the local API in either
+direction: `github status` says whether one is stored, never what it is, and
+`github forget-token` removes it. Revoke it on GitHub as well.
+
+Only repositories enrolled with `--integration pull-request` use a token at all.
+Direct push, which is the default, needs nothing configured. See
+[PUBLICATION.md](PUBLICATION.md) for the difference.
+
 `diagnostics export DIRECTORY` writes a shareable report: service status,
 repositories, the queue, integration health, and recent events. Everything in it
 is read back through the ordinary local API, which is what makes it safe to

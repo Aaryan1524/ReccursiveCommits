@@ -15,6 +15,24 @@ pub enum PublicationMode {
     ImmediateAvailability,
 }
 
+/// How finished work reaches the target branch.
+///
+/// Orthogonal to `PublicationMode`, which decides *when* and *where first*. This decides what
+/// happens at the moment the target is supposed to receive the work: a push, or a pull request
+/// somebody reviews and merges themselves.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetIntegration {
+    /// Push straight to the target, using the Git credentials already in use.
+    #[default]
+    DirectPush,
+    /// Push to a branch and open a pull request against the target.
+    ///
+    /// The pull request is opened automatically; it is never merged automatically. Merging is
+    /// authority over what lands on a main branch, and this product does not take it.
+    PullRequest,
+}
+
 /// A milestone a dependency must reach before its dependent becomes eligible.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +102,8 @@ pub struct RepositoryPolicy {
     pub publication_mode: PublicationMode,
     pub target: TargetRef,
     pub development_target: Option<TargetRef>,
+    /// How the target is reached. Defaults to a direct push, which needs nothing configured.
+    pub target_integration: TargetIntegration,
 }
 
 impl RepositoryPolicy {
@@ -112,7 +132,28 @@ impl RepositoryPolicy {
             publication_mode,
             target,
             development_target,
+            target_integration: TargetIntegration::DirectPush,
         })
+    }
+
+    /// Chooses how the target is reached.
+    ///
+    /// A builder rather than a sixth argument to `new`, because direct push is what almost every
+    /// repository wants and a caller that does not care should not have to say so.
+    /// A pull request needs a branch to come from, and immediate mode is what produces one.
+    /// Rather than inventing a second branch scheme that would need its own lifecycle, the
+    /// pull-request strategy reuses the development branch the repository already publishes to.
+    pub fn with_target_integration(
+        mut self,
+        target_integration: TargetIntegration,
+    ) -> Result<Self, PolicyError> {
+        if target_integration == TargetIntegration::PullRequest
+            && self.publication_mode != PublicationMode::ImmediateAvailability
+        {
+            return Err(PolicyError::PullRequestNeedsDevelopmentBranch);
+        }
+        self.target_integration = target_integration;
+        Ok(self)
     }
 
     #[must_use]
@@ -165,6 +206,11 @@ pub enum PolicyError {
     MissingDevelopmentTarget,
     #[error("development and final targets must be different branches")]
     TargetsMustDiffer,
+    #[error(
+        "the pull-request strategy needs a development branch to open the request from; \
+         enrol with --mode immediate --development-target <branch>"
+    )]
+    PullRequestNeedsDevelopmentBranch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -179,6 +225,65 @@ mod tests {
 
     fn main_target() -> TargetRef {
         TargetRef::new("refs/heads/main").unwrap()
+    }
+
+    #[test]
+    fn a_pull_request_strategy_requires_a_branch_to_open_the_request_from() {
+        let target = TargetRef::new("refs/heads/main").unwrap();
+        let scheduled = RepositoryPolicy::new(
+            RepositoryId::new(),
+            Revision::FIRST,
+            PublicationMode::ScheduledCreation,
+            target.clone(),
+            None,
+        )
+        .unwrap();
+        // A pull request has to come from somewhere. Scheduled mode publishes straight to the
+        // target and never creates a branch, so there would be nothing to open a request from.
+        assert_eq!(
+            scheduled
+                .clone()
+                .with_target_integration(TargetIntegration::PullRequest)
+                .unwrap_err(),
+            PolicyError::PullRequestNeedsDevelopmentBranch
+        );
+        // Direct push stays available to it, which is the default anyway.
+        assert!(
+            scheduled
+                .with_target_integration(TargetIntegration::DirectPush)
+                .is_ok()
+        );
+
+        let immediate = RepositoryPolicy::new(
+            RepositoryId::new(),
+            Revision::FIRST,
+            PublicationMode::ImmediateAvailability,
+            target,
+            Some(TargetRef::new("refs/heads/development").unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            immediate
+                .with_target_integration(TargetIntegration::PullRequest)
+                .unwrap()
+                .target_integration,
+            TargetIntegration::PullRequest
+        );
+    }
+
+    #[test]
+    fn a_policy_publishes_by_direct_push_unless_it_says_otherwise() {
+        // The default matters: it is what every repository enrolled before this existed means,
+        // and it is the strategy that needs no token and no GitHub.
+        let policy = RepositoryPolicy::new(
+            RepositoryId::new(),
+            Revision::FIRST,
+            PublicationMode::ScheduledCreation,
+            TargetRef::new("refs/heads/main").unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(policy.target_integration, TargetIntegration::DirectPush);
     }
 
     #[test]

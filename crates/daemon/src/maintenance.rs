@@ -19,6 +19,21 @@ use std::{
 
 use reccursive_store::{Store, StoreError};
 
+/// How long one GitHub request may take before it is abandoned.
+///
+/// Generous, because a slow answer is still an answer and re-asking costs a rate limit; bounded,
+/// because a maintenance pass that blocks forever stops every other repository behind it.
+const GITHUB_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The branch name GitHub wants, from the ref this product stores.
+fn branch_name(target: &reccursive_core::TargetRef) -> String {
+    target
+        .as_str()
+        .strip_prefix("refs/heads/")
+        .unwrap_or(target.as_str())
+        .to_owned()
+}
+
 use crate::lifecycle::{TimeTransition, WakeDetector};
 
 /// A shutdown request that every long-running part of the daemon can observe.
@@ -285,6 +300,263 @@ impl Maintenance {
         Ok(scheduled)
     }
 
+    /// Opens a pull request for work that is due to reach the target and cannot be pushed there.
+    ///
+    /// The pull-request strategy publishes early to a development branch exactly as immediate mode
+    /// always does; what changes is the integration. Instead of pushing to the target, the service
+    /// asks GitHub to open a request against it, and then stops. Nothing here merges, and there is
+    /// no code path that could: merging is authority over what lands on a main branch.
+    ///
+    /// Opening is claim-before-execute like the rest of the queue. A process that opened a pull
+    /// request and died before recording it finds the existing one instead of opening a second,
+    /// which is why `AlreadyExists` is recovered from rather than reported.
+    pub fn open_pending_pull_requests(
+        &self,
+        store: &mut Store,
+        state_dir: &std::path::Path,
+        endpoint: &reccursive_github::Endpoint,
+        now_unix_ms: i64,
+    ) -> Result<usize, StoreError> {
+        let mut opened = 0;
+        for repository in store.repositories()? {
+            if self.shutdown.is_requested() {
+                return Ok(opened);
+            }
+            if repository.active_policy.target_integration
+                != reccursive_core::TargetIntegration::PullRequest
+            {
+                continue;
+            }
+            let repository_id = repository.registration.id;
+            // Pausing governs what is started, and opening a pull request starts something.
+            if store.repository_pause(repository_id)?.is_some() {
+                continue;
+            }
+            let Some(development_target) = repository.active_policy.development_target.clone()
+            else {
+                continue;
+            };
+            let Some(slug) = reccursive_github::RepositorySlug::from_remote(
+                &repository.registration.canonical_remote,
+            ) else {
+                self.report_pull_request_problem(
+                    store,
+                    repository_id,
+                    "github_remote_unrecognised",
+                    "this repository's remote is not a GitHub URL, so no pull request can be \
+                     opened for it; publish by direct push instead",
+                    now_unix_ms,
+                )?;
+                continue;
+            };
+            let token =
+                match reccursive_github::storage::load(state_dir, &repository_id.to_string()) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        self.report_pull_request_problem(
+                            store,
+                            repository_id,
+                            "github_token_unavailable",
+                            &format!("{error}; run: reccursive github set-token {repository_id}"),
+                            now_unix_ms,
+                        )?;
+                        continue;
+                    }
+                };
+            let client =
+                reccursive_github::GitHubClient::new(endpoint.clone(), token, GITHUB_TIMEOUT);
+
+            for slot in store.overdue_schedule_slots(repository_id, now_unix_ms)? {
+                if self.shutdown.is_requested() {
+                    return Ok(opened);
+                }
+                // Only the integration half is a pull request. Work that has not reached the
+                // development branch yet is an ordinary publication and belongs to the worker.
+                if !store.package_published_to(
+                    slot.package_id,
+                    slot.package_revision,
+                    &development_target,
+                )? {
+                    continue;
+                }
+                if store.pull_request(slot.release_unit_id)?.is_some() {
+                    continue;
+                }
+                let head = branch_name(&development_target);
+                let base = branch_name(&repository.active_policy.target);
+                let title = self.pull_request_title(store, slot.release_unit_id)?;
+                let body = "Opened by reccursive at its scheduled release time.\n\n\
+                            This pull request is not merged automatically, now or ever. \
+                            Review and merge it yourself when you are ready.";
+
+                let outcome = match client.create_pull_request(&slug, &head, &base, &title, body) {
+                    Ok(pull_request) => Some(pull_request),
+                    // Already open: a previous run created it and did not get to record it. The
+                    // existing one is adopted rather than a second one opened.
+                    Err(reccursive_github::GitHubError::AlreadyExists) => client
+                        .find_open_pull_request(&slug, &slug.owner, &head)
+                        .ok()
+                        .flatten(),
+                    Err(error) => {
+                        self.report_pull_request_problem(
+                            store,
+                            repository_id,
+                            if error.is_worth_retrying() {
+                                "github_unavailable"
+                            } else {
+                                "github_refused"
+                            },
+                            &error.to_string(),
+                            now_unix_ms,
+                        )?;
+                        None
+                    }
+                };
+                let Some(pull_request) = outcome else {
+                    continue;
+                };
+
+                store.record_pull_request(&reccursive_store::PullRequestRecord {
+                    release_unit_id: slot.release_unit_id,
+                    repository_id,
+                    package_id: slot.package_id,
+                    package_revision: slot.package_revision,
+                    number: pull_request.number,
+                    url: pull_request.url.clone(),
+                    head: development_target.clone(),
+                    base: repository.active_policy.target.clone(),
+                    state: pull_request.state.clone(),
+                    merged_at_unix_ms: None,
+                    observed_at_unix_ms: now_unix_ms,
+                    created_at_unix_ms: now_unix_ms,
+                })?;
+                // The selection has done its job. Withdrawing it returns the unit to the queue,
+                // where it waits on the pull request rather than on a release time.
+                store.invalidate_schedule_slot(
+                    slot.release_unit_id,
+                    "a pull request was opened for this work",
+                    now_unix_ms,
+                )?;
+                opened += 1;
+            }
+        }
+        Ok(opened)
+    }
+
+    /// Asks GitHub what became of the pull requests this service opened.
+    ///
+    /// A merged pull request is the only thing that makes a task published under this strategy,
+    /// and it is always somebody else's doing. Closed-without-merge is left as it is: the work is
+    /// still captured, and deciding what to do with a rejected change is not automation's call.
+    pub fn observe_pull_requests(
+        &self,
+        store: &mut Store,
+        state_dir: &std::path::Path,
+        endpoint: &reccursive_github::Endpoint,
+        now_unix_ms: i64,
+    ) -> Result<usize, StoreError> {
+        let mut merged = 0;
+        for record in store.open_pull_requests()? {
+            if self.shutdown.is_requested() {
+                return Ok(merged);
+            }
+            let Some(repository) = store.repository(record.repository_id)? else {
+                continue;
+            };
+            let Some(slug) = reccursive_github::RepositorySlug::from_remote(
+                &repository.registration.canonical_remote,
+            ) else {
+                continue;
+            };
+            let Ok(token) =
+                reccursive_github::storage::load(state_dir, &record.repository_id.to_string())
+            else {
+                continue;
+            };
+            let client =
+                reccursive_github::GitHubClient::new(endpoint.clone(), token, GITHUB_TIMEOUT);
+            let Ok(observed) = client.pull_request(&slug, record.number) else {
+                continue;
+            };
+            store.observe_pull_request(
+                record.release_unit_id,
+                &observed.state,
+                observed.merged,
+                now_unix_ms,
+            )?;
+            if !observed.merged {
+                continue;
+            }
+            // Merged means the target now carries this work, which is exactly what `Published`
+            // asserts. Nothing else in this strategy may set it.
+            if let Some(unit) = store.release_unit(record.release_unit_id)? {
+                for task_id in &unit.task_ids {
+                    store.advance_task_to(
+                        unit.feature_id,
+                        unit.plan_revision,
+                        *task_id,
+                        reccursive_core::TaskStatus::Published,
+                        now_unix_ms,
+                    )?;
+                }
+            }
+            merged += 1;
+        }
+        Ok(merged)
+    }
+
+    /// Names a pull request after the work it delivers, rather than after an identifier.
+    fn pull_request_title(
+        &self,
+        store: &Store,
+        release_unit_id: reccursive_core::ReleaseUnitId,
+    ) -> Result<String, StoreError> {
+        let Some(unit) = store.release_unit(release_unit_id)? else {
+            return Ok("Scheduled change".to_owned());
+        };
+        let names: Vec<String> = unit
+            .task_ids
+            .iter()
+            .filter_map(|task_id| {
+                store
+                    .task(unit.feature_id, unit.plan_revision, *task_id)
+                    .ok()
+                    .flatten()
+                    .map(|task| task.name)
+            })
+            .collect();
+        Ok(if names.is_empty() {
+            "Scheduled change".to_owned()
+        } else {
+            names.join(", ")
+        })
+    }
+
+    /// Records why a pull request could not be opened, where a person will actually find it.
+    fn report_pull_request_problem(
+        &self,
+        store: &mut Store,
+        repository_id: reccursive_core::RepositoryId,
+        kind: &str,
+        detail: &str,
+        now_unix_ms: i64,
+    ) -> Result<(), StoreError> {
+        let event = reccursive_store::NewEvent::new(
+            now_unix_ms,
+            reccursive_store::EventContext {
+                repository_id: Some(repository_id),
+                ..reccursive_store::EventContext::default()
+            },
+            kind,
+            reccursive_store::EventSeverity::Warning,
+            None,
+            detail,
+            serde_json::Value::Null,
+        )?;
+        store.record_event(&event, reccursive_store::DEFAULT_EVENT_RETENTION)?;
+        Ok(())
+    }
+
     /// Publishes every unit whose selected time has arrived.
     ///
     /// This is what makes a schedule mean anything without someone at the keyboard: the pass that
@@ -311,6 +583,22 @@ impl Maintenance {
             let Some(repository) = store.repository(unit.repository_id)? else {
                 continue;
             };
+            // Under the pull-request strategy the integration is a request somebody merges, not a
+            // push. Handing this unit to the worker would push it to the target and bypass the
+            // pull request entirely — the exact thing the strategy was chosen to prevent. The
+            // early publication to the development branch is still an ordinary push, so only work
+            // that has already reached that branch is withheld.
+            if repository.active_policy.target_integration
+                == reccursive_core::TargetIntegration::PullRequest
+                && let Some(development_target) = &repository.active_policy.development_target
+                && store.package_published_to(
+                    unit.package_id,
+                    unit.package_revision,
+                    development_target,
+                )?
+            {
+                continue;
+            }
             // No identity configured means no commit can be attributed. Refusing is the only
             // honest option: inventing an author would put a name on work it did not do.
             let Some(attribution) = ReleaseAttribution::from_checkout(std::path::Path::new(

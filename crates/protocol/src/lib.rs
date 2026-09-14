@@ -8,14 +8,15 @@ pub use reccursive_core::{
     AcceptanceCheck, AttemptId, ConnectivityFault, EventId, FeatureId, FeaturePlan, Integration,
     PLAN_SCHEMA_VERSION, PackageId, PlanPhase, PlanTask, PublicationMode, ReasonCode,
     ReleaseUnitId, RepositoryId, RepositoryPolicy, RequestId, Revision, SchedulePolicy,
-    SchedulePolicyOverride, StateReason, TargetMilestone, TargetRef, TaskId, TaskStatus,
+    SchedulePolicyOverride, StateReason, TargetIntegration, TargetMilestone, TargetRef, TaskId,
+    TaskStatus,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
 /// Local API protocol version. Version 16 adds package change inspection and check results.
-pub const API_VERSION: u16 = 17;
+pub const API_VERSION: u16 = 18;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -631,6 +632,9 @@ pub struct EnrollRepositoryRequest {
     pub publication_mode: PublicationMode,
     pub target: TargetRef,
     pub development_target: Option<TargetRef>,
+    /// How the target is reached. Absent means a direct push, which needs nothing configured.
+    #[serde(default)]
+    pub target_integration: TargetIntegration,
 }
 
 /// Validated inputs needed to make a repository ready to accept scheduled work.
@@ -698,6 +702,7 @@ pub struct RepositoryView {
     pub publication_mode: PublicationMode,
     pub target: TargetRef,
     pub development_target: Option<TargetRef>,
+    pub target_integration: TargetIntegration,
 }
 
 /// Severity attached to a diagnostic event.
@@ -1071,6 +1076,11 @@ pub enum QueuedUnitState {
     Blocked,
     /// Withdrawn from the target; it will not be published.
     Cancelled,
+    /// A pull request is open against the target and waiting for a person to merge it.
+    ///
+    /// Terminal as far as this product is concerned. Nothing here merges, so a unit sits in this
+    /// state until somebody decides it should land — which is the entire point of the strategy.
+    AwaitingMerge,
     /// On a development branch and visible to others, but not yet on the target.
     ///
     /// Distinct from `Ready` on purpose. Both are waiting to be scheduled for the target, but one
@@ -1112,6 +1122,19 @@ pub struct QueuedUnitView {
     pub last_schedule_change: Option<String>,
     /// Branches this unit's work has already reached, newest first.
     pub published_to: Vec<PublicationView>,
+    /// The pull request opened for this unit, when the repository publishes that way.
+    pub pull_request: Option<PullRequestView>,
+}
+
+/// A pull request this service opened, as a reader needs to see it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PullRequestView {
+    pub number: u64,
+    /// Where a person opens it to review and merge it.
+    pub url: String,
+    pub state: String,
+    /// When it was observed to have been merged. Only ever an observation: nothing here merges.
+    pub merged_at_unix_ms: Option<i64>,
 }
 
 /// Queued work across one repository.
@@ -1595,6 +1618,7 @@ mod tests {
     fn enrollment_rejects_credentials_and_invalid_mode_targets() {
         let target = TargetRef::new("refs/heads/main").unwrap();
         let credentials = EnrollRepositoryRequest {
+            target_integration: TargetIntegration::DirectPush,
             checkout_path: "/tmp/repo".into(),
             canonical_remote: "https://user:secret@example.invalid/repo.git".into(),
             publication_mode: PublicationMode::ScheduledCreation,
@@ -1607,6 +1631,7 @@ mod tests {
         );
 
         let missing_development = EnrollRepositoryRequest {
+            target_integration: TargetIntegration::DirectPush,
             checkout_path: "/tmp/repo".into(),
             canonical_remote: "git@example.invalid:repo.git".into(),
             publication_mode: PublicationMode::ImmediateAvailability,

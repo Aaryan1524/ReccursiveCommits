@@ -17,8 +17,8 @@ use reccursive_protocol::{
     ReleasePackageRequest, ReleaseUnitId, ReleaseUnitView, RepositoryId, RepositoryView,
     ResponseData, Revision, ScheduleChangeView, SchedulePolicy, SchedulePolicyOverride,
     SchedulePolicyView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest,
-    SubmissionView, SubmitTaskRequest, TargetMilestone, TargetRef, TaskId, TaskProgressView,
-    WorkspaceView, next_action_for_attempt,
+    SubmissionView, SubmitTaskRequest, TargetIntegration, TargetMilestone, TargetRef, TaskId,
+    TaskProgressView, WorkspaceView, next_action_for_attempt,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -66,6 +66,11 @@ enum TopLevelCommand {
     Repository {
         #[command(subcommand)]
         command: RepositoryCommand,
+    },
+    /// Manage the GitHub token the pull-request strategy uses.
+    Github {
+        #[command(subcommand)]
+        command: GithubCommand,
     },
     /// Import and inspect versioned feature plans.
     Plan {
@@ -492,9 +497,43 @@ enum RepositoryCommand {
         /// Development branch required by immediate mode.
         #[arg(long)]
         development_target: Option<String>,
+        /// How the target branch is reached.
+        #[arg(long, value_enum, default_value = "direct-push")]
+        integration: TargetIntegrationArgument,
     },
     /// List registered repositories.
     List,
+}
+
+#[derive(Debug, Subcommand)]
+enum GithubCommand {
+    /// Store a GitHub token for a repository, read from standard input.
+    ///
+    /// Read from stdin rather than taken as an argument, because an argument would be visible in
+    /// the process list and saved in shell history.
+    SetToken {
+        /// The repository the token belongs to.
+        repository_id: String,
+    },
+    /// Report whether a token is stored, without printing it.
+    Status {
+        /// The repository to check.
+        repository_id: String,
+    },
+    /// Remove a stored token.
+    ForgetToken {
+        /// The repository to remove the token for.
+        repository_id: String,
+    },
+}
+
+/// How the target branch is reached.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TargetIntegrationArgument {
+    /// Push straight to the target using the Git credentials already in use.
+    DirectPush,
+    /// Open a pull request against the target. You merge it yourself; nothing merges it for you.
+    PullRequest,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -1072,6 +1111,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 output_data(data, cli.json, stdout)
             }
         },
+        TopLevelCommand::Github { command } => run_github(command, &session.state_dir, stdout),
         TopLevelCommand::Repository { command } => match command {
             RepositoryCommand::List => {
                 let data = send(&session, Command::ListRepositories)?;
@@ -1083,8 +1123,16 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 target,
                 mode,
                 development_target,
+                integration,
             } => {
-                let request = enrollment_request(path, remote, target, mode, development_target)?;
+                let request = enrollment_request(
+                    path,
+                    remote,
+                    target,
+                    mode,
+                    development_target,
+                    integration,
+                )?;
                 let data = send(&session, Command::EnrollRepository(request))?;
                 output_data(data, cli.json, stdout)
             }
@@ -1588,12 +1636,73 @@ fn api_failure(error: ApiError) -> CliFailure {
     CliFailure::new(exit, code, error.message)
 }
 
+/// Stores, reports on, or removes the GitHub token for one repository.
+///
+/// Handled entirely in the CLI, against the same state directory the service uses. The token never
+/// crosses the local API in either direction: the fewer places a secret travels, the fewer places
+/// it can be logged, cached, or exported by accident.
+fn run_github(
+    command: GithubCommand,
+    state_dir: &std::path::Path,
+    stdout: &mut impl Write,
+) -> Result<(), CliFailure> {
+    let refusal =
+        |detail: String| CliFailure::new(EXIT_ACTION_REQUIRED, "github_token_unusable", detail);
+    match command {
+        GithubCommand::SetToken { repository_id } => {
+            let mut token = String::new();
+            std::io::Read::read_to_string(&mut io::stdin(), &mut token).map_err(|error| {
+                refusal(format!(
+                    "could not read the token from standard input: {error}"
+                ))
+            })?;
+            reccursive_github::storage::store(state_dir, &repository_id, token.trim())
+                .map_err(|error| refusal(error.to_string()))?;
+            writeln!(
+                stdout,
+                "Stored a GitHub token for {repository_id}.\n\
+                 It is readable only by you, and is never written to logs, events, or the \
+                 diagnostic export.\n\
+                 Nothing merges pull requests for you; opening them is all this token is used for."
+            )
+            .map_err(output_error)
+        }
+        GithubCommand::Status { repository_id } => {
+            let present = reccursive_github::storage::is_present(state_dir, &repository_id);
+            writeln!(
+                stdout,
+                "{}",
+                if present {
+                    format!("A GitHub token is stored for {repository_id}.")
+                } else {
+                    format!(
+                        "No GitHub token is stored for {repository_id}.\n\
+                         Repositories that publish by direct push do not need one."
+                    )
+                }
+            )
+            .map_err(output_error)
+        }
+        GithubCommand::ForgetToken { repository_id } => {
+            reccursive_github::storage::forget(state_dir, &repository_id)
+                .map_err(|error| refusal(error.to_string()))?;
+            writeln!(
+                stdout,
+                "Removed the stored GitHub token for {repository_id}.\n\
+                 Revoke it on GitHub as well if you no longer want it to exist."
+            )
+            .map_err(output_error)
+        }
+    }
+}
+
 fn enrollment_request(
     path: PathBuf,
     remote: Option<String>,
     target: String,
     mode: PublicationModeArgument,
     development_target: Option<String>,
+    integration: TargetIntegrationArgument,
 ) -> Result<EnrollRepositoryRequest, CliFailure> {
     let requested_path = fs::canonicalize(&path).map_err(|error| {
         CliFailure::new(
@@ -1617,7 +1726,12 @@ fn enrollment_request(
         PublicationModeArgument::Scheduled => PublicationMode::ScheduledCreation,
         PublicationModeArgument::Immediate => PublicationMode::ImmediateAvailability,
     };
+    let target_integration = match integration {
+        TargetIntegrationArgument::DirectPush => TargetIntegration::DirectPush,
+        TargetIntegrationArgument::PullRequest => TargetIntegration::PullRequest,
+    };
     let request = EnrollRepositoryRequest {
+        target_integration,
         checkout_path: checkout.to_string_lossy().into_owned(),
         canonical_remote,
         publication_mode,
@@ -2039,6 +2153,7 @@ fn queued_state_label(state: QueuedUnitState) -> &'static str {
         QueuedUnitState::Blocked => "blocked",
         QueuedUnitState::Cancelled => "cancelled",
         QueuedUnitState::AvailableEarly => "available early",
+        QueuedUnitState::AwaitingMerge => "awaiting your merge",
         QueuedUnitState::Published => "published",
     }
 }
@@ -2090,6 +2205,21 @@ fn output_queue_summary(
             if let Some(reason) = &unit.reason {
                 writeln!(out, "  {} blocked: {reason}", unit.release_unit_id)
                     .map_err(output_error)?;
+            }
+            if let Some(pull_request) = &unit.pull_request {
+                writeln!(
+                    out,
+                    "  {} pull request #{} {} — {}",
+                    unit.release_unit_id,
+                    pull_request.number,
+                    if pull_request.merged_at_unix_ms.is_some() {
+                        "was merged"
+                    } else {
+                        "is waiting for you to merge it"
+                    },
+                    pull_request.url,
+                )
+                .map_err(output_error)?;
             }
             for publication in &unit.published_to {
                 writeln!(
@@ -3107,6 +3237,10 @@ fn apply_setup_steps(
         plan.target.clone(),
         mode,
         plan.development_target.clone(),
+        // The guided setup enrols by direct push. Choosing the pull-request strategy means
+        // creating a token first, which is a decision to make deliberately rather than inside a
+        // wizard that is otherwise about getting started quickly.
+        TargetIntegrationArgument::DirectPush,
     )?;
     let enrolled = send(session, Command::EnrollRepository(request))?;
     let repository_id = match enrolled {

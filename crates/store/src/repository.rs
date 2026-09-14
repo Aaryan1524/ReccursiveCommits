@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use reccursive_core::{
     PolicyError, PublicationMode, RemoteIdentity, RepositoryId, RepositoryPolicy, Revision,
-    SchedulePolicy, TargetRef,
+    SchedulePolicy, TargetIntegration, TargetRef,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -439,7 +439,8 @@ const ACTIVE_REPOSITORY_QUERY: &str = "
         p.revision,
         p.publication_mode,
         p.target_ref,
-        p.development_target_ref
+        p.development_target_ref,
+        p.target_integration
     FROM repositories r
     JOIN repository_policies p
       ON p.repository_id = r.id
@@ -456,19 +457,37 @@ fn insert_policy(
         .execute(
             "INSERT INTO repository_policies (
             repository_id, revision, publication_mode, target_ref,
-            development_target_ref, created_at_unix_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            development_target_ref, target_integration, created_at_unix_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 policy.repository_id.to_string(),
                 policy.revision.get(),
                 publication_mode_name(policy.publication_mode),
                 policy.target.as_str(),
                 policy.development_target.as_ref().map(TargetRef::as_str),
+                target_integration_name(policy.target_integration),
                 created_at_unix_ms,
             ],
         )
         .map_err(map_write_error)?;
     Ok(())
+}
+
+const fn target_integration_name(integration: TargetIntegration) -> &'static str {
+    match integration {
+        TargetIntegration::DirectPush => "direct_push",
+        TargetIntegration::PullRequest => "pull_request",
+    }
+}
+
+fn target_integration_from_name(value: &str) -> Result<TargetIntegration, StoreError> {
+    match value {
+        "direct_push" => Ok(TargetIntegration::DirectPush),
+        "pull_request" => Ok(TargetIntegration::PullRequest),
+        other => Err(StoreError::InvalidData(format!(
+            "unknown target integration: {other}"
+        ))),
+    }
 }
 
 fn ensure_policy_owner(
@@ -511,6 +530,7 @@ struct RawStoredRepository {
     publication_mode: String,
     target_ref: String,
     development_target_ref: Option<String>,
+    target_integration: String,
 }
 
 impl RawStoredRepository {
@@ -525,6 +545,7 @@ impl RawStoredRepository {
             publication_mode: row.get(6)?,
             target_ref: row.get(7)?,
             development_target_ref: row.get(8)?,
+            target_integration: row.get(9)?,
         })
     }
 }
@@ -557,6 +578,8 @@ impl TryFrom<RawStoredRepository> for StoredRepository {
             target,
             development_target,
         )
+        .map_err(policy_data_error)?
+        .with_target_integration(target_integration_from_name(&raw.target_integration)?)
         .map_err(policy_data_error)?;
         Ok(Self {
             registration,

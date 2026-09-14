@@ -23,13 +23,14 @@ use reccursive_protocol::{
     DueUnitView, EnrollRepositoryRequest, EventSeverityView, EventView, FeatureId,
     FeatureStatusView, IdempotencyKey, InitializeRepositoryRequest, IntegrationHealthView,
     MissedWindowView, PackageChangesView, PackageView, PlanView, ProtocolValidationError,
-    PublicationView, QueueAuditView, QueueExportView, QueueRecoveryIssueView, QueueSummaryView,
-    QueuedUnitState, QueuedUnitView, ReasonCode, ReleaseAttemptView, ReleasePackageRequest,
-    ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryQueueView, RepositoryView,
-    RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision, ScheduleChangeView,
-    SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest,
-    SetSchedulePolicyRequest, StateReason, SubmissionView, TargetRef, TaskCancellationView,
-    TaskProgressView, TaskStatus, TransportError, WorkspacePrerequisiteView, WorkspaceView,
+    PublicationView, PullRequestView, QueueAuditView, QueueExportView, QueueRecoveryIssueView,
+    QueueSummaryView, QueuedUnitState, QueuedUnitView, ReasonCode, ReleaseAttemptView,
+    ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryQueueView,
+    RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision,
+    ScheduleChangeView, SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView,
+    ScheduleUnitRequest, SetSchedulePolicyRequest, StateReason, SubmissionView, TargetRef,
+    TaskCancellationView, TaskProgressView, TaskStatus, TransportError, WorkspacePrerequisiteView,
+    WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -139,6 +140,10 @@ impl LocalService {
         let shutdown = self.shutdown.clone();
         let managed_root = Arc::clone(&self.managed_root);
         let release_root = Arc::clone(&self.release_root);
+        let state_dir = Arc::new(self.owner.paths.state_dir.clone());
+        // Overridable so a scenario can point the adapter at a stand-in endpoint over a Unix
+        // socket. Unset — which is every real installation — means api.github.com over TLS.
+        let github_endpoint = github_endpoint_from_environment();
         let interval = MAINTENANCE_INTERVAL;
         let mut maintenance = crate::maintenance::Maintenance::new(
             shutdown.clone(),
@@ -176,6 +181,21 @@ impl LocalService {
                     // Selecting its time here, after the pass that may have just published it,
                     // means the integration is planned without anyone typing a command.
                     let _ = maintenance.schedule_pending_integrations(&mut store, seed, now);
+                    // The pull-request half of integration. Both passes are no-ops for a
+                    // repository that publishes by direct push, which is every repository that
+                    // never opted in, so nothing here runs without a token having been stored.
+                    let _ = maintenance.open_pending_pull_requests(
+                        &mut store,
+                        state_dir.as_path(),
+                        &github_endpoint,
+                        now,
+                    );
+                    let _ = maintenance.observe_pull_requests(
+                        &mut store,
+                        state_dir.as_path(),
+                        &github_endpoint,
+                        now,
+                    );
                 }
             }
         })
@@ -299,6 +319,21 @@ impl ServiceOwner {
 impl Drop for ServiceOwner {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.paths.socket);
+    }
+}
+
+/// Where the GitHub adapter should send its requests.
+///
+/// `RECCURSIVE_GITHUB_SOCKET` exists for the scenario suite, which runs the real adapter and the
+/// real `curl` against a stand-in endpoint on a Unix socket — no network, no credential, and no
+/// separate code path that could pass while the real one is broken.
+fn github_endpoint_from_environment() -> reccursive_github::Endpoint {
+    match std::env::var_os("RECCURSIVE_GITHUB_SOCKET") {
+        Some(socket) => reccursive_github::Endpoint {
+            base_url: "http://localhost".to_owned(),
+            unix_socket: Some(PathBuf::from(socket)),
+        },
+        None => reccursive_github::Endpoint::github(),
     }
 }
 
@@ -2124,6 +2159,15 @@ fn queued_unit_view(
     }
 
     let published_to = publication_views(&publications, &Some(repository_target.clone()));
+    let pull_request = store
+        .pull_request(unit.unit_id)
+        .map_err(store_api_error)?
+        .map(|record| PullRequestView {
+            number: record.number,
+            url: record.url,
+            state: record.state,
+            merged_at_unix_ms: record.merged_at_unix_ms,
+        });
     let slot = store.schedule_slot(unit.unit_id).map_err(store_api_error)?;
     let publishing = match &slot {
         Some(slot) => store
@@ -2146,6 +2190,13 @@ fn queued_unit_view(
         QueuedUnitState::Published
     } else if publishing {
         QueuedUnitState::Publishing
+    } else if pull_request
+        .as_ref()
+        .is_some_and(|request| request.merged_at_unix_ms.is_none() && request.state == "open")
+    {
+        // Waiting on a person, not on a time. Reporting this as `Ready` would invite somebody to
+        // schedule it again, which would do nothing: the work is already with its reviewer.
+        QueuedUnitState::AwaitingMerge
     } else {
         match &slot {
             Some(slot) if slot.selected_at_unix_ms <= now_unix_ms => QueuedUnitState::Due,
@@ -2171,6 +2222,7 @@ fn queued_unit_view(
 
     Ok(QueuedUnitView {
         published_to,
+        pull_request,
         release_unit_id: unit.unit_id,
         feature_id: unit.feature_id,
         plan_revision: unit.plan_revision,
@@ -3200,7 +3252,24 @@ fn enroll_repository_inner(
         request.target,
         request.development_target,
     )
+    .and_then(|policy| policy.with_target_integration(request.target_integration))
     .map_err(|error| ApiError::new(ApiErrorCode::InvalidRequest, error.to_string(), false))?;
+    // A pull request can only be opened against a repository GitHub actually hosts. Refusing here
+    // means the mistake is caught at enrolment, rather than at the first scheduled integration
+    // with nobody watching.
+    if request.target_integration == reccursive_core::TargetIntegration::PullRequest
+        && reccursive_github::RepositorySlug::from_remote(&registration.canonical_remote).is_none()
+    {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            format!(
+                "the pull-request strategy needs a GitHub remote; {} is not one. \
+                 Publish by direct push instead, or enrol with a GitHub remote.",
+                registration.canonical_remote
+            ),
+            false,
+        ));
+    }
     let mut store = lock_store(store)?;
     let initial_schedule_policy = initial_schedule_policy.map(|policy| StoredSchedulePolicy {
         repository_id,
@@ -3245,6 +3314,7 @@ fn enroll_repository_inner(
 
 fn repository_view(stored: StoredRepository) -> RepositoryView {
     RepositoryView {
+        target_integration: stored.active_policy.target_integration,
         id: stored.registration.id,
         checkout_path: stored.registration.checkout_path,
         canonical_remote: stored.registration.canonical_remote,
@@ -3492,6 +3562,7 @@ mod tests {
             .send(
                 &paths.socket,
                 Command::EnrollRepository(EnrollRepositoryRequest {
+                    target_integration: reccursive_core::TargetIntegration::DirectPush,
                     checkout_path: checkout.to_string_lossy().into_owned(),
                     canonical_remote: "ssh://git@example.invalid/project.git".into(),
                     publication_mode: PublicationMode::ScheduledCreation,

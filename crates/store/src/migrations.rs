@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 21;
+pub const STORAGE_SCHEMA_VERSION: u32 = 22;
 
 struct Migration {
     version: u32,
@@ -755,6 +755,48 @@ const MIGRATIONS: &[Migration] = &[
 
         CREATE INDEX idx_idempotent_requests_claimed
             ON idempotent_requests(claimed_at_unix_ms);
+        "#,
+    },
+    Migration {
+        version: 22,
+        sql: r#"
+        -- How the target is reached, independently of when. A column with a default rather than a
+        -- rebuild, because every existing repository already means 'direct_push' and saying so is
+        -- not a change to what they do.
+        ALTER TABLE repository_policies ADD COLUMN target_integration TEXT NOT NULL
+            DEFAULT 'direct_push'
+            CHECK (target_integration IN ('direct_push', 'pull_request'));
+
+        -- One row per pull request this service opened, keyed by the unit it delivers.
+        --
+        -- The number is recorded so a crash between opening a pull request and remembering it can
+        -- be resolved by looking, rather than by opening a second one. `merged_at_unix_ms` is only
+        -- ever written from what GitHub reports: this product never merges, so the column records
+        -- an observation and not an action.
+        CREATE TABLE github_pull_requests (
+            release_unit_id TEXT PRIMARY KEY,
+            repository_id TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            package_revision INTEGER NOT NULL CHECK (package_revision > 0),
+            number INTEGER NOT NULL CHECK (number > 0),
+            url TEXT NOT NULL CHECK (length(trim(url)) > 0),
+            head_ref TEXT NOT NULL CHECK (head_ref LIKE 'refs/heads/%'),
+            base_ref TEXT NOT NULL CHECK (base_ref LIKE 'refs/heads/%'),
+            state TEXT NOT NULL CHECK (state IN ('open', 'closed')),
+            merged_at_unix_ms INTEGER
+                CHECK (merged_at_unix_ms IS NULL OR merged_at_unix_ms >= 0),
+            observed_at_unix_ms INTEGER NOT NULL CHECK (observed_at_unix_ms >= 0),
+            created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+            -- A merged pull request is closed; anything else would be a state nobody can act on.
+            CHECK (merged_at_unix_ms IS NULL OR state = 'closed'),
+            FOREIGN KEY (release_unit_id) REFERENCES release_units(unit_id) ON DELETE RESTRICT,
+            FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE,
+            UNIQUE (repository_id, number)
+        );
+
+        CREATE INDEX idx_github_pull_requests_open
+            ON github_pull_requests(repository_id)
+            WHERE state = 'open';
         "#,
     },
 ];

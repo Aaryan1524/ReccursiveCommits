@@ -7,7 +7,7 @@ publication.
 
 ## The short version
 
-| | **Direct push** | **Pull request** *(not yet implemented)* |
+| | **Direct push** | **Pull request** |
 | --- | --- | --- |
 | Works with | Any Git host | GitHub |
 | Needs a token | No | Yes, one you create |
@@ -72,17 +72,28 @@ prerequisite is pushed to the development branch; the second only once the
 target itself carries it. In scheduled mode, where there is no development
 branch, publishing to the target satisfies both.
 
-## Pull request — not yet implemented
+## Pull request
 
-**This strategy is being built and is not available yet.** It is described here
-because the design is settled and the trade-off it asks you to make is one you
-should be able to read before you depend on this product. Everything below says
-what it *will* do. Until it ships, direct push is the only strategy, and
-`--mode immediate` publishes to a development branch without opening anything.
+```
+reccursive repository add ~/code/my-project \
+    --mode immediate --development-target development \
+    --integration pull-request
+printf '%s' "$GITHUB_TOKEN" | reccursive github set-token <repository-id>
+```
 
-At the release time you chose, the service pushes your work to a branch and
-opens a pull request against your target. You get a notification from GitHub the
-way you would for any PR, review it when you like, and merge it yourself.
+Your work reaches the development branch at its release time, exactly as it does
+under direct push. What changes is the integration: instead of pushing to your
+target, the service opens a pull request from the development branch against it.
+You get a notification from GitHub the way you would for any PR, review it when
+you like, and merge it yourself.
+
+The pull-request strategy needs a development branch to open the request from,
+so it goes with `--mode immediate`. It also needs a GitHub remote, which is
+checked when you enrol rather than discovered at the first scheduled
+integration with nobody watching.
+
+Until you merge, `queue status` says `awaiting your merge` and names the pull
+request. Nothing is reported as published, because nothing has landed.
 
 **The service never merges.** Not when checks pass, not on a schedule, not
 ever. Opening a pull request is automation; merging one is authority over what
@@ -93,6 +104,15 @@ change merged, you merge it.
 
 Opening a pull request needs a GitHub token, because Git alone cannot create
 one. You create it, you scope it, and you can revoke it at any time.
+
+You give it to the service on standard input, never as an argument — an argument
+would be visible in the process list and saved in your shell history:
+
+```
+printf '%s' "$GITHUB_TOKEN" | reccursive github set-token <repository-id>
+reccursive github status <repository-id>       # says whether one is stored, never what it is
+reccursive github forget-token <repository-id> # then revoke it on GitHub too
+```
 
 Be clear-eyed about what this changes. Without a token, the honest description
 of this product is *it uses your Git credentials and nothing else*. With one,

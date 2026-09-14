@@ -20,7 +20,7 @@ pub use integration::{BackoffPolicy, ConnectivityFault, Integration};
 pub use plan::{AcceptanceCheck, FeaturePlan, PLAN_SCHEMA_VERSION, PlanError, PlanPhase, PlanTask};
 pub use policy::{
     PackageError, PackageRevision, PolicyError, PolicyRef, PublicationMode, RepositoryPolicy,
-    TargetMilestone, TargetRef,
+    TargetIntegration, TargetMilestone, TargetRef,
 };
 pub use release::{ReleaseUnit, ReleaseUnitError};
 pub use remote::RemoteIdentity;

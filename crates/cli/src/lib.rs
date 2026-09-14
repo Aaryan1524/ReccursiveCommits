@@ -2038,6 +2038,7 @@ fn queued_state_label(state: QueuedUnitState) -> &'static str {
         QueuedUnitState::Publishing => "publishing",
         QueuedUnitState::Blocked => "blocked",
         QueuedUnitState::Cancelled => "cancelled",
+        QueuedUnitState::AvailableEarly => "available early",
         QueuedUnitState::Published => "published",
     }
 }
@@ -2089,6 +2090,21 @@ fn output_queue_summary(
             if let Some(reason) = &unit.reason {
                 writeln!(out, "  {} blocked: {reason}", unit.release_unit_id)
                     .map_err(output_error)?;
+            }
+            for publication in &unit.published_to {
+                writeln!(
+                    out,
+                    "  {} {} {} at {}",
+                    unit.release_unit_id,
+                    if publication.is_target {
+                        "is on the target"
+                    } else {
+                        "is available early on"
+                    },
+                    publication.target.as_str(),
+                    short_commit(&publication.commit),
+                )
+                .map_err(output_error)?;
             }
             if let Some(change) = &unit.last_schedule_change {
                 writeln!(
@@ -2173,7 +2189,29 @@ fn output_task_progress(out: &mut impl Write, task: &TaskProgressView) -> Result
     if let Some(selected) = task.selected_at_unix_ms {
         writeln!(out, "      due:     {selected} (unix ms)").map_err(output_error)?;
     }
+    // Where the work actually is. A task whose unit published to a development branch returns to
+    // the queue awaiting its integration, so its status alone cannot say that the work is already
+    // on a real branch that other people can see.
+    for publication in &task.published_to {
+        writeln!(
+            out,
+            "      {} {} at {}",
+            if publication.is_target {
+                "on target:"
+            } else {
+                "available:"
+            },
+            publication.target.as_str(),
+            short_commit(&publication.commit),
+        )
+        .map_err(output_error)?;
+    }
     Ok(())
+}
+
+/// Shortens a commit for display without ever inventing one.
+fn short_commit(commit: &str) -> &str {
+    commit.get(..12).unwrap_or(commit)
 }
 
 fn output_submission(out: &mut impl Write, submission: &SubmissionView) -> Result<(), CliFailure> {

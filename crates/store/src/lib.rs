@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 
-pub use attempts::{AttemptLease, NewReleaseAttempt, ReleaseAttempt};
+pub use attempts::{AttemptLease, NewReleaseAttempt, ReleaseAttempt, TaskPublication};
 pub use checks::{CandidateValidationEvidence, TrustedCheck, ValidationEvidence};
 pub use events::{DEFAULT_EVENT_RETENTION, EventContext, EventSeverity, NewEvent, StoredEvent};
 pub use idempotency::IdempotencyClaim;

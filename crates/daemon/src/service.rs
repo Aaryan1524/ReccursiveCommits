@@ -23,13 +23,13 @@ use reccursive_protocol::{
     DueUnitView, EnrollRepositoryRequest, EventSeverityView, EventView, FeatureId,
     FeatureStatusView, IdempotencyKey, InitializeRepositoryRequest, IntegrationHealthView,
     MissedWindowView, PackageChangesView, PackageView, PlanView, ProtocolValidationError,
-    QueueAuditView, QueueExportView, QueueRecoveryIssueView, QueueSummaryView, QueuedUnitState,
-    QueuedUnitView, ReasonCode, ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView,
-    RepositoryId, RepositoryPolicy, RepositoryQueueView, RepositoryView, RequestEnvelope,
-    RequestId, ResponseData, ResponseEnvelope, Revision, ScheduleChangeView, SchedulePolicyView,
-    ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest,
-    StateReason, SubmissionView, TaskCancellationView, TaskProgressView, TaskStatus,
-    TransportError, WorkspacePrerequisiteView, WorkspaceView,
+    PublicationView, QueueAuditView, QueueExportView, QueueRecoveryIssueView, QueueSummaryView,
+    QueuedUnitState, QueuedUnitView, ReasonCode, ReleaseAttemptView, ReleasePackageRequest,
+    ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryQueueView, RepositoryView,
+    RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision, ScheduleChangeView,
+    SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest,
+    SetSchedulePolicyRequest, StateReason, SubmissionView, TargetRef, TaskCancellationView,
+    TaskProgressView, TaskStatus, TransportError, WorkspacePrerequisiteView, WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -2043,7 +2043,12 @@ fn summarize_queue(
             .release_units_for_repository(id)
             .map_err(store_api_error)?
         {
-            units.push(queued_unit_view(&store, &unit, now)?);
+            units.push(queued_unit_view(
+                &store,
+                &unit,
+                &repository.active_policy.target,
+                now,
+            )?);
         }
         summaries.push(RepositoryQueueView {
             repository_id: id,
@@ -2063,14 +2068,35 @@ fn summarize_queue(
     })
 }
 
+/// Presents stored publications with the one fact a reader needs: is this the target branch.
+///
+/// A repository that is no longer enrolled leaves no target to compare against. Reporting those
+/// publications as not-on-the-target is the safe reading: it never claims work has landed.
+fn publication_views(
+    publications: &[reccursive_store::TaskPublication],
+    repository_target: &Option<TargetRef>,
+) -> Vec<PublicationView> {
+    publications
+        .iter()
+        .map(|publication| PublicationView {
+            target: publication.target.clone(),
+            commit: publication.commit.clone(),
+            published_at_unix_ms: publication.published_at_unix_ms,
+            is_target: repository_target.as_ref() == Some(&publication.target),
+        })
+        .collect()
+}
+
 /// Places one unit in the queue, from the state its own parts are in.
 fn queued_unit_view(
     store: &Store,
     unit: &reccursive_store::ReleaseUnitRecord,
+    repository_target: &TargetRef,
     now_unix_ms: i64,
 ) -> Result<QueuedUnitView, ApiError> {
     let mut task_names = Vec::new();
     let mut statuses = Vec::new();
+    let mut publications = Vec::new();
     let mut reason = None;
     for task_id in &unit.task_ids {
         let Some(task) = store
@@ -2081,6 +2107,11 @@ fn queued_unit_view(
         };
         task_names.push(task.name);
         statuses.push(task.state.status());
+        for publication in store.task_publications(*task_id).map_err(store_api_error)? {
+            if !publications.contains(&publication) {
+                publications.push(publication);
+            }
+        }
         if reason.is_none()
             && let Some(state_reason) = task.state.reason()
         {
@@ -2088,6 +2119,7 @@ fn queued_unit_view(
         }
     }
 
+    let published_to = publication_views(&publications, &Some(repository_target.clone()));
     let slot = store.schedule_slot(unit.unit_id).map_err(store_api_error)?;
     let publishing = match &slot {
         Some(slot) => store
@@ -2114,6 +2146,12 @@ fn queued_unit_view(
         match &slot {
             Some(slot) if slot.selected_at_unix_ms <= now_unix_ms => QueuedUnitState::Due,
             Some(_) => QueuedUnitState::Scheduled,
+            // Nothing is scheduled — but work already on a development branch is not the same
+            // situation as work that has never been published, and a queue that showed both as
+            // `Ready` would be hiding a real publication from the person reading it.
+            None if published_to.iter().any(|entry| !entry.is_target) => {
+                QueuedUnitState::AvailableEarly
+            }
             None => QueuedUnitState::Ready,
         }
     };
@@ -2128,6 +2166,7 @@ fn queued_unit_view(
         .and_then(|change| change.invalidated_reason);
 
     Ok(QueuedUnitView {
+        published_to,
         release_unit_id: unit.unit_id,
         feature_id: unit.feature_id,
         plan_revision: unit.plan_revision,
@@ -2187,6 +2226,12 @@ fn get_feature_status(
             )
         })?;
     let plan_revision = plan.plan.revision;
+    // The repository's target is what separates "landed" from "available early", so it is read
+    // once here rather than re-derived per task.
+    let repository_target = store
+        .repository(plan.plan.repository_id)
+        .map_err(store_api_error)?
+        .map(|repository| repository.active_policy.target.clone());
 
     let mut tasks = Vec::new();
     for record in store
@@ -2216,6 +2261,12 @@ fn get_feature_status(
             package_id: package.map(|package| package.package_id),
             release_unit_id: unit.map(|unit| unit.unit_id),
             selected_at_unix_ms,
+            published_to: publication_views(
+                &store
+                    .task_publications(record.task_id)
+                    .map_err(store_api_error)?,
+                &repository_target,
+            ),
         });
     }
 

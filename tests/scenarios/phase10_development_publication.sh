@@ -200,6 +200,32 @@ sleep 70
 [[ "$(remote_ref refs/heads/main)" == "$main_before" ]] || \
   fail "a later maintenance pass moved the target branch"
 
+# --- The product has to *say* the work is available, not merely have published it. ---
+#
+# Withdrawing the spent slot returns the unit's tasks to the queue, so without this the unit would
+# render exactly like one that had never published at all.
+queue_json="$(cli queue status)"
+grep -q '"state":"available_early"' <<<"$queue_json" || \
+  fail "the queue does not distinguish work available on a development branch: $queue_json"
+grep -q "\"target\":\"refs/heads/development\"" <<<"$queue_json" || \
+  fail "the queue does not report which branch the work reached: $queue_json"
+grep -q "\"commit\":\"$development_head\"" <<<"$queue_json" || \
+  fail "the queue does not report the commit that carries the work: $queue_json"
+grep -q '"is_target":false' <<<"$queue_json" || \
+  fail "the queue does not distinguish a development branch from the target: $queue_json"
+
+queue_text="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" queue status)"
+grep -q "available early" <<<"$queue_text" || \
+  fail "the human-readable queue does not report early availability: $queue_text"
+grep -q "is available early on refs/heads/development" <<<"$queue_text" || \
+  fail "the human-readable queue does not name the development branch: $queue_text"
+
+status_text="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" feature status "$feature_id" --revision 1)"
+grep -q "available: refs/heads/development" <<<"$status_text" || \
+  fail "feature status does not report where the work is available: $status_text"
+grep -q "on target:" <<<"$status_text" && \
+  fail "feature status claims work is on the target when only the development branch has it"
+
 # --- The two milestones now diverge, which is the whole reason they are separate. ---
 slot_json="$(cli schedule unit "$dependent_dev_unit" --package-id "$dependent_dev_package" --revision 1)"
 grep -q '"type":"schedule_slot"' <<<"$slot_json" || \

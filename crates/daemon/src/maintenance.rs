@@ -532,6 +532,31 @@ impl Maintenance {
         })
     }
 
+    /// Records that a repository cannot be published from, and why.
+    ///
+    /// Written once per pass rather than deduplicated, because the event store already prunes and
+    /// a repeated entry is how a reader sees that this is still happening rather than a single
+    /// thing that happened once.
+    fn report_unattributable_checkout(
+        &self,
+        store: &mut Store,
+        repository_id: reccursive_core::RepositoryId,
+        checkout_path: &str,
+        now_unix_ms: i64,
+    ) -> Result<(), StoreError> {
+        self.report_pull_request_problem(
+            store,
+            repository_id,
+            "checkout_unattributable",
+            &format!(
+                "{checkout_path} cannot provide an author for a commit; it may have been moved, \
+                 deleted, or left without user.name and user.email. Nothing will publish from \
+                 this repository until that is fixed: reccursive diagnose {repository_id}"
+            ),
+            now_unix_ms,
+        )
+    }
+
     /// Records why a pull request could not be opened, where a person will actually find it.
     fn report_pull_request_problem(
         &self,
@@ -601,9 +626,21 @@ impl Maintenance {
             }
             // No identity configured means no commit can be attributed. Refusing is the only
             // honest option: inventing an author would put a name on work it did not do.
+            //
+            // Refusing silently is not. A checkout that has been moved, deleted, or left without
+            // an identity makes every pass skip this repository forever, and without a record the
+            // queue simply looks idle. The reason is written where `logs` and the diagnostic
+            // export will show it.
             let Some(attribution) = ReleaseAttribution::from_checkout(std::path::Path::new(
                 &repository.registration.checkout_path,
             )) else {
+                self.report_unattributable_checkout(
+                    store,
+                    unit.repository_id,
+                    &repository.registration.checkout_path,
+                    now_unix_ms,
+                )?;
+                tally.blocked += 1;
                 continue;
             };
             let task_names = store

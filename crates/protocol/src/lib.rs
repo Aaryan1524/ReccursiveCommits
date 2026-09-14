@@ -771,6 +771,108 @@ pub struct PackageView {
     pub created_at_unix_ms: i64,
 }
 
+/// Every reason the release worker can durably record for a failed publication.
+///
+/// An enum rather than a list of strings kept in step by hand. The previous arrangement was a
+/// hardcoded list in a test that claimed "a new classification added without guidance fails
+/// here", and it had already fallen four classifications behind the worker — so a protected
+/// branch, a timeout, a failed commit and an unclassified publication failure each left their
+/// owner with a blocked unit and no next step. Matching exhaustively on this makes that claim
+/// true: adding a variant without guidance does not compile.
+///
+/// The stored representation stays the string it always was, so existing databases keep meaning
+/// what they meant.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ReleaseFailure {
+    /// The captured change no longer applies to the target.
+    Conflict,
+    /// A check ran and rejected the change.
+    ValidationFailed,
+    /// A check could not run at all.
+    ValidationUnavailable,
+    /// The candidate commit could not be created.
+    CommitFailed,
+    /// The endpoint refused the credentials.
+    Authentication,
+    /// The endpoint refused the push itself, such as a protected branch.
+    BranchRule,
+    /// The endpoint could not be reached.
+    Transport,
+    /// The remote could not be read while resolving an attempt.
+    Remote,
+    /// The operation ran too long without an answer.
+    Timeout,
+    /// The push may or may not have landed.
+    AmbiguousRemote,
+    /// The target moved under a valid attempt.
+    TargetChanged,
+    /// Commit signing was required and did not succeed.
+    Signing,
+    /// Git is misconfigured for this publication, such as a missing identity.
+    Configuration,
+    /// The publication was cancelled before it completed.
+    Cancelled,
+    /// Retrying was allowed to continue only so many times, and that bound was reached.
+    RetryExhausted,
+    /// The publication failed for a reason none of the above describes.
+    PublicationFailed,
+    /// The daemon itself failed.
+    InternalError,
+}
+
+impl ReleaseFailure {
+    /// Every variant, so callers can exercise the whole set rather than a remembered subset.
+    pub const ALL: [Self; 17] = [
+        Self::Conflict,
+        Self::ValidationFailed,
+        Self::ValidationUnavailable,
+        Self::CommitFailed,
+        Self::Authentication,
+        Self::BranchRule,
+        Self::Transport,
+        Self::Remote,
+        Self::Timeout,
+        Self::AmbiguousRemote,
+        Self::TargetChanged,
+        Self::Signing,
+        Self::Configuration,
+        Self::Cancelled,
+        Self::RetryExhausted,
+        Self::PublicationFailed,
+        Self::InternalError,
+    ];
+
+    /// The durable string this failure is stored and reported as.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Conflict => "conflict",
+            Self::ValidationFailed => "validation_failed",
+            Self::ValidationUnavailable => "validation_unavailable",
+            Self::CommitFailed => "commit_failed",
+            Self::Authentication => "authentication",
+            Self::BranchRule => "branch_rule",
+            Self::Transport => "transport",
+            Self::Remote => "remote",
+            Self::Timeout => "timeout",
+            Self::AmbiguousRemote => "ambiguous_remote",
+            Self::TargetChanged => "target_changed",
+            Self::Signing => "signing",
+            Self::Configuration => "configuration",
+            Self::Cancelled => "cancelled",
+            Self::RetryExhausted => "retry_exhausted",
+            Self::PublicationFailed => "publication_failed",
+            Self::InternalError => "internal_error",
+        }
+    }
+
+    /// Reads back a stored classification, or `None` for one this version does not know.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|known| known.as_str() == value)
+    }
+}
+
 /// What a person should do about a blocked publication attempt.
 ///
 /// Lives in the protocol crate rather than in one client because every client faces the same
@@ -786,49 +888,107 @@ pub fn next_action_for_attempt(attempt: &ReleaseAttemptView) -> Option<String> {
     let revision = attempt.package_revision.get();
     let repository = attempt.repository_id;
     let attempt_id = attempt.attempt_id;
-    let classification = attempt.failure_classification.as_deref()?;
+    // An unrecognised classification is one this version has no guidance for. Saying nothing is
+    // better than plausible advice: a command that does not help still costs the reader's
+    // attention, and a wrong one costs more than that.
+    let classification = ReleaseFailure::parse(attempt.failure_classification.as_deref()?)?;
+    // Exhaustive on purpose — no catch-all arm. This is what makes "a new classification without
+    // guidance fails the build" true rather than merely claimed.
     Some(match classification {
         // The captured change no longer applies to the target. Seeing what it changes is the only
         // way to judge whether to re-capture it against the moved target.
-        "conflict" => format!(
+        ReleaseFailure::Conflict => format!(
             "reccursive package changes {package} --revision {revision} --patch
              then re-capture the work against the moved target with a new plan revision"
         ),
         // A check ran and said no. Which one, and what it printed, is already recorded.
-        "validation_failed" => format!(
+        ReleaseFailure::ValidationFailed => format!(
             "reccursive package checks {package} --revision {revision}
              fix what the failing check reports, then submit the task again"
         ),
         // The check could not run at all, which is a problem with this machine rather than with
         // the change.
-        "validation_unavailable" => "reccursive doctor
+        ReleaseFailure::ValidationUnavailable => "reccursive doctor
 the attempt retries on its own once checks can run again"
             .to_owned(),
         // Credentials. Never retried automatically, because presenting a rejected credential
         // repeatedly is how an account gets locked.
-        "authentication" => format!(
+        ReleaseFailure::Authentication => format!(
             "reccursive diagnose {repository}
              fix the credential it reports, then run: reccursive schedule release-now <unit>"
         ),
         // Transport faults back off and retry by themselves; the useful thing is to see when.
-        "transport" | "remote" => "reccursive integrations
+        ReleaseFailure::Transport | ReleaseFailure::Remote => "reccursive integrations
 the attempt retries on its own when the remote is reachable"
             .to_owned(),
         // The push may or may not have landed. This is the one case that genuinely needs a person
         // to look at the remote, and saying so is more honest than suggesting a command.
-        "ambiguous_remote" => format!(
+        ReleaseFailure::AmbiguousRemote => format!(
             "reccursive release attempt {attempt_id}
              check the remote yourself before acting: the push may or may not have landed"
         ),
         // The target moved under a valid attempt. Reconciliation handles it on the next pass.
-        "target_changed" => "reccursive queue status
+        ReleaseFailure::TargetChanged => "reccursive queue status
 the attempt reconciles against the new target on its own"
             .to_owned(),
-        "internal_error" => format!(
+        ReleaseFailure::InternalError => format!(
             "reccursive logs --limit 50
 then: reccursive release attempt {attempt_id}"
         ),
-        _ => return None,
+        // A protected branch, a required review, or a pre-receive hook said no. Retrying an
+        // identical push cannot change that answer, so the useful thing is the branch the work
+        // *can* reach: immediate mode publishes to a development branch the rules permit and
+        // integrates later, which keeps the work moving without asking anyone to weaken a rule.
+        ReleaseFailure::BranchRule => format!(
+            "reccursive release attempt {attempt_id}
+             the target refuses direct pushes; publish to a branch it allows instead:
+             reccursive repository add <path> --mode immediate --development-target <branch>
+             see docs/PUBLICATION.md for which strategy suits this repository"
+        ),
+        // Distinct from `transport` because a timeout may have been the push itself running long.
+        // Whether the remote took it is not known here, so the honest step is to look.
+        ReleaseFailure::Timeout => format!(
+            "reccursive integrations
+             the attempt retries on its own; if it keeps timing out, check the remote holds what
+             you expect before forcing it: reccursive release attempt {attempt_id}"
+        ),
+        // The change was captured and verified but could not be turned into a commit. That is a
+        // local fault — identity, disk, or the workspace — rather than anything about the remote.
+        ReleaseFailure::CommitFailed => format!(
+            "reccursive diagnose {repository}
+             the candidate could not be committed locally; fix what it reports, then:
+             reccursive schedule release-now <unit>"
+        ),
+        // Signing is configured per repository and per key; the diagnostic already reports which
+        // part of it is unavailable.
+        ReleaseFailure::Signing => format!(
+            "reccursive diagnose {repository}
+             fix the signing key it reports, then: reccursive schedule release-now <unit>"
+        ),
+        // Git itself cannot proceed — most often no author identity in the checkout.
+        ReleaseFailure::Configuration => format!(
+            "reccursive diagnose {repository}
+             set what it reports missing in the checkout, then:
+             reccursive schedule release-now <unit>"
+        ),
+        // Stopped deliberately, usually by a shutdown. Nothing is wrong; it needs releasing again.
+        ReleaseFailure::Cancelled => "reccursive queue status
+the publication stopped before it finished; schedule it again when you want it:
+reccursive schedule release-now <unit>"
+            .to_owned(),
+        // The bound on retries exists so a failing publication cannot retry forever. Reaching it
+        // means the underlying fault is still there, so the attempt is where the reason is.
+        ReleaseFailure::RetryExhausted => format!(
+            "reccursive release attempt {attempt_id}
+             retrying stopped at its limit; fix what the attempt reports, then:
+             reccursive schedule release-now <unit>"
+        ),
+        // The push failed for a reason nothing above recognised. There is no honest specific
+        // advice, so this points at the two records that actually contain the reason.
+        ReleaseFailure::PublicationFailed => format!(
+            "reccursive release attempt {attempt_id}
+             then: reccursive logs --limit 50"
+        ),
     })
 }
 
@@ -1583,9 +1743,10 @@ mod tests {
 
     #[test]
     fn every_failure_the_release_worker_can_record_has_a_next_action() {
-        // These are the classifications `ReleaseWorker` actually writes. A blocked attempt a user
-        // cannot act on is the failure this task exists to remove, so the list is asserted rather
-        // than assumed — a new classification added without guidance fails here.
+        // Walks `ReleaseFailure::ALL` rather than a list repeated here. The list this replaced
+        // claimed a new classification without guidance would fail the build, and had already
+        // fallen four behind the worker — a protected branch, a timeout, a failed commit and an
+        // unclassified failure each left their owner blocked with nothing to do.
         let attempt = |classification: &str| ReleaseAttemptView {
             attempt_id: AttemptId::new(),
             repository_id: RepositoryId::new(),
@@ -1608,17 +1769,8 @@ mod tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
         };
-        for classification in [
-            "conflict",
-            "validation_failed",
-            "validation_unavailable",
-            "authentication",
-            "transport",
-            "remote",
-            "ambiguous_remote",
-            "target_changed",
-            "internal_error",
-        ] {
+        for failure in ReleaseFailure::ALL {
+            let classification = failure.as_str();
             let action = next_action_for_attempt(&attempt(classification));
             assert!(
                 action.is_some(),

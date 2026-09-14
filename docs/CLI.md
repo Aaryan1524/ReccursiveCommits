@@ -302,6 +302,19 @@ look at the remote — an ambiguous push — it says that instead of suggesting 
 command. A classification with no known action prints nothing rather than
 something plausible.
 
+A target branch that refuses direct pushes is the one worth calling out.
+`branch_rule` means the remote answered and said no: a protected branch, a
+required review, or a pre-receive hook. Retrying an identical push cannot change
+that answer, so nothing retries it and nothing is reported as published — the
+unit stays blocked and the target is untouched. The **Next:** block names a
+branch the rules do permit, by enrolling the repository in immediate mode with a
+development branch, rather than asking anyone to weaken a protection. See
+[PUBLICATION.md](PUBLICATION.md) for which strategy suits a given repository.
+
+Every classification the release worker can record has an action, and that is
+enforced rather than maintained: `ReleaseFailure` is an enum and the mapping
+matches on it exhaustively, so a new failure without guidance does not compile.
+
 `diagnostics export DIRECTORY` writes a shareable report: service status,
 repositories, the queue, integration health, and recent events. Everything in it
 is read back through the ordinary local API, which is what makes it safe to

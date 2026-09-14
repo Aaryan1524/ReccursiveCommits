@@ -23,10 +23,11 @@ use crate::lifecycle::ConnectivityFault;
 use reccursive_git::{
     CandidateApplyOutcome, CandidateCommitRequest, CandidatePublishError, CandidatePublishRequest,
     CandidateVerificationError, CandidateWorkspace, GitError, ManagedClone, PersistedCandidate,
-    PublicationRecovery, PublicationResolution, PublicationRetryPolicy,
+    PublicationBlock, PublicationRecovery, PublicationResolution, PublicationRetryPolicy,
 };
 use reccursive_protocol::{
-    AttemptId, PackageId, PublicationMode, ReasonCode, Revision, StateReason, TargetRef, TaskStatus,
+    AttemptId, PackageId, PublicationMode, ReasonCode, ReleaseFailure, Revision, StateReason,
+    TargetRef, TaskStatus,
 };
 use reccursive_store::{
     AttemptLease, CandidateValidationEvidence, NewReleaseAttempt, ReleaseAttempt, SnapshotRecord,
@@ -425,7 +426,7 @@ impl ReleaseWorker {
                 })
             }
             Err(error) => {
-                let classification = classify(&error);
+                let classification = classify(&error).as_str();
                 let failures = attempt.failed_attempts.saturating_add(1);
                 match self.retry.decide(failures, &error) {
                     // Delays are not slept here: the caller owns scheduling, and a worker that
@@ -463,7 +464,7 @@ impl ReleaseWorker {
                     }
                     PublicationResolution::Manual { block } => {
                         let detail = format!("{block:?}: {error}");
-                        let classification = format!("{block:?}").to_lowercase();
+                        let classification = manual_block_failure(&block).as_str().to_owned();
                         self.block(store, attempt, &classification, &detail, now_unix_ms)?;
                         Ok(ReleaseOutcome::Blocked {
                             attempt_id: id,
@@ -900,27 +901,66 @@ fn current_unix_ms() -> Result<i64, ReleaseError> {
 /// non-zero exit, so the message is the only signal available. Treating them alike would either
 /// retry a credential failure — which can lock an account or raise a prompt with nobody present to
 /// answer it — or give up on a transient outage that would have cleared on its own.
-fn classify(error: &CandidatePublishError) -> &'static str {
+/// Names a non-retryable publication block in the vocabulary the rest of the product speaks.
+///
+/// This was `format!("{block:?}").to_lowercase()`, which produced `branchrule`, `gitfailure` and
+/// `retryexhausted` — strings nothing else in the codebase matched. Six of the eight categories
+/// therefore reached users as a blocked unit with no next step, and the guidance written for
+/// `branch_rule` was never once reached, because the worker never wrote that string.
+fn manual_block_failure(block: &PublicationBlock) -> ReleaseFailure {
+    match block {
+        PublicationBlock::Authentication => ReleaseFailure::Authentication,
+        PublicationBlock::Signing => ReleaseFailure::Signing,
+        PublicationBlock::BranchRule => ReleaseFailure::BranchRule,
+        PublicationBlock::Conflict => ReleaseFailure::Conflict,
+        PublicationBlock::Configuration => ReleaseFailure::Configuration,
+        PublicationBlock::Cancelled => ReleaseFailure::Cancelled,
+        PublicationBlock::RetryExhausted => ReleaseFailure::RetryExhausted,
+        PublicationBlock::GitFailure => ReleaseFailure::PublicationFailed,
+    }
+}
+
+fn classify(error: &CandidatePublishError) -> ReleaseFailure {
     match error {
         CandidatePublishError::Git(git_error) => {
             match ConnectivityFault::classify_git(&git_error.to_string()) {
-                ConnectivityFault::Rejected => "authentication",
-                ConnectivityFault::Refused => "branch_rule",
-                ConnectivityFault::TimedOut => "timeout",
-                ConnectivityFault::Unreachable => "transport",
+                ConnectivityFault::Rejected => ReleaseFailure::Authentication,
+                ConnectivityFault::Refused => ReleaseFailure::BranchRule,
+                ConnectivityFault::TimedOut => ReleaseFailure::Timeout,
+                ConnectivityFault::Unreachable => ReleaseFailure::Transport,
             }
         }
-        CandidatePublishError::TargetAdvanced { .. } => "target_changed",
-        _ => "publication_failed",
+        CandidatePublishError::TargetAdvanced { .. } => ReleaseFailure::TargetChanged,
+        _ => ReleaseFailure::PublicationFailed,
     }
 }
 
 fn reason_code(classification: &str) -> ReasonCode {
-    match classification {
-        "conflict" | "target_changed" | "branch_rule" => ReasonCode::Conflict,
-        "transport" | "timeout" | "ambiguous_remote" => ReasonCode::DeviceUnavailable,
-        "authentication" => ReasonCode::AuthenticationRequired,
-        other => ReasonCode::Other(other.to_owned()),
+    // Exhaustive over the enum, so a new failure gets a deliberate reason code rather than
+    // falling into `Other` because nobody remembered this function existed.
+    let Some(failure) = ReleaseFailure::parse(classification) else {
+        return ReasonCode::Other(classification.to_owned());
+    };
+    match failure {
+        ReleaseFailure::Conflict | ReleaseFailure::TargetChanged | ReleaseFailure::BranchRule => {
+            ReasonCode::Conflict
+        }
+        ReleaseFailure::Transport
+        | ReleaseFailure::Timeout
+        | ReleaseFailure::Remote
+        | ReleaseFailure::AmbiguousRemote => ReasonCode::DeviceUnavailable,
+        ReleaseFailure::Authentication => ReasonCode::AuthenticationRequired,
+        ReleaseFailure::ValidationFailed | ReleaseFailure::ValidationUnavailable => {
+            ReasonCode::ValidationFailed
+        }
+        ReleaseFailure::Signing | ReleaseFailure::Configuration => {
+            ReasonCode::AuthenticationRequired
+        }
+        ReleaseFailure::Cancelled => ReasonCode::UserRequested,
+        ReleaseFailure::CommitFailed
+        | ReleaseFailure::RetryExhausted
+        | ReleaseFailure::PublicationFailed
+        | ReleaseFailure::InternalError => ReasonCode::Other(failure.as_str().to_owned()),
     }
 }
 

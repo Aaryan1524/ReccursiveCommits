@@ -315,6 +315,30 @@ Every classification the release worker can record has an action, and that is
 enforced rather than maintained: `ReleaseFailure` is an enum and the mapping
 matches on it exhaustively, so a new failure without guidance does not compile.
 
+`repository set-policy REPOSITORY` changes where or how an enrolled repository
+publishes. Only what you name changes; omitting a flag leaves that setting alone,
+and removing the development branch has to be said out loud with
+`--no-development-target` rather than implied.
+
+It refuses, with the reason, when something is mid-flight under the old policy: a
+publication already owns a unit, a pull request is open against the branch the
+old policy named, or work sits on a development branch and has not reached the
+target yet, where removing that branch would strand it. A refusal changes
+nothing at all — the policy revision does not move.
+
+What it does move is release times. A selected time was drawn under the old
+policy and may now name a different branch, so live selections are withdrawn and
+chosen again from the new policy. Each unit keeps its identity, so nothing is
+duplicated, and nothing publishes in between. The command prints which units were
+moved.
+
+`contributions REPOSITORY` explains what this machine decides about a published
+commit — the identity it will carry, the branch it lands on, and that its author
+date is its release time, never backdated — and names what only GitHub can
+decide, rather than guessing. It deliberately does not tell you that scheduling a
+push for a date produces a contribution on that date: those are different things
+decided by different systems.
+
 `github set-token REPOSITORY` stores the GitHub token the pull-request strategy
 uses, read from **standard input** — an argument would be visible in the process
 list and saved in your shell history. It is written owner-only beside the

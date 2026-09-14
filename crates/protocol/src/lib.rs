@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
 /// Local API protocol version. Version 16 adds package change inspection and check results.
-pub const API_VERSION: u16 = 18;
+pub const API_VERSION: u16 = 19;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -125,6 +125,7 @@ impl RequestEnvelope {
         }
         match &self.command {
             Command::EnrollRepository(request) => request.validate(),
+            Command::ChangeRepositoryPolicy(request) => request.validate(),
             Command::InitializeRepository(request) => request.validate(),
             Command::CreateWorkspace(request) => request.validate(),
             Command::CapturePackage(request) => request.validate(),
@@ -200,6 +201,8 @@ impl RequestEnvelope {
 pub enum Command {
     Ping,
     EnrollRepository(EnrollRepositoryRequest),
+    /// Change where and how an enrolled repository publishes.
+    ChangeRepositoryPolicy(ChangeRepositoryPolicyRequest),
     /// Register a repository and activate its first scheduling policy as one durable operation.
     InitializeRepository(InitializeRepositoryRequest),
     ListRepositories,
@@ -356,6 +359,7 @@ impl Command {
     pub const fn changes_state(&self) -> bool {
         match self {
             Self::EnrollRepository(_)
+            | Self::ChangeRepositoryPolicy(_)
             | Self::InitializeRepository(_)
             | Self::ImportPlan { .. }
             | Self::SealPlan { .. }
@@ -414,6 +418,7 @@ impl Command {
             Self::ReleasePackage(_) => true,
             Self::Ping
             | Self::EnrollRepository(_)
+            | Self::ChangeRepositoryPolicy(_)
             | Self::InitializeRepository(_)
             | Self::ListRepositories
             | Self::ListEvents { .. }
@@ -635,6 +640,65 @@ pub struct EnrollRepositoryRequest {
     /// How the target is reached. Absent means a direct push, which needs nothing configured.
     #[serde(default)]
     pub target_integration: TargetIntegration,
+}
+
+/// A change to where or how an already-enrolled repository publishes.
+///
+/// Every field is optional and absent means "leave it alone", so a caller changing one thing
+/// cannot silently reset another by omitting it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeRepositoryPolicyRequest {
+    pub repository_id: RepositoryId,
+    #[serde(default)]
+    pub publication_mode: Option<PublicationMode>,
+    #[serde(default)]
+    pub target: Option<TargetRef>,
+    #[serde(default)]
+    pub development_target: DevelopmentTargetChange,
+    #[serde(default)]
+    pub target_integration: Option<TargetIntegration>,
+}
+
+/// What to do with a repository's development branch.
+///
+/// An explicit enum rather than `Option<Option<TargetRef>>`, because those two shapes serialise to
+/// the same `null` and "remove the branch" would arrive as "leave it alone" — a change that looks
+/// applied and is not.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevelopmentTargetChange {
+    #[default]
+    Keep,
+    Remove,
+    Set(TargetRef),
+}
+
+impl ChangeRepositoryPolicyRequest {
+    /// Refuses a change that asks for nothing, so an empty request cannot look like it worked.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.publication_mode.is_none()
+            && self.target.is_none()
+            && self.development_target == DevelopmentTargetChange::Keep
+            && self.target_integration.is_none()
+        {
+            return Err(ProtocolValidationError::EmptyPolicyChange);
+        }
+        Ok(())
+    }
+}
+
+/// What changing a repository's policy did, and what it had to move to do it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PolicyChangeView {
+    pub repository_id: RepositoryId,
+    pub policy_revision: Revision,
+    pub publication_mode: PublicationMode,
+    pub target: TargetRef,
+    pub development_target: Option<TargetRef>,
+    pub target_integration: TargetIntegration,
+    /// Units whose selected release time was withdrawn because it was chosen under the old
+    /// policy. They are scheduled again from the new one; nothing is published in the meantime.
+    pub withdrawn: Vec<ReleaseUnitId>,
 }
 
 /// Validated inputs needed to make a repository ready to accept scheduled work.
@@ -1384,6 +1448,9 @@ pub enum ResponseData {
     RepositoryEnrolled {
         repository: RepositoryView,
     },
+    RepositoryPolicyChanged {
+        change: PolicyChangeView,
+    },
     RepositoryInitialized {
         repository: RepositoryView,
         schedule_policy: SchedulePolicyView,
@@ -1557,6 +1624,8 @@ pub enum ProtocolValidationError {
     MissingDevelopmentTarget,
     #[error("development and target branches must differ")]
     TargetsMustDiffer,
+    #[error("a policy change must name at least one thing to change")]
+    EmptyPolicyChange,
     #[error("event limit must be between 1 and 1000")]
     InvalidEventLimit,
     #[error("invalid feature plan: {0}")]

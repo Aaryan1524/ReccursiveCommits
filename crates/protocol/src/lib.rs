@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
 /// Local API protocol version. Version 16 adds package change inspection and check results.
-pub const API_VERSION: u16 = 19;
+pub const API_VERSION: u16 = 20;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -1557,6 +1557,11 @@ pub enum ResponseData {
     },
     RepositoryDiagnostics {
         repository_id: RepositoryId,
+        /// Whether the enrolled checkout can still produce an attributed commit. Reported first
+        /// because credentials and signing say nothing about it: they are probed against the
+        /// managed mirror, which outlives the working copy.
+        checkout: String,
+        checkout_detail: Option<String>,
         credentials: String,
         credential_detail: Option<String>,
         signing: String,

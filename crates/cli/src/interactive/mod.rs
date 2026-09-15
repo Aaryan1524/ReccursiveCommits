@@ -264,7 +264,11 @@ fn confirmation(
 ) -> Result<(), CliFailure> {
     writeln!(
         stdout,
-        "\n✓ Scheduled\n\n{}\n{}\n\n{} · {}\n\nYou can go offline.",
+        // Not "you can go offline". The service is a launchd *agent* in the user's login session:
+        // it outlives a closed terminal, but not a logout or a shutdown, and sleep delays a
+        // release rather than preserving its time. Promising all five readings of "offline" would
+        // be promising four things this cannot do.
+        "\n✓ Scheduled\n\n{}\n{}\n\n{} · {}\n\nReccursive will handle it automatically.",
         group.feature_goal,
         human_time(slot.selected_at_unix_ms),
         change_count(included.len()),

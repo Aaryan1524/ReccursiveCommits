@@ -218,20 +218,12 @@ done
 [[ -n "$development_head" ]] || \
   fail "the work never reached the development branch within 180 seconds"
 
-# The integration is planned on its own, exactly as it is for a direct push — what differs is
-# what happens when its time arrives. Brought forward here so the scenario does not wait out a
-# time drawn at random from the policy window.
-integration_slot=''
-for _ in {1..60}; do
-  if integration_slot="$(cli schedule show "$unit_id" 2>/dev/null)"; then
-    break
-  fi
-  integration_slot=''
-  sleep 2
-done
-[[ -n "$integration_slot" ]] || \
-  fail "no release time was selected for integrating the work into the target"
-cli schedule release-now "$unit_id" >/dev/null
+# No second release time is selected, and none should be. The time the person chose was for this
+# publication; the pull request follows from it succeeding, not from an unrelated future slot.
+sleep 65
+if stray="$(cli schedule show "$unit_id" 2>/dev/null)"; then
+  fail "a second release time was selected before opening the pull request: $stray"
+fi
 
 # --- And then a pull request is opened, by the service, with nobody asking. ---
 opened=''

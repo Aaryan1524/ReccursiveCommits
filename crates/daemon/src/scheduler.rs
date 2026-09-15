@@ -16,6 +16,33 @@ impl Scheduler {
         seed: u64,
         now_unix_ms: i64,
     ) -> Result<ScheduleSlot, SchedulerError> {
+        Self::schedule_at(
+            store,
+            release_unit_id,
+            package_id,
+            package_revision,
+            seed,
+            None,
+            now_unix_ms,
+        )
+    }
+
+    /// Selects a release time, either drawn from the policy or the exact one a person asked for.
+    ///
+    /// `requested_at_unix_ms` does not bypass the policy. It is checked against the same rules the
+    /// generator draws within, and refused when it is not a time this repository may publish at.
+    /// A requested time that passes is stored exactly as given: silently moving somebody's release
+    /// would tell them it is scheduled without telling them when.
+    #[allow(clippy::too_many_arguments)]
+    pub fn schedule_at(
+        store: &mut Store,
+        release_unit_id: ReleaseUnitId,
+        package_id: PackageId,
+        package_revision: Revision,
+        seed: u64,
+        requested_at_unix_ms: Option<i64>,
+        now_unix_ms: i64,
+    ) -> Result<ScheduleSlot, SchedulerError> {
         if let Some(slot) = store.schedule_slot(release_unit_id)? {
             return Ok(slot);
         }
@@ -39,10 +66,21 @@ impl Scheduler {
             .into_iter()
             .map(|slot| slot.selected_at_unix_ms)
             .collect::<Vec<_>>();
-        let selected = SlotGenerator::seeded(seed)
-            .select(&effective, now_unix_ms, 1, &existing)?
-            .pop()
-            .ok_or(SchedulerError::NoSelectableSlot)?;
+        let selected = match requested_at_unix_ms {
+            Some(requested) => effective
+                .validate_requested_slot(requested, now_unix_ms, &existing)
+                .map_err(|error| {
+                    // A refusal that only says no leaves the asker guessing. The policy is in hand
+                    // here, so the answer can carry what *is* allowed on the day they chose.
+                    SchedulerError::RequestedTimeRefused {
+                        detail: describe_refusal(&error, &effective, requested),
+                    }
+                })?,
+            None => SlotGenerator::seeded(seed)
+                .select(&effective, now_unix_ms, 1, &existing)?
+                .pop()
+                .ok_or(SchedulerError::NoSelectableSlot)?,
+        };
         Ok(store.persist_schedule_slot(&NewScheduleSlot {
             release_unit_id,
             package_id,
@@ -267,12 +305,57 @@ impl Scheduler {
     }
 }
 
+/// Turns a policy refusal into something worth reading, naming the hours that are open.
+///
+/// Deliberately does not offer to reschedule. Somebody who asked for 10:30 should be told why
+/// 10:30 is not possible, not quietly given 14:05 and left to discover it later.
+fn describe_refusal(
+    error: &reccursive_core::SchedulePolicyError,
+    policy: &reccursive_core::SchedulePolicy,
+    requested_unix_ms: i64,
+) -> String {
+    use reccursive_core::SchedulePolicyError as PolicyError;
+    let hours = || {
+        let windows = policy.windows_on(requested_unix_ms);
+        if windows.is_empty() {
+            format!(
+                "This repository publishes on {}.",
+                policy
+                    .allowed_days
+                    .iter()
+                    .map(|day| format!("{day:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            format!(
+                "Publishing hours that day are {}.",
+                windows
+                    .iter()
+                    .map(|window| format!(
+                        "{:02}:{:02}-{:02}:{:02}",
+                        window.start.hour, window.start.minute, window.end.hour, window.end.minute
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    };
+    match error {
+        PolicyError::RequestedTimeOutsideWindows { .. }
+        | PolicyError::RequestedDayNotAllowed { .. } => format!("{error}. {}", hours()),
+        other => other.to_string(),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
     Policy(#[from] reccursive_core::SchedulePolicyError),
+    #[error("{detail}")]
+    RequestedTimeRefused { detail: String },
     #[error("release unit {0} is not stored")]
     MissingReleaseUnit(ReleaseUnitId),
     #[error("release unit plan is not stored")]

@@ -315,6 +315,25 @@ Every classification the release worker can record has an action, and that is
 enforced rather than maintained: `ReleaseFailure` is an enum and the mapping
 matches on it exhaustively, so a new failure without guidance does not compile.
 
+`schedule` with no subcommand is the interactive scheduler: it shows work that is
+ready, lets you pick what ships together, asks for a date and a time in the
+repository's own zone, shows you the batch, and schedules it. It is for a person
+at a terminal — `--json` refuses it outright, and so does a pipe, because a
+prompt nobody can answer is worse than an error. Everything it does is the same
+`release create-unit` and `schedule unit` an automated caller would send.
+
+`ready` prints the same list non-interactively: work that has been captured, has
+passed its checks, and is not yet grouped into a release unit.
+
+`schedule unit --at "2026-09-18 10:30"` names an exact release time instead of
+letting the policy choose one. `--zone` says which zone that clock time is
+written in, defaulting to this machine's. **A requested time does not bypass the
+schedule policy.** It is checked against the same rules the scheduler draws
+within — allowed day, publishing window, minimum spacing, daily maximum — and
+refused, with the hours that *are* open, when it does not fit. It is never
+silently moved: asking for 10:30 and being given 14:05 would tell you a release
+is scheduled without telling you when.
+
 Times are shown the way you read a clock — `Tue 15 Sep 2026, 16:48 EDT`, in this
 machine's zone. `--json` keeps the raw millisecond value, because that is the
 stable contract other programs parse and a localised string would be neither.

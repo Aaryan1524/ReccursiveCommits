@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
 /// Local API protocol version. Version 16 adds package change inspection and check results.
-pub const API_VERSION: u16 = 20;
+pub const API_VERSION: u16 = 21;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -183,6 +183,7 @@ impl RequestEnvelope {
             }
             Command::Ping
             | Command::ListRepositories
+            | Command::ListReadyWork
             | Command::ListEvents { .. }
             | Command::GetPlan { .. }
             | Command::PlanHistory { .. }
@@ -228,6 +229,8 @@ pub enum Command {
     /// Register a repository and activate its first scheduling policy as one durable operation.
     InitializeRepository(InitializeRepositoryRequest),
     ListRepositories,
+    /// Report work that has been captured, has passed its checks, and is waiting to be scheduled.
+    ListReadyWork,
     ListEvents {
         limit: usize,
     },
@@ -403,6 +406,7 @@ impl Command {
             | Self::ExportQueue { .. } => true,
             Self::Ping
             | Self::ListRepositories
+            | Self::ListReadyWork
             | Self::ListEvents { .. }
             | Self::GetPlan { .. }
             | Self::PlanHistory { .. }
@@ -443,6 +447,7 @@ impl Command {
             | Self::ChangeRepositoryPolicy(_)
             | Self::InitializeRepository(_)
             | Self::ListRepositories
+            | Self::ListReadyWork
             | Self::ListEvents { .. }
             | Self::ImportPlan { .. }
             | Self::SealPlan { .. }
@@ -587,6 +592,14 @@ pub struct ScheduleUnitRequest {
     pub package_id: PackageId,
     pub package_revision: Revision,
     pub seed: u64,
+    /// An exact instant a person asked for, instead of letting the policy choose one.
+    ///
+    /// Absent is the original behaviour and stays the default, so an existing client that does not
+    /// know about this field keeps getting a policy-selected time. Present does not bypass the
+    /// policy: the instant is validated against it and refused if it is not a time this repository
+    /// is allowed to publish at.
+    #[serde(default)]
+    pub requested_at_unix_ms: Option<i64>,
 }
 
 impl ReleasePackageRequest {
@@ -1178,6 +1191,42 @@ pub enum QueuedUnitState {
     Published,
 }
 
+/// Work that could be scheduled right now, grouped the way it must be scheduled.
+///
+/// One group is one feature revision, because a release unit belongs to exactly one — tasks from
+/// two features cannot become one atomic release, and a selector that implied otherwise would be
+/// promising something the queue cannot deliver.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReadyWorkGroup {
+    pub repository_id: RepositoryId,
+    /// The checkout path, which is what a person recognises a repository by.
+    pub repository_path: String,
+    pub feature_id: FeatureId,
+    /// The plan's goal, used as the feature's title.
+    pub feature_goal: String,
+    pub plan_revision: Revision,
+    pub target: TargetRef,
+    pub development_target: Option<TargetRef>,
+    pub publication_mode: PublicationMode,
+    pub target_integration: TargetIntegration,
+    /// The policy's zone, which is the one a requested release time is read in.
+    pub timezone: String,
+    pub tasks: Vec<ReadyTaskView>,
+}
+
+/// One task that is ready to be scheduled.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReadyTaskView {
+    pub task_id: TaskId,
+    pub name: String,
+    /// Tasks that scheduling this one necessarily brings with it.
+    ///
+    /// A dependency whose milestone is `captured` couples two tasks into the same release unit, so
+    /// selecting one selects both. Reported rather than applied silently: work appearing in a
+    /// release nobody chose is exactly the surprise this product exists to avoid.
+    pub couples_with: Vec<TaskId>,
+}
+
 /// One branch a unit's or task's work has already reached.
 ///
 /// The distinction `is_target` carries is the whole point of immediate mode: work on a
@@ -1228,6 +1277,10 @@ pub struct PullRequestView {
 pub struct RepositoryQueueView {
     pub repository_id: RepositoryId,
     pub target: TargetRef,
+    /// How this repository reaches its target, so a reader knows whether a scheduled release
+    /// lands on the target or arrives as a request they will have to merge.
+    #[serde(default)]
+    pub target_integration: TargetIntegration,
     /// Present when the repository is paused, carrying the reason it was.
     pub paused: Option<String>,
     pub units: Vec<QueuedUnitView>,
@@ -1476,6 +1529,9 @@ pub enum ResponseData {
     RepositoryInitialized {
         repository: RepositoryView,
         schedule_policy: SchedulePolicyView,
+    },
+    ReadyWork {
+        groups: Vec<ReadyWorkGroup>,
     },
     Repositories {
         repositories: Vec<RepositoryView>,

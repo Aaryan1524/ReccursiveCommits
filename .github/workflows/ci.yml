@@ -57,3 +57,4 @@ jobs:
       - run: ./tests/scenarios/phase10_policy_changes.sh
       - run: ./tests/scenarios/phase11_recovery_matrix.sh
       - run: ./tests/scenarios/phase11_security_boundaries.sh
+      - run: ./tests/scenarios/phase12_requested_release_time.sh

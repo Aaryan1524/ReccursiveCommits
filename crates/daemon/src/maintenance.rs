@@ -248,6 +248,14 @@ impl Maintenance {
             else {
                 continue;
             };
+            // A pull-request repository never pushes to its target, so there is no second
+            // publication to plan. Its integration is a request opened as soon as the development
+            // publication succeeds, and then a person deciding when to merge.
+            if repository.active_policy.target_integration
+                == reccursive_core::TargetIntegration::PullRequest
+            {
+                continue;
+            }
             let target = repository.active_policy.target.clone();
             for unit in store.release_units_for_repository(repository.registration.id)? {
                 if self.shutdown.is_requested() {
@@ -366,25 +374,47 @@ impl Maintenance {
             let client =
                 reccursive_github::GitHubClient::new(endpoint.clone(), token, GITHUB_TIMEOUT);
 
-            for slot in store.overdue_schedule_slots(repository_id, now_unix_ms)? {
+            // Every unit, not only those holding an overdue slot. The pull request is opened as
+            // soon as the development publication it describes has succeeded — the scheduled time
+            // the person chose was for *that* publication, and making them wait for a second,
+            // unrelated future slot before the request appeared meant the one time they picked did
+            // not mean what it said.
+            for unit in store.release_units_for_repository(repository_id)? {
                 if self.shutdown.is_requested() {
                     return Ok(opened);
                 }
-                // Only the integration half is a pull request. Work that has not reached the
-                // development branch yet is an ordinary publication and belongs to the worker.
-                if !store.package_published_to(
-                    slot.package_id,
-                    slot.package_revision,
-                    &development_target,
-                )? {
+                if store.pull_request(unit.unit_id)?.is_some() {
                     continue;
                 }
-                if store.pull_request(slot.release_unit_id)?.is_some() {
+                // A unit's tasks are carried by one package, so any of them names it.
+                let Some(task_id) = unit.task_ids.iter().next().copied() else {
+                    continue;
+                };
+                let Some(package) = store.snapshot_package_for_task(
+                    unit.feature_id,
+                    unit.plan_revision,
+                    task_id,
+                )?
+                else {
+                    continue;
+                };
+                // Only the integration half is a pull request. Work that has not reached the
+                // development branch yet is an ordinary publication and belongs to the worker, and
+                // work already on the target has nothing left to request.
+                if !store.package_published_to(
+                    package.package_id,
+                    package.revision,
+                    &development_target,
+                )? || store.package_published_to(
+                    package.package_id,
+                    package.revision,
+                    &repository.active_policy.target,
+                )? {
                     continue;
                 }
                 let head = branch_name(&development_target);
                 let base = branch_name(&repository.active_policy.target);
-                let title = self.pull_request_title(store, slot.release_unit_id)?;
+                let title = self.pull_request_title(store, unit.unit_id)?;
                 let body = "Opened by reccursive at its scheduled release time.\n\n\
                             This pull request is not merged automatically, now or ever. \
                             Review and merge it yourself when you are ready.";
@@ -417,10 +447,10 @@ impl Maintenance {
                 };
 
                 store.record_pull_request(&reccursive_store::PullRequestRecord {
-                    release_unit_id: slot.release_unit_id,
+                    release_unit_id: unit.unit_id,
                     repository_id,
-                    package_id: slot.package_id,
-                    package_revision: slot.package_revision,
+                    package_id: package.package_id,
+                    package_revision: package.revision,
                     number: pull_request.number,
                     url: pull_request.url.clone(),
                     head: development_target.clone(),
@@ -430,10 +460,11 @@ impl Maintenance {
                     observed_at_unix_ms: now_unix_ms,
                     created_at_unix_ms: now_unix_ms,
                 })?;
-                // The selection has done its job. Withdrawing it returns the unit to the queue,
-                // where it waits on the pull request rather than on a release time.
+                // A live selection would now be meaningless: the unit waits on a person, not on
+                // a time. There usually is not one — the development publication withdrew its own
+                // — so an absent slot is the ordinary case rather than a fault.
                 store.invalidate_schedule_slot(
-                    slot.release_unit_id,
+                    unit.unit_id,
                     "a pull request was opened for this work",
                     now_unix_ms,
                 )?;

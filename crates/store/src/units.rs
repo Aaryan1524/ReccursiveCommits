@@ -405,6 +405,18 @@ impl Store {
     }
 
     /// Dependency edges a unit must be closed under: those satisfied by capture alone.
+    /// The coupling a plan revision imposes: which tasks scheduling one necessarily brings along.
+    ///
+    /// Public so a selector can show the expansion before it happens. `create_release_unit`
+    /// applies the same map, so what a person is shown is what they get.
+    pub fn coupling_for_plan(
+        &self,
+        feature_id: FeatureId,
+        plan_revision: Revision,
+    ) -> Result<BTreeMap<TaskId, BTreeSet<TaskId>>, StoreError> {
+        self.coupling_dependencies(feature_id, plan_revision)
+    }
+
     fn coupling_dependencies(
         &self,
         feature_id: FeatureId,

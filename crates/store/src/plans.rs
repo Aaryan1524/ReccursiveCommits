@@ -131,6 +131,55 @@ impl Store {
         .transpose()
     }
 
+    /// Lists the newest sealed revision of every feature belonging to a repository.
+    ///
+    /// Only sealed revisions, because only a sealed revision can own a workspace and therefore
+    /// carry captured work. Only the newest of each feature, because an earlier revision's work
+    /// has been superseded by the seal that replaced it.
+    pub fn sealed_features_for_repository(
+        &self,
+        repository_id: reccursive_core::RepositoryId,
+    ) -> Result<Vec<(FeatureId, Revision, String)>, StoreError> {
+        // The newest sealed revision per feature. `features` was replaced by `feature_plans`
+        // early on, which keeps the whole plan document, so the goal is read from there rather
+        // than from a column that no longer exists.
+        let mut statement = self.connection.prepare(
+            "SELECT p.feature_id, p.revision, p.document_json
+             FROM feature_plans AS p
+             JOIN (
+                 SELECT feature_id, MAX(revision) AS revision
+                 FROM feature_plans
+                 WHERE repository_id = ?1 AND sealed = 1
+                 GROUP BY feature_id
+             ) AS newest
+               ON newest.feature_id = p.feature_id AND newest.revision = p.revision
+             WHERE p.repository_id = ?1
+             ORDER BY p.created_at_unix_ms, p.feature_id",
+        )?;
+        let rows = statement
+            .query_map([repository_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(id, revision, document)| {
+                let plan: FeaturePlan = serde_json::from_str(&document)?;
+                Ok((
+                    id.parse().map_err(|error: reccursive_core::IdParseError| {
+                        StoreError::InvalidData(error.to_string())
+                    })?,
+                    Revision::new(revision)
+                        .map_err(|error| StoreError::InvalidData(error.to_string()))?,
+                    plan.goal,
+                ))
+            })
+            .collect()
+    }
+
     /// Lists all immutable revisions for a feature in ascending order.
     pub fn plan_history(&self, feature_id: FeatureId) -> Result<Vec<StoredPlan>, StoreError> {
         let mut statement = self.connection.prepare(

@@ -487,6 +487,112 @@ impl SlotGenerator {
     }
 }
 
+impl SchedulePolicy {
+    /// Reports whether one exact instant is a release time this policy permits.
+    ///
+    /// The counterpart to `SlotGenerator::select`: that one *chooses* a time, this one *checks*
+    /// one a person chose. Both have to agree, so the rules are expressed once here and the
+    /// generator's own candidate construction is the only other place that knows them.
+    ///
+    /// Written as a predicate rather than as "find the nearest allowed time and use that",
+    /// deliberately. Silently moving a requested release is worse than refusing it: somebody who
+    /// asked for 10:30 and got 14:05 has been told a release is scheduled and not told when.
+    ///
+    /// All civil-time arithmetic goes through the policy's own zone, so a window is the wall-clock
+    /// window a person means on the day in question, including across a daylight-saving change.
+    pub fn validate_requested_slot(
+        &self,
+        requested_unix_ms: i64,
+        not_before_unix_ms: i64,
+        existing_slots_unix_ms: &[i64],
+    ) -> Result<PlannedSlot, SchedulePolicyError> {
+        if requested_unix_ms < 0 {
+            return Err(SchedulePolicyError::InvalidSchedulingTimestamp(
+                requested_unix_ms,
+            ));
+        }
+        let timezone = self.timezone.as_str();
+        let requested = Timestamp::from_millisecond(requested_unix_ms)
+            .map_err(|_| SchedulePolicyError::InvalidSchedulingTimestamp(requested_unix_ms))?
+            .in_tz(timezone)
+            .map_err(|_| SchedulePolicyError::InvalidTimeZone(timezone.to_owned()))?;
+        let requested_local = requested.strftime("%Y-%m-%d %H:%M").to_string();
+
+        if requested_unix_ms < not_before_unix_ms {
+            return Err(SchedulePolicyError::RequestedTimeInPast { requested_local });
+        }
+
+        let date = requested.date();
+        let weekday = weekday_from_jiff(date.weekday());
+        if !self.allowed_days.contains(&weekday) {
+            return Err(SchedulePolicyError::RequestedDayNotAllowed { weekday });
+        }
+
+        // Asked of the same candidate construction the generator uses, so a time this accepts is
+        // one the generator could itself have produced. `not_before` is the requested instant so
+        // the whole window is offered and the minute alignment is the generator's own.
+        let spacing_ms = i64::from(self.minimum_spacing_minutes) * 60_000;
+        let window_minutes = candidates_for_date(self, date, requested_unix_ms, &[], spacing_ms)?;
+        if !window_minutes.contains(&requested_unix_ms) {
+            return Err(SchedulePolicyError::RequestedTimeOutsideWindows { requested_local });
+        }
+
+        // Spacing and the daily maximum are about what is already scheduled, so they are checked
+        // against the live slots rather than against the window shape.
+        if let Some(conflict) = existing_slots_unix_ms
+            .iter()
+            .copied()
+            .filter(|existing| *existing != requested_unix_ms)
+            .min_by_key(|existing| (existing - requested_unix_ms).abs())
+            && (conflict - requested_unix_ms).abs() < spacing_ms
+        {
+            return Err(SchedulePolicyError::RequestedTimeTooClose {
+                requested_local,
+                required_minutes: self.minimum_spacing_minutes,
+                actual_minutes: (conflict - requested_unix_ms).abs() / 60_000,
+            });
+        }
+
+        let existing_today = existing_slots_unix_ms
+            .iter()
+            .filter(|instant| {
+                **instant != requested_unix_ms
+                    && local_date(**instant, timezone).is_ok_and(|value| value == date)
+            })
+            .count();
+        if existing_today >= usize::from(self.daily_releases.maximum) {
+            return Err(SchedulePolicyError::RequestedDayIsFull {
+                local_date: date.to_string(),
+                maximum: self.daily_releases.maximum,
+            });
+        }
+
+        Ok(PlannedSlot {
+            selected_at_unix_ms: requested_unix_ms,
+            local_date: date.to_string(),
+            timezone: self.timezone.clone(),
+        })
+    }
+
+    /// The publishing windows that apply on the day an instant falls in, as local clock times.
+    ///
+    /// Exists so a refusal can say what *is* allowed instead of only what is not. Empty when the
+    /// weekday itself is not permitted.
+    #[must_use]
+    pub fn windows_on(&self, instant_unix_ms: i64) -> Vec<DailyWindow> {
+        let Ok(date) = local_date(instant_unix_ms, self.timezone.as_str()) else {
+            return Vec::new();
+        };
+        if !self
+            .allowed_days
+            .contains(&weekday_from_jiff(date.weekday()))
+        {
+            return Vec::new();
+        }
+        self.windows.clone()
+    }
+}
+
 fn candidates_for_date(
     policy: &SchedulePolicy,
     date: jiff::civil::Date,
@@ -603,6 +709,23 @@ pub enum SchedulePolicyError {
     InsufficientSchedulingCapacity { requested: usize, selected: usize },
     #[error("the scheduling horizon exceeded {MAX_SCHEDULING_HORIZON_DAYS} days")]
     SchedulingHorizonExceeded,
+    #[error("{requested_local} has already passed")]
+    RequestedTimeInPast { requested_local: String },
+    #[error("{weekday:?} is not a day this repository publishes on")]
+    RequestedDayNotAllowed { weekday: Weekday },
+    #[error("{requested_local} is outside this repository's publishing hours")]
+    RequestedTimeOutsideWindows { requested_local: String },
+    #[error(
+        "{requested_local} is within {actual_minutes} minutes of another scheduled release; \
+         this repository requires {required_minutes}"
+    )]
+    RequestedTimeTooClose {
+        requested_local: String,
+        required_minutes: u16,
+        actual_minutes: i64,
+    },
+    #[error("{local_date} already has the {maximum} releases this repository allows in a day")]
+    RequestedDayIsFull { local_date: String, maximum: u8 },
 }
 
 #[cfg(test)]
@@ -627,6 +750,208 @@ mod tests {
             MissedWindowBehavior::RescheduleForward,
         )
         .unwrap()
+    }
+
+    /// Monday-to-Friday business hours, which is what the requested-time tests are about. The
+    /// shared `policy()` helper permits only Monday to Wednesday, and reusing it here would have
+    /// made every weekday assertion below mean something other than it says.
+    fn business_policy() -> SchedulePolicy {
+        SchedulePolicy::new(
+            IanaTimeZone::new("America/New_York").unwrap(),
+            BTreeSet::from([
+                Weekday::Monday,
+                Weekday::Tuesday,
+                Weekday::Wednesday,
+                Weekday::Thursday,
+                Weekday::Friday,
+            ]),
+            vec![DailyWindow::new(time(9, 0), time(17, 0)).unwrap()],
+            DailyReleaseRange::new(1, 3).unwrap(),
+            90,
+            MissedWindowBehavior::RescheduleForward,
+        )
+        .unwrap()
+    }
+
+    /// Builds an instant from a civil time in the policy's zone, the way a person naming a date
+    /// and a clock time means it.
+    fn at_local(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> i64 {
+        jiff::civil::date(year, month, day)
+            .at(hour, minute, 0, 0)
+            .in_tz("America/New_York")
+            .unwrap()
+            .timestamp()
+            .as_millisecond()
+    }
+
+    #[test]
+    fn a_requested_time_inside_a_window_on_an_allowed_day_is_accepted_exactly() {
+        // 2026-09-18 is a Friday. The whole point is that the instant comes back unchanged: a
+        // scheduler that accepted 10:30 and stored 10:31 would be lying to the person who asked.
+        let requested = at_local(2026, 9, 18, 10, 30);
+        let slot = business_policy()
+            .validate_requested_slot(requested, at_local(2026, 9, 17, 9, 0), &[])
+            .unwrap();
+        assert_eq!(slot.selected_at_unix_ms, requested);
+        assert_eq!(slot.local_date, "2026-09-18");
+        assert_eq!(slot.timezone.as_str(), "America/New_York");
+    }
+
+    #[test]
+    fn a_requested_time_outside_the_window_is_refused_on_both_sides() {
+        let now = at_local(2026, 9, 17, 9, 0);
+        for (hour, minute) in [(8, 59), (22, 30), (17, 0), (0, 0)] {
+            let requested = at_local(2026, 9, 18, hour, minute);
+            assert!(
+                matches!(
+                    business_policy().validate_requested_slot(requested, now, &[]),
+                    Err(SchedulePolicyError::RequestedTimeOutsideWindows { .. })
+                ),
+                "{hour:02}:{minute:02} was not refused as outside the window"
+            );
+        }
+    }
+
+    #[test]
+    fn a_requested_time_on_a_day_the_repository_does_not_publish_is_refused() {
+        // 2026-09-19 is a Saturday, and the policy permits weekdays only.
+        let requested = at_local(2026, 9, 19, 10, 30);
+        assert!(matches!(
+            business_policy().validate_requested_slot(requested, at_local(2026, 9, 17, 9, 0), &[]),
+            Err(SchedulePolicyError::RequestedDayNotAllowed {
+                weekday: Weekday::Saturday
+            })
+        ));
+    }
+
+    #[test]
+    fn a_requested_time_in_the_past_is_refused_rather_than_moved() {
+        let requested = at_local(2026, 9, 18, 10, 30);
+        assert!(matches!(
+            business_policy().validate_requested_slot(requested, at_local(2026, 9, 18, 11, 0), &[]),
+            Err(SchedulePolicyError::RequestedTimeInPast { .. })
+        ));
+    }
+
+    #[test]
+    fn a_requested_time_too_close_to_an_existing_release_is_refused_and_says_by_how_much() {
+        // The policy requires 90 minutes of spacing.
+        let existing = at_local(2026, 9, 18, 10, 0);
+        let requested = at_local(2026, 9, 18, 11, 0);
+        match business_policy().validate_requested_slot(
+            requested,
+            at_local(2026, 9, 17, 9, 0),
+            &[existing],
+        ) {
+            Err(SchedulePolicyError::RequestedTimeTooClose {
+                required_minutes,
+                actual_minutes,
+                ..
+            }) => {
+                assert_eq!(required_minutes, 90);
+                assert_eq!(actual_minutes, 60);
+            }
+            other => panic!("expected a spacing refusal, got {other:?}"),
+        }
+        // Exactly the required spacing is allowed: the rule is "at least", not "more than".
+        let far_enough = at_local(2026, 9, 18, 11, 30);
+        assert!(
+            business_policy()
+                .validate_requested_slot(far_enough, at_local(2026, 9, 17, 9, 0), &[existing])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_day_already_at_its_release_maximum_refuses_another() {
+        // Three is this policy's daily maximum, and these are spaced far enough apart to make the
+        // daily limit the only reason a fourth is refused.
+        let existing = [
+            at_local(2026, 9, 18, 9, 0),
+            at_local(2026, 9, 18, 12, 0),
+            at_local(2026, 9, 18, 15, 0),
+        ];
+        let requested = at_local(2026, 9, 18, 16, 45);
+        assert!(matches!(
+            business_policy().validate_requested_slot(
+                requested,
+                at_local(2026, 9, 17, 9, 0),
+                &existing
+            ),
+            Err(SchedulePolicyError::RequestedDayIsFull { maximum: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn requesting_the_time_a_unit_already_holds_is_not_a_conflict_with_itself() {
+        // Re-validating an existing selection must not read that selection as a competitor, or
+        // rescheduling a unit to the time it already has would refuse itself.
+        let requested = at_local(2026, 9, 18, 10, 30);
+        assert!(
+            business_policy()
+                .validate_requested_slot(requested, at_local(2026, 9, 17, 9, 0), &[requested])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_requested_time_is_the_wall_clock_time_across_a_daylight_saving_change() {
+        // America/New_York leaves daylight saving on 2026-11-01. A window of 09:00-17:00 means
+        // those clock readings on both sides of the change, not a fixed offset from UTC.
+        let before = at_local(2026, 10, 30, 10, 30);
+        let after = at_local(2026, 11, 2, 10, 30);
+        let now = at_local(2026, 10, 29, 9, 0);
+        assert!(
+            business_policy()
+                .validate_requested_slot(before, now, &[])
+                .is_ok()
+        );
+        assert!(
+            business_policy()
+                .validate_requested_slot(after, now, &[])
+                .is_ok()
+        );
+        // The clocks went back in between, so the same wall-clock reading three days later is
+        // three days *and one hour* apart in absolute terms. Asserting that is what distinguishes
+        // real civil-time handling from arithmetic on a fixed UTC offset, which would have put
+        // one of these two outside the window.
+        assert_eq!(after - before, 3 * 86_400_000 + 3_600_000);
+    }
+
+    #[test]
+    fn a_repository_override_changes_what_a_requested_time_is_checked_against() {
+        // Overrides refine a shared policy. A requested time has to be judged by the effective
+        // policy, not the base one, or a repository's own narrower hours would not apply.
+        let effective = business_policy()
+            .with_override(&SchedulePolicyOverride {
+                windows: Some(vec![DailyWindow::new(time(13, 0), time(14, 0)).unwrap()]),
+                // A one-hour window cannot hold three releases 90 minutes apart, and the policy
+                // refuses to construct a combination that cannot be satisfied.
+                daily_releases: Some(DailyReleaseRange::new(1, 1).unwrap()),
+                ..SchedulePolicyOverride::default()
+            })
+            .unwrap();
+        let now = at_local(2026, 9, 17, 9, 0);
+        assert!(matches!(
+            effective.validate_requested_slot(at_local(2026, 9, 18, 10, 30), now, &[]),
+            Err(SchedulePolicyError::RequestedTimeOutsideWindows { .. })
+        ));
+        assert!(
+            effective
+                .validate_requested_slot(at_local(2026, 9, 18, 13, 30), now, &[])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn windows_on_reports_what_is_allowed_so_a_refusal_can_say_so() {
+        let friday = at_local(2026, 9, 18, 10, 30);
+        let saturday = at_local(2026, 9, 19, 10, 30);
+        let open = business_policy().windows_on(friday);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].start, time(9, 0));
+        assert_eq!(open[0].end, time(17, 0));
+        assert!(business_policy().windows_on(saturday).is_empty());
     }
 
     #[test]

@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
 /// Local API protocol version. Version 16 adds package change inspection and check results.
-pub const API_VERSION: u16 = 22;
+pub const API_VERSION: u16 = 23;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -155,6 +155,7 @@ impl RequestEnvelope {
             Command::SubmitTask(request) => request.validate(),
             Command::ReleasePackage(request) => request.validate(),
             Command::CreateReleaseUnit(request) => request.validate(),
+            Command::ScheduleCapturedWork(_) => Ok(()),
             Command::PauseRepository { reason, .. }
                 if reason.trim().is_empty() || reason.len() > 256 =>
             {
@@ -232,6 +233,13 @@ pub enum Command {
     ListRepositories,
     /// Report work that has been captured, has passed its checks, and is waiting to be scheduled.
     ListReadyWork,
+    /// Group a captured package into a release unit and select its release time in one step.
+    ///
+    /// One command because the two halves are one intention. Done separately, a grouping that
+    /// succeeds followed by a scheduling that fails leaves a release unit nobody asked for, and
+    /// the work inside it stops being offered as ready — it has a unit — while still showing in
+    /// the queue. That is how a trial lost a change: it was neither schedulable nor visibly gone.
+    ScheduleCapturedWork(ScheduleCapturedWorkRequest),
     /// Ask whether an instant is a release time a repository is currently allowed to publish at.
     ///
     /// Read-only and advisory. It reserves nothing, and the answer can stop being true the moment
@@ -405,6 +413,7 @@ impl Command {
             | Self::CancelTask(_)
             | Self::ReleasePackage(_)
             | Self::CreateReleaseUnit(_)
+            | Self::ScheduleCapturedWork(_)
             | Self::SetSchedulePolicy(_)
             | Self::ScheduleUnit(_)
             | Self::WithdrawScheduleSlot { .. }
@@ -462,6 +471,7 @@ impl Command {
             | Self::ListReadyWork
             | Self::ValidateReleaseTime { .. }
             | Self::ListEvents { .. }
+            | Self::ScheduleCapturedWork(_)
             | Self::ImportPlan { .. }
             | Self::SealPlan { .. }
             | Self::GetPlan { .. }
@@ -1204,6 +1214,20 @@ pub enum QueuedUnitState {
     Published,
 }
 
+/// Grouping and timing for one captured package, as a single intention.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleCapturedWorkRequest {
+    pub feature_id: FeatureId,
+    pub plan_revision: Revision,
+    pub package_id: PackageId,
+    pub package_revision: Revision,
+    /// An exact instant, or `None` to let the policy choose one.
+    #[serde(default)]
+    pub requested_at_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub seed: u64,
+}
+
 /// Whether a requested release time is currently allowed, and if not, which rule refused it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "verdict", rename_all = "snake_case")]
@@ -1284,6 +1308,21 @@ pub struct ReadyPackageView {
     pub task_ids: Vec<TaskId>,
     /// The plan's names for those tasks, which is what a person recognises the work by.
     pub task_names: Vec<String>,
+    /// What this work is waiting on, when it cannot be scheduled yet.
+    ///
+    /// Reported rather than filtered out: work that exists and is waiting is a different thing
+    /// from work that does not exist, and a list that silently omitted it would leave somebody
+    /// wondering where their change went.
+    #[serde(default)]
+    pub blocked_by: Option<BlockedByView>,
+}
+
+/// The prerequisite holding a piece of work back.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlockedByView {
+    /// The prerequisite's name, as the plan wrote it.
+    pub name: String,
+    pub milestone: TargetMilestone,
 }
 
 /// One branch a unit's or task's work has already reached.

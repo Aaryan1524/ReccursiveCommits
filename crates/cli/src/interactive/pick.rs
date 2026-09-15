@@ -61,21 +61,60 @@ pub fn group(groups: &[ReadyWorkGroup]) -> Result<&ReadyWorkGroup, CliFailure> {
 /// prompt would offer combinations that cannot be scheduled — and would only say so after the
 /// person had reviewed and confirmed them.
 pub fn package(group: &ReadyWorkGroup) -> Result<&ReadyPackageView, CliFailure> {
-    if let [only] = group.packages.as_slice() {
-        return Ok(only);
-    }
-    let labels: Vec<String> = group.packages.iter().map(describe).collect();
-    let chosen = answered(
-        Select::new("Which change should ship?", labels.clone())
-            .with_help_message("each entry was captured together and ships together")
-            .prompt(),
-    )?
-    .ok_or_else(cancelled)?;
-    let index = labels
+    // Blocked work is shown but not offered. Hiding it would leave somebody hunting for a change
+    // they know they captured; offering it would let them pick something scheduling must refuse,
+    // which is what a real trial did before this.
+    let (selectable, blocked): (Vec<_>, Vec<_>) = group
+        .packages
         .iter()
-        .position(|label| *label == chosen)
-        .expect("the chosen label came from this list");
-    Ok(&group.packages[index])
+        .partition(|package| package.blocked_by.is_none());
+    if !blocked.is_empty() {
+        println!("\nWaiting on other work:");
+        for package in &blocked {
+            let blocking = package
+                .blocked_by
+                .as_ref()
+                .expect("partitioned on this being present");
+            println!(
+                "  {}\n    waiting for: {} → {}",
+                describe(package),
+                blocking.name,
+                milestone_label(blocking.milestone)
+            );
+        }
+        println!();
+    }
+    match selectable.as_slice() {
+        [] => Err(CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "all_blocked",
+            "Every change here is waiting on work that has not been published yet.",
+        )),
+        [only] => Ok(only),
+        many => {
+            let labels: Vec<String> = many.iter().map(|package| describe(package)).collect();
+            let chosen = answered(
+                Select::new("Which change should ship?", labels.clone())
+                    .with_help_message("each entry was captured together and ships together")
+                    .prompt(),
+            )?
+            .ok_or_else(cancelled)?;
+            let index = labels
+                .iter()
+                .position(|label| *label == chosen)
+                .expect("the chosen label came from this list");
+            Ok(many[index])
+        }
+    }
+}
+
+/// Says what a prerequisite still has to reach, without the enum's own vocabulary.
+fn milestone_label(milestone: reccursive_protocol::TargetMilestone) -> &'static str {
+    match milestone {
+        reccursive_protocol::TargetMilestone::Captured => "captured",
+        reccursive_protocol::TargetMilestone::DevelopmentAvailable => "available for review",
+        reccursive_protocol::TargetMilestone::TargetPublished => "published",
+    }
 }
 
 /// Names a package by the work in it, never by its identifier.
@@ -89,4 +128,25 @@ pub fn describe(package: &ReadyPackageView) -> String {
 
 pub fn confirm(question: &str) -> Result<bool, CliFailure> {
     Ok(answered(Confirm::new(question).with_default(true).prompt())?.unwrap_or(false))
+}
+
+/// Where the work to schedule should come from, when both exist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Source {
+    Prepared,
+    Checkout,
+}
+
+/// Asks which of the two, only when both are actually available.
+pub fn source() -> Result<Source, CliFailure> {
+    const PREPARED: &str = "Prepared work";
+    const CHECKOUT: &str = "Current checkout changes";
+    let chosen =
+        answered(Select::new("What do you want to schedule?", vec![PREPARED, CHECKOUT]).prompt())?
+            .ok_or_else(cancelled)?;
+    Ok(if chosen == CHECKOUT {
+        Source::Checkout
+    } else {
+        Source::Prepared
+    })
 }

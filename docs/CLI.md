@@ -315,6 +315,22 @@ Every classification the release worker can record has an action, and that is
 enforced rather than maintained: `ReleaseFailure` is an enum and the mapping
 matches on it exhaustively, so a new failure without guidance does not compile.
 
+Times are shown the way you read a clock — `Tue 15 Sep 2026, 16:48 EDT`, in this
+machine's zone. `--json` keeps the raw millisecond value, because that is the
+stable contract other programs parse and a localised string would be neither.
+
+`schedule release-now UNIT` moves a unit's release time to now. It is subject to
+the same **dependency** rules as an ordinary selection — a prerequisite that has
+not reached its milestone still holds it back — but not to the release window:
+asking for something now is a decision a person is making now. A time asked for
+this way is recorded as such, so missed-window reconciliation leaves it alone
+rather than treating it as a window that was slept through.
+
+A workspace can only be built against a **sealed** plan revision, because
+sealing fixes the scope that the workspace and every package captured in it
+belong to. `plan seal FEATURE` appends a sealed copy as the next revision, so
+the revision number goes up — use the new one from then on.
+
 `diagnose REPOSITORY` answers one question — can this repository publish right
 now — and names whichever part cannot. **Checkout** is reported first and
 deliberately: credentials and signing are probed against the managed mirror,

@@ -52,6 +52,8 @@ impl Scheduler {
             eligible_at_unix_ms: now_unix_ms,
             selected_at_unix_ms: selected.selected_at_unix_ms,
             created_at_unix_ms: now_unix_ms,
+            // The scheduler chose this time, so a passed one really is a missed window.
+            released_on_request: false,
         })?)
     }
 }
@@ -224,6 +226,13 @@ impl Scheduler {
 
         let mut outcome = MissedWindowOutcome::default();
         for (index, slot) in overdue.into_iter().enumerate() {
+            // A time a person asked for is not a missed window. Both look identical here — a slot
+            // whose time has passed — so without this `schedule release-now`, issued outside a
+            // release window, was undone by the very next pass and the command did nothing at all.
+            if slot.released_on_request {
+                outcome.retained.push(slot.release_unit_id);
+                continue;
+            }
             // Oldest first: work that has waited longest is released first under a catch-up
             // allowance, rather than whichever unit happens to be cheapest to process.
             if index < allowance {
@@ -456,6 +465,7 @@ mod tests {
                     eligible_at_unix_ms: now_unix_ms - 4 * DAY_MS,
                     selected_at_unix_ms: now_unix_ms - 3 * DAY_MS + i64::try_from(index).unwrap(),
                     created_at_unix_ms: now_unix_ms - 4 * DAY_MS,
+                    released_on_request: false,
                 })
                 .unwrap();
             units.push(unit_id);
@@ -579,6 +589,7 @@ mod tests {
                 // would serve it last. Fair rotation must still reach it in the first round.
                 selected_at_unix_ms: now_unix_ms - 1,
                 created_at_unix_ms: now_unix_ms - 2 * DAY_MS,
+                released_on_request: false,
             })
             .unwrap();
         (repository_id, unit_id)

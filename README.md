@@ -176,15 +176,46 @@ it.
 
 ### 3. Give it work
 
-Import a plan, capture a change from an owned workspace, group it into a release
-unit, and schedule it. The full command sequence is in
-[docs/CLI.md](docs/CLI.md); an agent does this by itself through
-[docs/AGENT_HANDOFF.md](docs/AGENT_HANDOFF.md).
+A plan describes what you are delivering: phases, tasks, what each task depends
+on, and how you will know it is done. `plan template` writes one already wired
+to your repository, with real identifiers in it.
 
 ```bash
-./target/release/reccursive queue status
-./target/release/reccursive schedule preview <repository-id>
+reccursive plan template <repository-id> -o plan.json
+# edit plan.json: the goal and the task names
+reccursive plan import plan.json
+reccursive plan seal <feature-id>        # fixes the scope; appends the next revision
 ```
+
+**Sealing bumps the revision.** `import` stores revision 1, `seal` appends
+revision 2, and everything after this uses the sealed number. A workspace can
+only be built against a sealed revision, because the workspace and every package
+captured in it belong to a scope that must not change underneath them.
+
+Then do the work — **in the workspace it prints, not in your checkout**:
+
+```bash
+reccursive workspace create <feature-id> --revision 2
+#   → prints a path under the state directory. Edit files there.
+
+reccursive package capture <feature-id> --revision 2 --task <task-id>
+reccursive release create-unit <feature-id> --revision 2 --task <task-id>
+reccursive schedule unit <unit-id> --package-id <package-id> --revision 1
+```
+
+An agent collapses those last three into `reccursive task submit <feature-id>
+--task <task-id>`; see [docs/AGENT_HANDOFF.md](docs/AGENT_HANDOFF.md).
+
+```bash
+reccursive queue status
+reccursive schedule preview <repository-id>
+```
+
+> [!TIP]
+> To see a publish immediately instead of waiting for your window, activate a
+> policy whose window is all day, then `reccursive schedule release-now <unit>`.
+> The default policy is weekday working hours, so outside those a scheduled unit
+> is waiting rather than stuck.
 
 ### 4. Prove it publishes while the machine sleeps
 

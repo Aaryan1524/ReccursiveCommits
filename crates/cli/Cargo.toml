@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+jiff.workspace = true
 reccursive-protocol = { path = "../protocol" }
 reccursive-github = { path = "../github" }
 serde.workspace = true

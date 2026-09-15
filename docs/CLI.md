@@ -322,6 +322,18 @@ at a terminal — `--json` refuses it outright, and so does a pipe, because a
 prompt nobody can answer is worse than an error. Everything it does is the same
 `release create-unit` and `schedule unit` an automated caller would send.
 
+The wizard checks a chosen time **before** showing you the batch to confirm, so
+a refusal arrives at the prompt rather than after you have reviewed and said
+yes. A rejected weekday asks for the date again; a rejected hour or a spacing
+conflict asks only for the time, keeping the date you already gave.
+
+That check is advisory — it reserves nothing. Scheduling validates again when
+the slot is persisted, so a release someone else schedules in between is still
+refused, and the wizard says what changed and asks again.
+
+`schedule check REPOSITORY --at "2026-09-18 10:30"` runs the same check from the
+command line, returning a structured verdict.
+
 `ready` prints the same list non-interactively: work that has been captured, has
 passed its checks, and is not yet grouped into a release unit.
 

@@ -309,7 +309,7 @@ impl Scheduler {
 ///
 /// Deliberately does not offer to reschedule. Somebody who asked for 10:30 should be told why
 /// 10:30 is not possible, not quietly given 14:05 and left to discover it later.
-fn describe_refusal(
+pub(crate) fn describe_refusal(
     error: &reccursive_core::SchedulePolicyError,
     policy: &reccursive_core::SchedulePolicy,
     requested_unix_ms: i64,

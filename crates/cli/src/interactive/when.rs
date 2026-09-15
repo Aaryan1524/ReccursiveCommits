@@ -6,24 +6,92 @@
 //! against the same policy the scheduler draws from — this module never decides what is allowed.
 
 use inquire::Text;
-use reccursive_protocol::ReadyWorkGroup;
+use reccursive_protocol::{Command, ReadyWorkGroup, ReleaseTimeVerdict, ResponseData};
 
-use crate::{CliFailure, EXIT_ACTION_REQUIRED};
+use crate::{CliFailure, EXIT_ACTION_REQUIRED, Session, send};
 
 pub struct Chosen {
     pub instant_unix_ms: i64,
 }
 
-/// Asks for a date and a time in the repository's own zone.
-pub fn choose(group: &ReadyWorkGroup) -> Result<Chosen, CliFailure> {
+/// How many times to re-ask before giving up, so a wrong keyboard cannot loop forever.
+const MAX_ATTEMPTS: usize = 12;
+
+/// Asks for a date and a time in the repository's own zone, until one the repository allows.
+///
+/// The refusal arrives here rather than after the review screen, which is where it used to: being
+/// told on Saturday evening that Saturday is not a publishing day, only after choosing what to
+/// ship and confirming it, is the wrong end of the conversation.
+///
+/// The verdict comes from the daemon. This module does not know the scheduling rules and must not
+/// learn them — a second implementation of the policy would eventually disagree with the one that
+/// actually decides.
+pub fn choose(session: &Session, group: &ReadyWorkGroup) -> Result<Chosen, CliFailure> {
     let zone = group.timezone.clone();
-    let date = prompt(
-        "Date (YYYY-MM-DD)",
-        &format!("the day this should ship, in {zone}"),
-    )?;
-    let time = prompt("Time (HH:MM, 24-hour)", &format!("local time in {zone}"))?;
-    let instant_unix_ms = to_instant(&date, &time, &zone)?;
-    Ok(Chosen { instant_unix_ms })
+    let mut date: Option<String> = None;
+
+    for _ in 0..MAX_ATTEMPTS {
+        // A rejected weekday means the date is wrong; a rejected hour means the time is. Keeping
+        // the good half saves retyping the part that was already right.
+        let chosen_date = match date.take() {
+            Some(existing) => existing,
+            None => prompt(
+                "Date (YYYY-MM-DD)",
+                &format!("the day this should ship, in {zone}"),
+            )?,
+        };
+        let time = prompt("Time (HH:MM, 24-hour)", &format!("local time in {zone}"))?;
+
+        let instant_unix_ms = match to_instant(&chosen_date, &time, &zone) {
+            Ok(instant) => instant,
+            Err(failure) => {
+                // Malformed input never reached the daemon, so it is explained here and both
+                // fields are asked again.
+                println!("\n{}\n", failure.message);
+                continue;
+            }
+        };
+
+        match validate(session, group, instant_unix_ms)? {
+            ReleaseTimeVerdict::Allowed => return Ok(Chosen { instant_unix_ms }),
+            ReleaseTimeVerdict::Refused { reason, message } => {
+                println!("\n{message}\n");
+                if !reason.asks_for_a_new_date() {
+                    date = Some(chosen_date);
+                }
+            }
+        }
+    }
+    Err(CliFailure::new(
+        EXIT_ACTION_REQUIRED,
+        "no_valid_time",
+        "No release time was accepted. Nothing was scheduled.",
+    ))
+}
+
+/// Asks the daemon whether an instant is currently a time this repository may publish at.
+///
+/// Advisory: it reserves nothing, and scheduling checks again. A refusal after this one is a real
+/// answer about a queue that changed, not a contradiction.
+fn validate(
+    session: &Session,
+    group: &ReadyWorkGroup,
+    requested_at_unix_ms: i64,
+) -> Result<ReleaseTimeVerdict, CliFailure> {
+    match send(
+        session,
+        Command::ValidateReleaseTime {
+            repository_id: group.repository_id,
+            requested_at_unix_ms,
+        },
+    )? {
+        ResponseData::ReleaseTimeValidated { verdict } => Ok(verdict),
+        _ => Err(CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "unexpected_response",
+            "the service did not answer whether that time is allowed",
+        )),
+    }
 }
 
 fn prompt(label: &str, help: &str) -> Result<String, CliFailure> {

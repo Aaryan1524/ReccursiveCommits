@@ -15,6 +15,9 @@ mod when;
 
 pub use when::to_instant;
 
+/// How many times to re-ask before giving up, so a contended queue cannot loop forever.
+const MAX_ATTEMPTS: usize = 5;
+
 use std::io::Write;
 
 use reccursive_protocol::{
@@ -50,17 +53,42 @@ pub fn schedule(session: &Session, stdout: &mut impl Write) -> Result<(), CliFai
     // shown here rather than discovered on the review screen as an unexplained extra line.
     let included = pick::with_coupled(group, &selected);
 
-    let when = when::choose(group)?;
+    // The early check is advisory: it holds nothing and reserves nothing, so between answering
+    // the prompts and confirming, another release can be scheduled nearby and take the time away.
+    // The authoritative refusal comes from scheduling itself, and it is not a contradiction — it
+    // is a true answer about a queue that changed. When that happens the person is told what
+    // changed and asked again rather than dropped out of the wizard.
+    for _ in 0..MAX_ATTEMPTS {
+        let when = when::choose(session, group)?;
 
-    review(stdout, group, &included, &selected, when.instant_unix_ms)?;
-    if !pick::confirm("Schedule it?")? {
-        writeln!(stdout, "Not scheduled. No changes were made.").map_err(crate::output_error)?;
-        return Ok(());
+        review(stdout, group, &included, &selected, when.instant_unix_ms)?;
+        if !pick::confirm("Schedule it?")? {
+            writeln!(stdout, "Not scheduled. No changes were made.")
+                .map_err(crate::output_error)?;
+            return Ok(());
+        }
+
+        // Grouping is idempotent for an identical task set, so repeating this after a refused
+        // time returns the same unit rather than creating a second one.
+        let unit = create_unit(session, group, &included)?;
+        match schedule_unit(session, group, &unit, when.instant_unix_ms) {
+            Ok(slot) => return confirmation(stdout, group, &included, slot),
+            Err(failure) if failure.code == "invalid_request" => {
+                writeln!(
+                    stdout,
+                    "\nThat time is no longer available.\n{}\n",
+                    failure.message
+                )
+                .map_err(crate::output_error)?;
+            }
+            Err(failure) => return Err(failure),
+        }
     }
-
-    let unit = create_unit(session, group, &included)?;
-    let slot = schedule_unit(session, group, &unit, when.instant_unix_ms)?;
-    confirmation(stdout, group, &included, slot)
+    Err(CliFailure::new(
+        EXIT_ACTION_REQUIRED,
+        "no_valid_time",
+        "No release time could be secured. Nothing was scheduled.",
+    ))
 }
 
 /// A group's delivery strategy, in the words the person enrolling it chose.

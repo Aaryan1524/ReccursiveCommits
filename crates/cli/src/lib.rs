@@ -326,6 +326,18 @@ enum ScheduleCommand {
         #[arg(long, value_name = "IANA")]
         zone: Option<String>,
     },
+    /// Ask whether a time is one this repository may currently publish at.
+    ///
+    /// Advisory: it reserves nothing, and scheduling checks again when the slot is persisted.
+    Check {
+        repository_id: RepositoryId,
+        /// The local time to check, such as "2026-09-18 10:30".
+        #[arg(long, value_name = "WHEN")]
+        at: String,
+        /// Time zone the --at value is written in; this machine's zone when omitted.
+        #[arg(long, value_name = "IANA")]
+        zone: Option<String>,
+    },
     /// Show the durable slot previously selected for a release unit.
     Show { release_unit_id: ReleaseUnitId },
     /// Withdraw one unit's release time so it returns to the queue for a fresh selection.
@@ -1072,6 +1084,21 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                         package_revision: revision,
                         seed,
                     }),
+                )?;
+                output_data(data, cli.json, stdout)
+            }
+            ScheduleCommand::Check {
+                repository_id,
+                at,
+                zone,
+            } => {
+                let requested_at_unix_ms = requested_instant(&at, zone.as_deref())?;
+                let data = send(
+                    &session,
+                    Command::ValidateReleaseTime {
+                        repository_id,
+                        requested_at_unix_ms,
+                    },
                 )?;
                 output_data(data, cli.json, stdout)
             }
@@ -2624,6 +2651,14 @@ fn output_data(
             }
         ),
         ResponseData::ReadyWork { groups } => output_ready_work(out, &groups),
+        ResponseData::ReleaseTimeValidated { verdict } => match verdict {
+            reccursive_protocol::ReleaseTimeVerdict::Allowed => {
+                writeln!(out, "That is a release time this repository allows.")
+            }
+            reccursive_protocol::ReleaseTimeVerdict::Refused { message, .. } => {
+                writeln!(out, "{message}")
+            }
+        },
         ResponseData::RepositoryPolicyChanged { change } => {
             writeln!(
                 out,

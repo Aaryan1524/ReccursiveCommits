@@ -1268,20 +1268,22 @@ pub struct ReadyWorkGroup {
     pub target_integration: TargetIntegration,
     /// The policy's zone, which is the one a requested release time is read in.
     pub timezone: String,
-    pub tasks: Vec<ReadyTaskView>,
+    pub packages: Vec<ReadyPackageView>,
 }
 
-/// One task that is ready to be scheduled.
+/// One captured package that is ready to be scheduled.
+///
+/// The package is the unit of choice, not the task. A release unit's tasks must equal a package's
+/// tasks exactly — `ensure_unit_is_eligible` refuses anything else — so what ships together was
+/// decided when the work was captured, and offering tasks individually would invite a selection
+/// that cannot be scheduled at all.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ReadyTaskView {
-    pub task_id: TaskId,
-    pub name: String,
-    /// Tasks that scheduling this one necessarily brings with it.
-    ///
-    /// A dependency whose milestone is `captured` couples two tasks into the same release unit, so
-    /// selecting one selects both. Reported rather than applied silently: work appearing in a
-    /// release nobody chose is exactly the surprise this product exists to avoid.
-    pub couples_with: Vec<TaskId>,
+pub struct ReadyPackageView {
+    pub package_id: PackageId,
+    pub package_revision: Revision,
+    pub task_ids: Vec<TaskId>,
+    /// The plan's names for those tasks, which is what a person recognises the work by.
+    pub task_names: Vec<String>,
 }
 
 /// One branch a unit's or task's work has already reached.

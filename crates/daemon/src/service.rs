@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read, Write},
     os::unix::{
@@ -25,8 +25,8 @@ use reccursive_protocol::{
     IdempotencyKey, InitializeRepositoryRequest, IntegrationHealthView, MissedWindowView,
     PackageChangesView, PackageView, PlanView, PolicyChangeView, ProtocolValidationError,
     PublicationView, PullRequestView, QueueAuditView, QueueExportView, QueueRecoveryIssueView,
-    QueueSummaryView, QueuedUnitState, QueuedUnitView, ReadyTaskView, ReadyWorkGroup, ReasonCode,
-    ReleaseAttemptView, ReleasePackageRequest, ReleaseTimeRefusal, ReleaseTimeVerdict,
+    QueueSummaryView, QueuedUnitState, QueuedUnitView, ReadyPackageView, ReadyWorkGroup,
+    ReasonCode, ReleaseAttemptView, ReleasePackageRequest, ReleaseTimeRefusal, ReleaseTimeVerdict,
     ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryQueueView, RepositoryView,
     RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision, ScheduleChangeView,
     SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest,
@@ -3647,10 +3647,14 @@ fn list_ready_work(store: &Mutex<Store>) -> Result<ResponseData, ApiError> {
             .sealed_features_for_repository(repository_id)
             .map_err(store_api_error)?
         {
-            let coupling = store
-                .coupling_for_plan(feature_id, plan_revision)
-                .map_err(store_api_error)?;
-            let mut tasks = Vec::new();
+            // Grouped by the package that carries the work, because that is the only grouping a
+            // release unit may take: its tasks must equal a package's exactly. Offering tasks
+            // loose would let somebody pick a set no package delivers, which schedules fine right
+            // up until it is refused.
+            let mut by_package: BTreeMap<
+                (reccursive_protocol::PackageId, Revision),
+                (Vec<reccursive_protocol::TaskId>, Vec<String>),
+            > = BTreeMap::new();
             for task in store
                 .plan_tasks(feature_id, plan_revision)
                 .map_err(store_api_error)?
@@ -3665,16 +3669,36 @@ fn list_ready_work(store: &Mutex<Store>) -> Result<ResponseData, ApiError> {
                 {
                     continue;
                 }
-                tasks.push(ReadyTaskView {
-                    task_id: task.task_id,
-                    name: task.name,
-                    couples_with: coupling
-                        .get(&task.task_id)
-                        .map(|coupled| coupled.iter().copied().collect())
-                        .unwrap_or_default(),
+                let Some(package) = store
+                    .snapshot_package_for_task(feature_id, plan_revision, task.task_id)
+                    .map_err(store_api_error)?
+                else {
+                    continue;
+                };
+                let entry = by_package
+                    .entry((package.package_id, package.revision))
+                    .or_default();
+                entry.0.push(task.task_id);
+                entry.1.push(task.name);
+            }
+            // A package whose tasks are not all still queued is partly spoken for; scheduling it
+            // would be refused, so it is not offered.
+            let mut packages = Vec::new();
+            for ((package_id, package_revision), (task_ids, task_names)) in by_package {
+                let carried = store
+                    .package_task_ids(package_id, package_revision)
+                    .map_err(store_api_error)?;
+                if carried.len() != task_ids.len() {
+                    continue;
+                }
+                packages.push(ReadyPackageView {
+                    package_id,
+                    package_revision,
+                    task_ids,
+                    task_names,
                 });
             }
-            if tasks.is_empty() {
+            if packages.is_empty() {
                 continue;
             }
             groups.push(ReadyWorkGroup {
@@ -3688,7 +3712,7 @@ fn list_ready_work(store: &Mutex<Store>) -> Result<ResponseData, ApiError> {
                 publication_mode: repository.active_policy.publication_mode,
                 target_integration: repository.active_policy.target_integration,
                 timezone: schedule_timezone.clone(),
-                tasks,
+                packages,
             });
         }
     }

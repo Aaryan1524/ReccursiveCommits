@@ -3175,8 +3175,10 @@ fn output_ready_work(
     }
     for group in groups {
         writeln!(out, "{}", group.feature_goal)?;
-        for task in &group.tasks {
-            writeln!(out, "  {}", task.name)?;
+        // One line per captured package: that is the grouping a release actually takes, so
+        // listing loose task names would suggest they can be recombined.
+        for package in &group.packages {
+            writeln!(out, "  {}", package.task_names.join(", "))?;
         }
         writeln!(out)?;
     }

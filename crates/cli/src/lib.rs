@@ -539,17 +539,17 @@ enum GithubCommand {
     /// the process list and saved in shell history.
     SetToken {
         /// The repository the token belongs to.
-        repository_id: String,
+        repository_id: RepositoryId,
     },
     /// Report whether a token is stored, without printing it.
     Status {
         /// The repository to check.
-        repository_id: String,
+        repository_id: RepositoryId,
     },
     /// Remove a stored token.
     ForgetToken {
         /// The repository to remove the token for.
-        repository_id: String,
+        repository_id: RepositoryId,
     },
 }
 
@@ -1815,7 +1815,7 @@ fn run_github(
                     "could not read the token from standard input: {error}"
                 ))
             })?;
-            reccursive_github::storage::store(state_dir, &repository_id, token.trim())
+            reccursive_github::storage::store(state_dir, &repository_id.to_string(), token.trim())
                 .map_err(|error| refusal(error.to_string()))?;
             writeln!(
                 stdout,
@@ -1827,7 +1827,8 @@ fn run_github(
             .map_err(output_error)
         }
         GithubCommand::Status { repository_id } => {
-            let present = reccursive_github::storage::is_present(state_dir, &repository_id);
+            let present =
+                reccursive_github::storage::is_present(state_dir, &repository_id.to_string());
             writeln!(
                 stdout,
                 "{}",
@@ -1843,7 +1844,7 @@ fn run_github(
             .map_err(output_error)
         }
         GithubCommand::ForgetToken { repository_id } => {
-            reccursive_github::storage::forget(state_dir, &repository_id)
+            reccursive_github::storage::forget(state_dir, &repository_id.to_string())
                 .map_err(|error| refusal(error.to_string()))?;
             writeln!(
                 stdout,
@@ -2351,7 +2352,7 @@ fn output_queue_summary(
                         unit.release_unit_id.to_string(),
                         queued_state_label(unit.state).to_owned(),
                         unit.selected_at_unix_ms
-                            .map_or_else(|| "—".to_owned(), |at| at.to_string()),
+                            .map_or_else(|| "—".to_owned(), human_time),
                         unit.task_names.join(", "),
                     ]
                 })
@@ -2423,7 +2424,7 @@ fn output_schedule_history(
             .iter()
             .map(|change| {
                 vec![
-                    change.selected_at_unix_ms.to_string(),
+                    human_time(change.selected_at_unix_ms),
                     change
                         .withdrawn_at_unix_ms
                         .map_or_else(|| "—  (live)".to_owned(), |at| at.to_string()),
@@ -2457,6 +2458,25 @@ fn output_feature_status(
     Ok(())
 }
 
+/// Renders a stored instant the way a person reads a clock.
+///
+/// Human output only. `--json` keeps the raw milliseconds, because that is the stable contract
+/// other programs parse and a localised string would be neither stable nor parseable.
+///
+/// Times are shown in this machine's zone, since that is the one the reader is standing in.
+/// A value that cannot be turned into a civil time is printed as the number rather than hidden:
+/// the point of showing it is to say what is stored.
+fn human_time(unix_ms: i64) -> String {
+    jiff::Timestamp::from_millisecond(unix_ms)
+        .map(|timestamp| {
+            timestamp
+                .to_zoned(jiff::tz::TimeZone::system())
+                .strftime("%a %-d %b %Y, %H:%M %Z")
+                .to_string()
+        })
+        .unwrap_or_else(|_| unix_ms.to_string())
+}
+
 fn output_task_progress(out: &mut impl Write, task: &TaskProgressView) -> Result<(), CliFailure> {
     // The status is printed verbatim rather than collapsed into ready/not-ready, because
     // "blocked" and "cancelled" are answers a caller has to act on differently from "not yet".
@@ -2476,7 +2496,7 @@ fn output_task_progress(out: &mut impl Write, task: &TaskProgressView) -> Result
         writeln!(out, "      unit:    {unit_id}").map_err(output_error)?;
     }
     if let Some(selected) = task.selected_at_unix_ms {
-        writeln!(out, "      due:     {selected} (unix ms)").map_err(output_error)?;
+        writeln!(out, "      due:     {}", human_time(selected)).map_err(output_error)?;
     }
     // Where the work actually is. A task whose unit published to a development branch returns to
     // the queue awaiting its integration, so its status alone cannot say that the work is already
@@ -2506,7 +2526,7 @@ fn short_commit(commit: &str) -> &str {
 fn output_submission(out: &mut impl Write, submission: &SubmissionView) -> Result<(), CliFailure> {
     writeln!(
         out,
-        "{} {}\n  package: {}\n  unit:    {}\n  due:     {} (unix ms)",
+        "{} {}\n  package: {}\n  unit:    {}\n  due:     {}",
         if submission.created {
             "Submitted"
         } else {
@@ -2515,7 +2535,7 @@ fn output_submission(out: &mut impl Write, submission: &SubmissionView) -> Resul
         submission.unit.unit_id,
         submission.package.package_id,
         submission.unit.unit_id,
-        submission.slot.selected_at_unix_ms
+        human_time(submission.slot.selected_at_unix_ms)
     )
     .map_err(output_error)
 }
@@ -2890,7 +2910,7 @@ fn output_schedule_preview(
                 vec![
                     slot.release_unit_id.to_string(),
                     slot.package_id.to_string(),
-                    slot.selected_at_unix_ms.to_string(),
+                    human_time(slot.selected_at_unix_ms),
                     slot.timezone.clone(),
                 ]
             })
@@ -2949,7 +2969,7 @@ fn output_due_units(out: &mut impl Write, units: &[DueUnitView]) -> io::Result<(
                     unit.release_unit_id.to_string(),
                     unit.repository_id.to_string(),
                     unit.package_id.to_string(),
-                    unit.selected_at_unix_ms.to_string(),
+                    human_time(unit.selected_at_unix_ms),
                 ]
             })
             .collect(),
@@ -2959,13 +2979,13 @@ fn output_due_units(out: &mut impl Write, units: &[DueUnitView]) -> io::Result<(
 fn output_schedule_slot(out: &mut impl Write, slot: &ScheduleSlotView) -> io::Result<()> {
     writeln!(
         out,
-        "Unit: {}\nPackage: {} revision {}\nSelected: {} ({})\nEligible since: {}",
+        "Unit: {}\nPackage: {} revision {}\nSelected: {}\nPolicy time zone: {}\nEligible since: {}",
         slot.release_unit_id,
         slot.package_id,
         slot.package_revision.get(),
-        slot.selected_at_unix_ms,
+        human_time(slot.selected_at_unix_ms),
         slot.timezone,
-        slot.eligible_at_unix_ms,
+        human_time(slot.eligible_at_unix_ms),
     )
 }
 
@@ -2986,7 +3006,7 @@ fn output_release_attempt(out: &mut impl Write, attempt: &ReleaseAttemptView) ->
             .unwrap_or("not yet observed"),
         attempt
             .retry_not_before_unix_ms
-            .map_or_else(|| "not scheduled".into(), |value| value.to_string()),
+            .map_or_else(|| "not scheduled".into(), human_time),
         attempt.failure_classification.as_deref().unwrap_or("none"),
     )?;
     if let Some(reason) = &attempt.reason {

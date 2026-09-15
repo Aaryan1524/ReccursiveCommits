@@ -33,8 +33,24 @@ pub fn credentials_root(state_dir: &Path) -> PathBuf {
     state_dir.join("credentials")
 }
 
-fn token_path(state_dir: &Path, repository_id: &str) -> PathBuf {
-    credentials_root(state_dir).join(format!("github-{repository_id}.token"))
+/// Names the file a repository's token lives in, or refuses an identifier that could leave the
+/// credentials directory.
+///
+/// The `github-` prefix happens to block the obvious traversals, because `github-../x` needs a
+/// directory literally called `github-..`. That is accident rather than design, and accidents stop
+/// holding when the format string changes. This checks the identifier instead.
+fn token_path(state_dir: &Path, repository_id: &str) -> Result<PathBuf, TokenError> {
+    let usable = !repository_id.is_empty()
+        && repository_id.len() <= 128
+        && repository_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if !usable {
+        return Err(TokenError::Unusable(format!(
+            "{repository_id:?} is not a repository identifier"
+        )));
+    }
+    Ok(credentials_root(state_dir).join(format!("github-{repository_id}.token")))
 }
 
 /// Stores a token for one repository, replacing any previous one.
@@ -46,11 +62,11 @@ pub fn store(state_dir: &Path, repository_id: &str, token: &str) -> Result<(), T
     // then discovered at the moment a publication needed it.
     Token::new(token).map_err(|error: GitHubError| TokenError::Unusable(error.to_string()))?;
 
+    let destination = token_path(state_dir, repository_id)?;
     let root = credentials_root(state_dir);
     fs::create_dir_all(&root)?;
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
 
-    let destination = token_path(state_dir, repository_id);
     let staging = destination.with_extension("token.partial");
     let _ = fs::remove_file(&staging);
     {
@@ -69,7 +85,7 @@ pub fn store(state_dir: &Path, repository_id: &str, token: &str) -> Result<(), T
 
 /// Reads the token for one repository.
 pub fn load(state_dir: &Path, repository_id: &str) -> Result<Token, TokenError> {
-    let path = token_path(state_dir, repository_id);
+    let path = token_path(state_dir, repository_id)?;
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == ErrorKind::NotFound => return Err(TokenError::Missing),
@@ -83,12 +99,12 @@ pub fn load(state_dir: &Path, repository_id: &str) -> Result<Token, TokenError> 
 /// This is what the local API answers with. The token itself never crosses that boundary.
 #[must_use]
 pub fn is_present(state_dir: &Path, repository_id: &str) -> bool {
-    token_path(state_dir, repository_id).exists()
+    token_path(state_dir, repository_id).is_ok_and(|path| path.exists())
 }
 
 /// Removes a stored token. Absent is success: the caller asked for it to be gone.
 pub fn forget(state_dir: &Path, repository_id: &str) -> Result<(), TokenError> {
-    match fs::remove_file(token_path(state_dir, repository_id)) {
+    match fs::remove_file(token_path(state_dir, repository_id)?) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(TokenError::Io(error)),
@@ -108,7 +124,7 @@ mod tests {
         store(directory.path(), repository, "ghp_example_token").unwrap();
         assert!(is_present(directory.path(), repository));
 
-        let mode = fs::metadata(token_path(directory.path(), repository))
+        let mode = fs::metadata(token_path(directory.path(), repository).unwrap())
             .unwrap()
             .permissions()
             .mode()
@@ -131,7 +147,7 @@ mod tests {
         store(directory.path(), repository, "ghp_first").unwrap();
         store(directory.path(), repository, "ghp_second").unwrap();
         assert_eq!(
-            fs::read_to_string(token_path(directory.path(), repository)).unwrap(),
+            fs::read_to_string(token_path(directory.path(), repository).unwrap()).unwrap(),
             "ghp_second"
         );
     }
@@ -146,6 +162,31 @@ mod tests {
         ));
         // Nothing was written, so the failure cannot be mistaken for a stored-but-broken token.
         assert!(!is_present(directory.path(), repository));
+    }
+
+    #[test]
+    fn an_identifier_that_could_leave_the_credentials_directory_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        for hostile in [
+            "../../escaped",
+            "..",
+            ".",
+            "/etc/passwd",
+            "repo/../../x",
+            "repo\0null",
+            "",
+        ] {
+            assert!(
+                token_path(directory.path(), hostile).is_err(),
+                "{hostile:?} was accepted as a repository identifier"
+            );
+            assert!(
+                store(directory.path(), hostile, "ghp_x").is_err(),
+                "{hostile:?}"
+            );
+        }
+        // And nothing was created on the way to refusing.
+        assert!(!credentials_root(directory.path()).exists());
     }
 
     #[test]

@@ -26,6 +26,11 @@ jobs:
   test:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # A scenario that hangs waits on a daemon, a socket, or a prompt that will never arrive, and
+    # none of those resolve themselves. Without a bound one did exactly that for six hours before
+    # the platform killed it, leaving an orphan CLI process behind. The whole suite finishes in
+    # about twenty minutes, so forty says "stuck" rather than "slow".
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:

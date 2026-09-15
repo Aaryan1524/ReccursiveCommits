@@ -196,11 +196,22 @@ spaced="$(cli schedule unit "$unit_two" --package-id "$package_two" --revision 1
   fail "a correctly spaced request was not honoured exactly"
 
 # --- The human view shows a readable time and no internals. ---
-queue_text="$(plain queue status)"
+#
+# Human output renders in the machine's own zone, which is the right behaviour and makes a bare
+# "10:30" assertion a statement about the machine running the test rather than about the product.
+# CI runs in UTC and read 14:30. Pinning TZ for this one invocation keeps the assertion about the
+# rendering while staying true wherever it runs.
+queue_text="$(TZ=America/New_York plain queue status)"
 grep -q "10:30" <<<"$queue_text" || \
   fail "the queue does not show the scheduled clock time: $queue_text"
 grep -q "1789741800000" <<<"$queue_text" && \
   fail "the queue printed a raw millisecond timestamp to a person"
+
+# The same instant in a different zone is the same instant, differently written. Asserting both
+# is what proves the rendering follows the reader rather than a hardcoded offset.
+utc_text="$(TZ=UTC plain queue status)"
+grep -q "14:30 UTC" <<<"$utc_text" || \
+  fail "the queue does not render the scheduled time in the reader's own zone: $utc_text"
 
 # --- And the machine view still carries the exact instant. ---
 grep -q '"selected_at_unix_ms":1789741800000' <<<"$(cli queue status)" || \

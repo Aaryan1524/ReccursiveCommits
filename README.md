@@ -3,7 +3,7 @@
 </div>
 
 <div align="center">
-  <h3>Finish the work today. Let it reach your branch on a schedule you chose — with the laptop shut.</h3>
+  <h3>Finish the work today. Let the commit be made on the schedule you chose — without you at the keyboard.</h3>
 </div>
 
 <div align="center">
@@ -35,9 +35,12 @@ cargo build --workspace --release
 
 ## Why use it
 
-- **It publishes while you are away** — the service is a launchd agent, so
-  closing the terminal does not stop it. Sleep the machine through a release
-  time and the work is published shortly after it wakes, not silently skipped.
+- **It publishes without you** — the service is a launchd agent, so closing the
+  terminal does not stop it and a crash restarts it. It runs in your login
+  session, which is what lets it publish with the Git credentials you already
+  have, and which also means logging out or shutting down stops it until you log
+  in again. Sleep the machine through a release time and the work is published
+  shortly after it wakes — late, but never silently skipped.
 
 - **The commit is created at release time** — not written now and held back, and
   never backdated. What lands is the change you captured, applied to whatever

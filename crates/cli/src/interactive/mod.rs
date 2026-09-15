@@ -15,11 +15,14 @@ mod when;
 
 pub use when::to_instant;
 
+/// How many times to re-ask before giving up, so a contended queue cannot loop forever.
+const MAX_ATTEMPTS: usize = 5;
+
 use std::io::Write;
 
 use reccursive_protocol::{
     Command, CreateReleaseUnitRequest, ReadyWorkGroup, ReleaseUnitId, ResponseData,
-    ScheduleUnitRequest, TargetIntegration, TaskId,
+    ScheduleUnitRequest, TargetIntegration,
 };
 
 use crate::{CliFailure, EXIT_ACTION_REQUIRED, Session, human_time, send};
@@ -40,27 +43,44 @@ pub fn schedule(session: &Session, stdout: &mut impl Write) -> Result<(), CliFai
     }
 
     let group = pick::group(&groups)?;
-    let selected = pick::tasks(group)?;
-    if selected.is_empty() {
-        writeln!(stdout, "Nothing selected. No changes were made.").map_err(crate::output_error)?;
-        return Ok(());
+    let package = pick::package(group)?;
+
+    // The early check is advisory: it holds nothing and reserves nothing, so between answering
+    // the prompts and confirming, another release can be scheduled nearby and take the time away.
+    // The authoritative refusal comes from scheduling itself, and it is not a contradiction — it
+    // is a true answer about a queue that changed. When that happens the person is told what
+    // changed and asked again rather than dropped out of the wizard.
+    for _ in 0..MAX_ATTEMPTS {
+        let when = when::choose(session, group)?;
+
+        review(stdout, group, package, when.instant_unix_ms)?;
+        if !pick::confirm("Schedule it?")? {
+            writeln!(stdout, "Not scheduled. No changes were made.")
+                .map_err(crate::output_error)?;
+            return Ok(());
+        }
+
+        // Grouping is idempotent for an identical task set, so repeating this after a refused
+        // time returns the same unit rather than creating a second one.
+        let unit = create_unit(session, group, package)?;
+        match schedule_unit(session, package, &unit, when.instant_unix_ms) {
+            Ok(slot) => return confirmation(stdout, group, package, slot),
+            Err(failure) if failure.code == "invalid_request" => {
+                writeln!(
+                    stdout,
+                    "\nThat time is no longer available.\n{}\n",
+                    failure.message
+                )
+                .map_err(crate::output_error)?;
+            }
+            Err(failure) => return Err(failure),
+        }
     }
-
-    // Coupling is applied by the queue whether or not anyone asked for it, so it is resolved and
-    // shown here rather than discovered on the review screen as an unexplained extra line.
-    let included = pick::with_coupled(group, &selected);
-
-    let when = when::choose(group)?;
-
-    review(stdout, group, &included, &selected, when.instant_unix_ms)?;
-    if !pick::confirm("Schedule it?")? {
-        writeln!(stdout, "Not scheduled. No changes were made.").map_err(crate::output_error)?;
-        return Ok(());
-    }
-
-    let unit = create_unit(session, group, &included)?;
-    let slot = schedule_unit(session, group, &unit, when.instant_unix_ms)?;
-    confirmation(stdout, group, &included, slot)
+    Err(CliFailure::new(
+        EXIT_ACTION_REQUIRED,
+        "no_valid_time",
+        "No release time could be secured. Nothing was scheduled.",
+    ))
 }
 
 /// A group's delivery strategy, in the words the person enrolling it chose.
@@ -101,31 +121,20 @@ fn ready_work(session: &Session) -> Result<Vec<ReadyWorkGroup>, CliFailure> {
 fn review(
     stdout: &mut impl Write,
     group: &ReadyWorkGroup,
-    included: &[TaskId],
-    chosen: &[TaskId],
+    package: &reccursive_protocol::ReadyPackageView,
     instant_unix_ms: i64,
 ) -> Result<(), CliFailure> {
     writeln!(stdout, "\nReview\n").map_err(crate::output_error)?;
     writeln!(stdout, "{}", group.feature_goal).map_err(crate::output_error)?;
-    for task_id in included {
-        let name = group
-            .tasks
-            .iter()
-            .find(|task| task.task_id == *task_id)
-            .map_or("(unnamed)", |task| task.name.as_str());
-        // A task nobody ticked is one the plan couples to one they did. Saying so is the whole
-        // point: work appearing in a release that nobody chose is the surprise to avoid.
-        if chosen.contains(task_id) {
-            writeln!(stdout, "  {name}").map_err(crate::output_error)?;
-        } else {
-            writeln!(stdout, "  {name}  (required by your selection)")
-                .map_err(crate::output_error)?;
-        }
+    // Every task in the package, named. A package carries what was captured together and ships
+    // together, so there is nothing here the person did not already choose by choosing it.
+    for name in &package.task_names {
+        writeln!(stdout, "  {name}").map_err(crate::output_error)?;
     }
     writeln!(
         stdout,
         "\n{}\n{}\n",
-        change_count(included.len()),
+        change_count(package.task_names.len()),
         delivery(group)
     )
     .map_err(crate::output_error)?;
@@ -143,13 +152,15 @@ fn change_count(count: usize) -> String {
 fn create_unit(
     session: &Session,
     group: &ReadyWorkGroup,
-    included: &[TaskId],
+    package: &reccursive_protocol::ReadyPackageView,
 ) -> Result<reccursive_protocol::ReleaseUnitView, CliFailure> {
     let request = CreateReleaseUnitRequest {
         release_unit_id: ReleaseUnitId::new(),
         feature_id: group.feature_id,
         plan_revision: group.plan_revision,
-        task_ids: included.iter().copied().collect(),
+        // Exactly the package's tasks. A unit whose set differs from its package's is refused
+        // when it is scheduled, so the package decides this rather than the person.
+        task_ids: package.task_ids.iter().copied().collect(),
     };
     match send(session, Command::CreateReleaseUnit(request))? {
         ResponseData::ReleaseUnitCreated { unit } => Ok(unit),
@@ -163,15 +174,14 @@ fn create_unit(
 
 fn schedule_unit(
     session: &Session,
-    group: &ReadyWorkGroup,
+    package: &reccursive_protocol::ReadyPackageView,
     unit: &reccursive_protocol::ReleaseUnitView,
     instant_unix_ms: i64,
 ) -> Result<reccursive_protocol::ScheduleSlotView, CliFailure> {
-    let package = package_for(session, group, unit)?;
     let request = ScheduleUnitRequest {
         release_unit_id: unit.unit_id,
-        package_id: package.0,
-        package_revision: package.1,
+        package_id: package.package_id,
+        package_revision: package.package_revision,
         // Unused when a time is requested, but the field is not optional and a fixed value keeps
         // a repeated wizard run reproducible rather than accidentally drawing a different slot.
         seed: 0,
@@ -187,59 +197,18 @@ fn schedule_unit(
     }
 }
 
-/// Finds the package carrying this unit's work, so the person never has to know it exists.
-fn package_for(
-    session: &Session,
-    group: &ReadyWorkGroup,
-    unit: &reccursive_protocol::ReleaseUnitView,
-) -> Result<
-    (
-        reccursive_protocol::PackageId,
-        reccursive_protocol::Revision,
-    ),
-    CliFailure,
-> {
-    let ResponseData::FeatureStatus { status } = send(
-        session,
-        Command::GetFeatureStatus {
-            feature_id: group.feature_id,
-            revision: Some(group.plan_revision),
-        },
-    )?
-    else {
-        return Err(CliFailure::new(
-            EXIT_ACTION_REQUIRED,
-            "unexpected_response",
-            "the service did not return the feature's status",
-        ));
-    };
-    status
-        .tasks
-        .iter()
-        .find(|task| unit.task_ids.contains(&task.task_id) && task.package_id.is_some())
-        .and_then(|task| task.package_id)
-        .map(|package_id| (package_id, reccursive_protocol::Revision::FIRST))
-        .ok_or_else(|| {
-            CliFailure::new(
-                EXIT_ACTION_REQUIRED,
-                "package_missing",
-                "this work has no captured package; capture it before scheduling",
-            )
-        })
-}
-
 fn confirmation(
     stdout: &mut impl Write,
     group: &ReadyWorkGroup,
-    included: &[TaskId],
+    package: &reccursive_protocol::ReadyPackageView,
     slot: reccursive_protocol::ScheduleSlotView,
 ) -> Result<(), CliFailure> {
     writeln!(
         stdout,
-        "\n✓ Scheduled\n\n{}\n{}\n\n{} · {}\n\nYou can go offline.",
+        "\n✓ Scheduled\n\n{}\n{}\n\n{} · {}\n\nReccursive will handle it automatically.",
         group.feature_goal,
         human_time(slot.selected_at_unix_ms),
-        change_count(included.len()),
+        change_count(package.task_names.len()),
         delivery(group),
     )
     .map_err(crate::output_error)

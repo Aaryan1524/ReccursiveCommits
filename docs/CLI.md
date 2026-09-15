@@ -315,6 +315,19 @@ Every classification the release worker can record has an action, and that is
 enforced rather than maintained: `ReleaseFailure` is an enum and the mapping
 matches on it exhaustively, so a new failure without guidance does not compile.
 
+`schedule` with no subcommand works from whichever source has work. If your own
+checkout has uncommitted changes and nothing has been prepared through the plan
+flow, it shows those changes, asks what to call them, and schedules them — no
+plan, revision, package or identifier involved. It reads your checkout and never
+writes to it: the snapshot is taken into the daemon's own storage, so editing
+afterwards cannot change what was scheduled, and nothing is ever reset, stashed,
+staged or committed on your behalf. Ignored files are excluded, because git
+excludes them. Renames are refused for now rather than captured wrongly.
+
+If prepared work exists as well, it asks which you mean. The two are never
+combined into one release: a release unit's tasks must match a captured
+package's exactly.
+
 `schedule` with no subcommand is the interactive scheduler: it shows work that is
 ready, lets you pick what ships together, asks for a date and a time in the
 repository's own zone, shows you the batch, and schedules it. It is for a person

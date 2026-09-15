@@ -34,6 +34,7 @@ pub use pull_requests::PullRequestRecord;
 pub use redaction::{redact_json, redact_text};
 pub use repository::{RepositoryRegistration, StoredRepository, StoredSchedulePolicy};
 use rusqlite::{Connection, OpenFlags};
+pub use schedules::BlockingPrerequisite;
 pub use schedules::{
     NewScheduleSlot, RepositoryPause, ScheduleRecalculation, ScheduleSlot, WithdrawnSlot,
 };

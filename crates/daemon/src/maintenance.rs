@@ -198,12 +198,20 @@ impl Maintenance {
             TimeTransition::ClockMovedBackwards { .. } | TimeTransition::Continuous => {}
         }
 
+        // A slot whose time arrived moments ago is not a missed window — it is a release about to
+        // happen, and the pass that publishes runs immediately after this one. Without this grace
+        // a `reschedule_forward` repository could never publish anything at all: every tick
+        // reconciled the slot into the future before the release pass could claim it, forever.
+        // The grace is one interval, because that is the longest a due slot can wait for its pass.
+        let missed_before = wall_clock_ms
+            .saturating_sub(i64::try_from(self.interval.as_millis()).unwrap_or(i64::MAX));
+
         // Shutdown stops new work, not this: reconciling is what records what is overdue, and a
         // service going down should leave that written rather than discovered later.
         for repository in store.repositories()? {
             let repository_id = repository.registration.id;
             if store
-                .overdue_schedule_slots(repository_id, wall_clock_ms)?
+                .overdue_schedule_slots(repository_id, missed_before)?
                 .is_empty()
             {
                 continue;
@@ -212,7 +220,7 @@ impl Maintenance {
                 store,
                 repository_id,
                 seed,
-                wall_clock_ms,
+                missed_before,
             ) {
                 Ok(_) => report.repositories_reconciled += 1,
                 // A repository with no policy configured yet is not an error worth stopping for.

@@ -30,6 +30,14 @@ pub struct ScheduleSlot {
     pub released_on_request: bool,
 }
 
+/// The prerequisite holding a piece of work back, named the way a person would recognise it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlockingPrerequisite {
+    pub task_id: reccursive_core::TaskId,
+    pub name: String,
+    pub milestone: TargetMilestone,
+}
+
 /// Why a repository is currently not handing out release work.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RepositoryPause {
@@ -502,6 +510,82 @@ impl Store {
         Ok(found.is_some())
     }
 
+    /// Reports whether a prerequisite has reached the milestone a dependent waits on.
+    ///
+    /// Extracted so the question can be asked before anybody commits to a release as well as when
+    /// one is scheduled. Two copies of this would eventually disagree, and the disagreement would
+    /// surface as work a selector offered and the scheduler then refused — which is exactly the
+    /// failure this was pulled out to fix.
+    fn milestone_is_met(
+        &self,
+        prerequisite: reccursive_core::TaskId,
+        dependency: &crate::TaskRecord,
+        milestone: TargetMilestone,
+        development_target: &Option<reccursive_core::TargetRef>,
+    ) -> Result<bool, StoreError> {
+        Ok(match milestone {
+            TargetMilestone::Captured => {
+                dependency.state.status() != TaskStatus::Planned
+                    && dependency.state.status() != TaskStatus::Building
+            }
+            TargetMilestone::TargetPublished => dependency.state.status() == TaskStatus::Published,
+            // A task published to the target has necessarily passed through being available, so
+            // the target milestone satisfies this one too. Without that, a scheduled-mode
+            // repository — which never publishes to a development branch at all — could never
+            // satisfy a `development_available` dependency.
+            TargetMilestone::DevelopmentAvailable => {
+                dependency.state.status() == TaskStatus::Published
+                    || match development_target {
+                        Some(branch) => self.task_reached_development(prerequisite, branch)?,
+                        None => false,
+                    }
+            }
+        })
+    }
+
+    /// Names the prerequisite that would stop a set of tasks being scheduled together, if any.
+    ///
+    /// The same rules `ensure_unit_is_eligible` enforces, asked of a prospective grouping rather
+    /// than a stored one. A selector uses this so it never offers work that scheduling will
+    /// refuse; the authoritative check still runs when the slot is persisted.
+    pub fn blocking_prerequisite(
+        &self,
+        feature_id: reccursive_core::FeatureId,
+        plan_revision: Revision,
+        task_ids: &BTreeSet<reccursive_core::TaskId>,
+        repository_id: reccursive_core::RepositoryId,
+    ) -> Result<Option<BlockingPrerequisite>, StoreError> {
+        let development_target = self
+            .repository(repository_id)?
+            .and_then(|repository| repository.active_policy.development_target.clone());
+        for task_id in task_ids {
+            for (prerequisite, milestone) in
+                self.task_prerequisites(feature_id, plan_revision, *task_id)?
+            {
+                // A prerequisite inside the same grouping travels with it, so it cannot block it.
+                if task_ids.contains(&prerequisite) {
+                    continue;
+                }
+                let Some(dependency) = self.task(feature_id, plan_revision, prerequisite)? else {
+                    continue;
+                };
+                if !self.milestone_is_met(
+                    prerequisite,
+                    &dependency,
+                    milestone,
+                    &development_target,
+                )? {
+                    return Ok(Some(BlockingPrerequisite {
+                        task_id: prerequisite,
+                        name: dependency.name.clone(),
+                        milestone,
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn ensure_unit_is_eligible(
         &self,
         unit: &crate::ReleaseUnitRecord,
@@ -534,28 +618,12 @@ impl Store {
                     .ok_or_else(|| {
                         StoreError::InvalidData(format!("prerequisite {prerequisite} is missing"))
                     })?;
-                let eligible = match milestone {
-                    TargetMilestone::Captured => {
-                        dependency.state.status() != TaskStatus::Planned
-                            && dependency.state.status() != TaskStatus::Building
-                    }
-                    TargetMilestone::TargetPublished => {
-                        dependency.state.status() == TaskStatus::Published
-                    }
-                    // A task published to the target has necessarily passed through being
-                    // available, so the target milestone satisfies this one too. Without that,
-                    // a scheduled-mode repository — which never publishes to a development
-                    // branch at all — could never satisfy a `development_available` dependency.
-                    TargetMilestone::DevelopmentAvailable => {
-                        dependency.state.status() == TaskStatus::Published
-                            || match &development_target {
-                                Some(branch) => {
-                                    self.task_reached_development(prerequisite, branch)?
-                                }
-                                None => false,
-                            }
-                    }
-                };
+                let eligible = self.milestone_is_met(
+                    prerequisite,
+                    &dependency,
+                    milestone,
+                    &development_target,
+                )?;
                 if !eligible {
                     return Err(StoreError::Conflict(format!(
                         "task {task_id} waits for prerequisite {prerequisite} at {milestone:?}"

@@ -18,7 +18,7 @@ use reccursive_capture::{
     SnapshotRequest, WorkspaceError, WorkspaceRequest as CaptureWorkspaceRequest,
 };
 use reccursive_protocol::{
-    ApiError, ApiErrorCode, AuthToken, CancelTaskRequest, CapturePackageRequest,
+    ApiError, ApiErrorCode, AuthToken, BlockedByView, CancelTaskRequest, CapturePackageRequest,
     ChangeRepositoryPolicyRequest, ChangedFileView, CheckResultView, CheckResultsView, Command,
     CreateReleaseUnitRequest, CreateWorkspaceRequest, DevelopmentTargetChange, DueUnitView,
     EnrollRepositoryRequest, EventSeverityView, EventView, FeatureId, FeatureStatusView,
@@ -590,6 +590,7 @@ fn dispatch(
         }
         Command::ChangeRepositoryPolicy(request) => change_repository_policy(request, store),
         Command::ListReadyWork => list_ready_work(store),
+        Command::ScheduleCapturedWork(request) => schedule_captured_work(request, store),
         Command::ValidateReleaseTime {
             repository_id,
             requested_at_unix_ms,
@@ -727,6 +728,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::InitializeRepository(_) => "repository.initialize",
         Command::ChangeRepositoryPolicy(..) => "repository.policy",
         Command::ListReadyWork => "work.ready",
+        Command::ScheduleCapturedWork(_) => "schedule.captured",
         Command::ValidateReleaseTime { .. } => "schedule.validate",
         Command::ListRepositories => "repository.list",
         Command::ListEvents { .. } => "logs",
@@ -3539,6 +3541,77 @@ fn change_repository_policy(
     })
 }
 
+/// Groups a captured package into a release unit and selects its release time together.
+///
+/// Together on purpose. Done as two commands, a grouping that succeeds followed by a scheduling
+/// that fails leaves a release unit nobody asked for; its tasks then have a unit, so they stop
+/// being offered as ready, while the unit itself still shows in the queue. The work is neither
+/// schedulable nor visibly gone. A trial lost a change exactly that way.
+///
+/// So a unit this call creates is discarded if the release time cannot be selected. A unit that
+/// already existed is left alone — grouping is idempotent, and an earlier unit is not this call's
+/// to throw away.
+fn schedule_captured_work(
+    request: reccursive_protocol::ScheduleCapturedWorkRequest,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let mut store = lock_store(store)?;
+
+    let task_ids: BTreeSet<_> = store
+        .package_task_ids(request.package_id, request.package_revision)
+        .map_err(store_api_error)?
+        .into_iter()
+        .collect();
+    if task_ids.is_empty() {
+        return Err(ApiError::new(
+            ApiErrorCode::NotFound,
+            format!("package {} carries no work", request.package_id),
+            false,
+        ));
+    }
+
+    let existing = store
+        .release_unit_for_task(
+            request.feature_id,
+            request.plan_revision,
+            *task_ids.iter().next().expect("checked above"),
+        )
+        .map_err(store_api_error)?;
+    let unit = store
+        .create_release_unit(
+            reccursive_protocol::ReleaseUnitId::new(),
+            request.feature_id,
+            request.plan_revision,
+            task_ids,
+            now,
+        )
+        .map_err(store_api_error)?;
+    let created_here = existing.is_none();
+
+    match Scheduler::schedule_at(
+        &mut store,
+        unit.unit_id,
+        request.package_id,
+        request.package_revision,
+        request.seed,
+        request.requested_at_unix_ms,
+        now,
+    ) {
+        Ok(slot) => Ok(ResponseData::ScheduleSlot {
+            slot: schedule_slot_view(slot),
+        }),
+        Err(error) => {
+            if created_here {
+                // Best effort: the scheduling failure is what the caller needs to hear, and a
+                // discard that itself fails must not replace it with a less useful message.
+                let _ = store.discard_unscheduled_release_unit(unit.unit_id);
+            }
+            Err(scheduler_api_error(error))
+        }
+    }
+}
+
 /// Answers whether an instant is a release time this repository may currently publish at.
 ///
 /// Advisory, and deliberately so. It reserves nothing and holds no lock, so the answer can stop
@@ -3691,11 +3764,27 @@ fn list_ready_work(store: &Mutex<Store>) -> Result<ResponseData, ApiError> {
                 if carried.len() != task_ids.len() {
                     continue;
                 }
+                // Asked of the same rules scheduling enforces, so nothing offered as selectable
+                // is refused a moment later. Blocked work is reported, not hidden: a change that
+                // exists and is waiting is a different thing from a change that is not there.
+                let blocked_by = store
+                    .blocking_prerequisite(
+                        feature_id,
+                        plan_revision,
+                        &task_ids.iter().copied().collect(),
+                        repository_id,
+                    )
+                    .map_err(store_api_error)?
+                    .map(|blocking| BlockedByView {
+                        name: blocking.name,
+                        milestone: blocking.milestone,
+                    });
                 packages.push(ReadyPackageView {
                     package_id,
                     package_revision,
                     task_ids,
                     task_names,
+                    blocked_by,
                 });
             }
             if packages.is_empty() {

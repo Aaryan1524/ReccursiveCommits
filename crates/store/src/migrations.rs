@@ -3,7 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::StoreError;
 
 /// Latest schema understood by this build.
-pub const STORAGE_SCHEMA_VERSION: u32 = 22;
+pub const STORAGE_SCHEMA_VERSION: u32 = 23;
 
 struct Migration {
     version: u32,
@@ -797,6 +797,19 @@ const MIGRATIONS: &[Migration] = &[
         CREATE INDEX idx_github_pull_requests_open
             ON github_pull_requests(repository_id)
             WHERE state = 'open';
+        "#,
+    },
+    Migration {
+        version: 23,
+        sql: r#"
+        -- Whether a person asked for this release time, rather than the scheduler choosing it.
+        --
+        -- Missed-window reconciliation cannot otherwise tell the two apart: both look like a slot
+        -- whose time has passed. So `schedule release-now`, issued outside a release window, was
+        -- undone by the very next maintenance pass and the command silently did nothing.
+        ALTER TABLE schedule_slots ADD COLUMN released_on_request INTEGER NOT NULL
+            DEFAULT 0
+            CHECK (released_on_request IN (0, 1));
         "#,
     },
 ];

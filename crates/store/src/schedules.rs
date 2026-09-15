@@ -26,6 +26,8 @@ pub struct ScheduleSlot {
     pub eligible_at_unix_ms: i64,
     pub selected_at_unix_ms: i64,
     pub created_at_unix_ms: i64,
+    /// Whether a person asked for this time, rather than the scheduler choosing it.
+    pub released_on_request: bool,
 }
 
 /// Why a repository is currently not handing out release work.
@@ -63,6 +65,8 @@ pub struct NewScheduleSlot {
     pub eligible_at_unix_ms: i64,
     pub selected_at_unix_ms: i64,
     pub created_at_unix_ms: i64,
+    /// Set only by `release_unit_now`. A deliberate request is not a missed window.
+    pub released_on_request: bool,
 }
 
 impl Store {
@@ -75,7 +79,7 @@ impl Store {
             .query_row(
                 "SELECT release_unit_id, repository_id, package_id, package_revision,
                         policy_revision, timezone, eligible_at_unix_ms, selected_at_unix_ms,
-                        created_at_unix_ms
+                        created_at_unix_ms, released_on_request
                  FROM schedule_slots
                  WHERE release_unit_id = ?1 AND invalidated_at_unix_ms IS NULL",
                 [release_unit_id.to_string()],
@@ -123,7 +127,7 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT release_unit_id, repository_id, package_id, package_revision,
                     policy_revision, timezone, eligible_at_unix_ms, selected_at_unix_ms,
-                    created_at_unix_ms
+                    created_at_unix_ms, released_on_request
              FROM schedule_slots
              WHERE repository_id = ?1 AND invalidated_at_unix_ms IS NULL
              ORDER BY selected_at_unix_ms, release_unit_id",
@@ -178,8 +182,9 @@ impl Store {
             .execute(
                 "INSERT INTO schedule_slots (
                 release_unit_id, repository_id, package_id, package_revision, policy_revision,
-                timezone, eligible_at_unix_ms, selected_at_unix_ms, created_at_unix_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                timezone, eligible_at_unix_ms, selected_at_unix_ms, created_at_unix_ms,
+                released_on_request
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     slot.release_unit_id.to_string(),
                     plan.plan.repository_id.to_string(),
@@ -190,6 +195,7 @@ impl Store {
                     slot.eligible_at_unix_ms,
                     slot.selected_at_unix_ms,
                     slot.created_at_unix_ms,
+                    slot.released_on_request,
                 ],
             )
             .map_err(map_schedule_write_error)?;
@@ -411,6 +417,10 @@ impl Store {
             eligible_at_unix_ms: now_unix_ms,
             selected_at_unix_ms: now_unix_ms,
             created_at_unix_ms: now_unix_ms,
+            // A person asked for this, now. Missed-window reconciliation must leave it alone:
+            // both look like a slot whose time has passed, and without this the next maintenance
+            // pass withdrew it and the command silently did nothing.
+            released_on_request: true,
         })
     }
 
@@ -426,7 +436,7 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT release_unit_id, repository_id, package_id, package_revision,
                     policy_revision, timezone, eligible_at_unix_ms, selected_at_unix_ms,
-                    created_at_unix_ms
+                    created_at_unix_ms, released_on_request
              FROM schedule_slots
              WHERE repository_id = ?1 AND invalidated_at_unix_ms IS NULL
                AND selected_at_unix_ms <= ?2
@@ -587,6 +597,7 @@ struct RawScheduleSlot {
     eligible_at_unix_ms: i64,
     selected_at_unix_ms: i64,
     created_at_unix_ms: i64,
+    released_on_request: bool,
 }
 
 impl RawScheduleSlot {
@@ -601,6 +612,7 @@ impl RawScheduleSlot {
             eligible_at_unix_ms: row.get(6)?,
             selected_at_unix_ms: row.get(7)?,
             created_at_unix_ms: row.get(8)?,
+            released_on_request: row.get(9)?,
         })
     }
 }
@@ -622,6 +634,7 @@ impl TryFrom<RawScheduleSlot> for ScheduleSlot {
             eligible_at_unix_ms: value.eligible_at_unix_ms,
             selected_at_unix_ms: value.selected_at_unix_ms,
             created_at_unix_ms: value.created_at_unix_ms,
+            released_on_request: value.released_on_request,
         })
     }
 }
@@ -765,6 +778,7 @@ mod tests {
                     eligible_at_unix_ms: 10,
                     selected_at_unix_ms: 20,
                     created_at_unix_ms: 10,
+                    released_on_request: false,
                 })
                 .unwrap();
             assert_eq!(created.selected_at_unix_ms, 20);
@@ -797,6 +811,7 @@ mod tests {
                 eligible_at_unix_ms: 10,
                 selected_at_unix_ms: 999,
                 created_at_unix_ms: 10,
+                released_on_request: false,
             })
             .unwrap();
         assert_eq!(idempotent, retained);
@@ -952,6 +967,7 @@ mod recalculation_tests {
                     eligible_at_unix_ms: 10,
                     selected_at_unix_ms: 100 + i64::try_from(index).unwrap(),
                     created_at_unix_ms: 10,
+                    released_on_request: false,
                 })
                 .unwrap();
             units.push((unit_id, package_id, *task_id));
@@ -1048,6 +1064,7 @@ mod recalculation_tests {
                 eligible_at_unix_ms: 50,
                 selected_at_unix_ms: 500,
                 created_at_unix_ms: 50,
+                released_on_request: false,
             })
             .unwrap();
         assert_eq!(rescheduled.selected_at_unix_ms, 500);
@@ -1240,6 +1257,7 @@ mod concurrency_tests {
             eligible_at_unix_ms: 10,
             selected_at_unix_ms: selected,
             created_at_unix_ms: 10,
+            released_on_request: false,
         }
     }
 

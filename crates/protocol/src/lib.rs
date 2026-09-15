@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
 /// Local API protocol version. Version 16 adds package change inspection and check results.
-pub const API_VERSION: u16 = 21;
+pub const API_VERSION: u16 = 22;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -184,6 +184,7 @@ impl RequestEnvelope {
             Command::Ping
             | Command::ListRepositories
             | Command::ListReadyWork
+            | Command::ValidateReleaseTime { .. }
             | Command::ListEvents { .. }
             | Command::GetPlan { .. }
             | Command::PlanHistory { .. }
@@ -231,6 +232,16 @@ pub enum Command {
     ListRepositories,
     /// Report work that has been captured, has passed its checks, and is waiting to be scheduled.
     ListReadyWork,
+    /// Ask whether an instant is a release time a repository is currently allowed to publish at.
+    ///
+    /// Read-only and advisory. It reserves nothing, and the answer can stop being true the moment
+    /// another release is scheduled — the authoritative check still runs when the slot is
+    /// persisted. It exists so somebody choosing a time is told at the prompt rather than after
+    /// they have reviewed and confirmed a batch.
+    ValidateReleaseTime {
+        repository_id: RepositoryId,
+        requested_at_unix_ms: i64,
+    },
     ListEvents {
         limit: usize,
     },
@@ -407,6 +418,7 @@ impl Command {
             Self::Ping
             | Self::ListRepositories
             | Self::ListReadyWork
+            | Self::ValidateReleaseTime { .. }
             | Self::ListEvents { .. }
             | Self::GetPlan { .. }
             | Self::PlanHistory { .. }
@@ -448,6 +460,7 @@ impl Command {
             | Self::InitializeRepository(_)
             | Self::ListRepositories
             | Self::ListReadyWork
+            | Self::ValidateReleaseTime { .. }
             | Self::ListEvents { .. }
             | Self::ImportPlan { .. }
             | Self::SealPlan { .. }
@@ -1191,6 +1204,50 @@ pub enum QueuedUnitState {
     Published,
 }
 
+/// Whether a requested release time is currently allowed, and if not, which rule refused it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum ReleaseTimeVerdict {
+    Allowed,
+    Refused {
+        reason: ReleaseTimeRefusal,
+        /// The sentence to show a person, already naming what is allowed where that is known.
+        message: String,
+    },
+}
+
+/// Which rule refused a requested release time.
+///
+/// Structured so a caller can decide what to ask again — a rejected weekday means the date is
+/// wrong, a rejected hour means the time is — without parsing a human sentence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseTimeRefusal {
+    /// The instant has already passed.
+    InPast,
+    /// The repository does not publish on that weekday.
+    DayNotAllowed,
+    /// The weekday is allowed but the clock time is outside its windows.
+    OutsideWindows,
+    /// Another release is scheduled too near it.
+    TooClose,
+    /// That day already holds as many releases as the policy allows.
+    DayFull,
+    /// The policy could not be evaluated at all — no policy, or an unusable instant.
+    Undecidable,
+}
+
+impl ReleaseTimeRefusal {
+    /// Which answer the person should be asked for again.
+    ///
+    /// A weekday or a past instant is a date problem; everything else is about the clock time, or
+    /// about other work rather than about this choice at all.
+    #[must_use]
+    pub const fn asks_for_a_new_date(self) -> bool {
+        matches!(self, Self::InPast | Self::DayNotAllowed | Self::DayFull)
+    }
+}
+
 /// Work that could be scheduled right now, grouped the way it must be scheduled.
 ///
 /// One group is one feature revision, because a release unit belongs to exactly one — tasks from
@@ -1532,6 +1589,9 @@ pub enum ResponseData {
     },
     ReadyWork {
         groups: Vec<ReadyWorkGroup>,
+    },
+    ReleaseTimeValidated {
+        verdict: ReleaseTimeVerdict,
     },
     Repositories {
         repositories: Vec<RepositoryView>,
@@ -1916,6 +1976,35 @@ mod tests {
             }
             .may_reach_remote()
         );
+    }
+
+    #[test]
+    fn a_refusal_says_which_answer_to_ask_for_again() {
+        // A weekday or a past instant is a date problem; an hour or a neighbour is not. Getting
+        // this backwards makes the wizard re-ask the field that was already right.
+        assert!(ReleaseTimeRefusal::InPast.asks_for_a_new_date());
+        assert!(ReleaseTimeRefusal::DayNotAllowed.asks_for_a_new_date());
+        assert!(ReleaseTimeRefusal::DayFull.asks_for_a_new_date());
+        assert!(!ReleaseTimeRefusal::OutsideWindows.asks_for_a_new_date());
+        assert!(!ReleaseTimeRefusal::TooClose.asks_for_a_new_date());
+    }
+
+    #[test]
+    fn a_verdict_round_trips_with_its_reason_intact() {
+        // The reason is the part a caller acts on, so it has to survive the wire rather than
+        // leaving the sentence as the only machine-readable signal.
+        let refused = ReleaseTimeVerdict::Refused {
+            reason: ReleaseTimeRefusal::TooClose,
+            message: "too close".to_owned(),
+        };
+        let encoded = serde_json::to_string(&refused).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ReleaseTimeVerdict>(&encoded).unwrap(),
+            refused
+        );
+        assert!(encoded.contains("too_close"), "{encoded}");
+        let allowed = serde_json::to_string(&ReleaseTimeVerdict::Allowed).unwrap();
+        assert!(allowed.contains("allowed"), "{allowed}");
     }
 
     #[test]

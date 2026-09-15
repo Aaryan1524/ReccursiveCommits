@@ -52,10 +52,22 @@ impl ServiceInstallation {
 
     /// Renders the launchd property list for this installation.
     ///
-    /// `RunAtLoad` and `KeepAlive` are both set so the service survives a logout, a crash, and a
-    /// restart. It deliberately does not set a `StartInterval`: the daemon reconciles durable
-    /// deadlines when it starts and when it wakes, rather than depending on a timer that does not
-    /// fire while the machine is asleep.
+    /// `RunAtLoad` starts the service when the agent is loaded, and `KeepAlive` restarts it if it
+    /// exits, so a crash and a closed terminal both leave publishing running.
+    ///
+    /// What that does *not* buy is surviving a logout. This is a launchd **agent** in the user's
+    /// own `~/Library/LaunchAgents`, with no `LimitLoadToSessionType`, so it belongs to the login
+    /// session and is unloaded with it; `KeepAlive` restarts a process that exits, it does not
+    /// outlive the session that owns the process. A shutdown ends it the same way, and it comes
+    /// back at the next login rather than at the moment a release was due.
+    ///
+    /// That is deliberate, not an oversight. An agent runs as the user, which is what lets
+    /// publishing use the Git credentials and SSH agent they already have; a `LaunchDaemon` would
+    /// survive logout and then have no credentials to publish with.
+    ///
+    /// It also does not set a `StartInterval`: the daemon reconciles durable deadlines when it
+    /// starts and when it wakes, rather than depending on a timer that does not fire while the
+    /// machine is asleep.
     #[must_use]
     pub fn plist(&self) -> String {
         format!(
@@ -217,7 +229,8 @@ mod tests {
         assert!(plist.contains("<string>/usr/local/bin/reccursive-daemon</string>"));
         assert!(plist.contains("<string>--state-dir</string>"));
         assert!(plist.contains("<string>/Users/example/.local/state/reccursive</string>"));
-        // Survives logout and crash, so closing the terminal does not stop publishing.
+        // Restarts after a crash and keeps running when the terminal closes. Not a logout: an
+        // agent is unloaded with the session that owns it.
         assert!(plist.contains("<key>RunAtLoad</key>\n    <true/>"));
         assert!(plist.contains("<key>KeepAlive</key>\n    <true/>"));
         // No timer: wake and start reconcile durable deadlines instead.

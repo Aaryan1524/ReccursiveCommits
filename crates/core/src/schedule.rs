@@ -717,7 +717,7 @@ pub enum SchedulePolicyError {
     RequestedTimeOutsideWindows { requested_local: String },
     #[error(
         "{requested_local} is within {actual_minutes} minutes of another scheduled release; \
-         this repository requires {required_minutes}"
+         this repository requires at least {required_minutes} minutes between releases"
     )]
     RequestedTimeTooClose {
         requested_local: String,
@@ -843,13 +843,26 @@ mod tests {
             at_local(2026, 9, 17, 9, 0),
             &[existing],
         ) {
-            Err(SchedulePolicyError::RequestedTimeTooClose {
-                required_minutes,
-                actual_minutes,
-                ..
-            }) => {
-                assert_eq!(required_minutes, 90);
-                assert_eq!(actual_minutes, 60);
+            Err(error @ SchedulePolicyError::RequestedTimeTooClose { .. }) => {
+                let SchedulePolicyError::RequestedTimeTooClose {
+                    required_minutes,
+                    actual_minutes,
+                    ..
+                } = &error
+                else {
+                    unreachable!("matched above")
+                };
+                assert_eq!(*required_minutes, 90);
+                assert_eq!(*actual_minutes, 60);
+                // The rendered message is what a person reads, and it used to stop at the bare
+                // number: "this repository requires 90". A sentence that ends mid-unit is a
+                // sentence nobody can act on.
+                let rendered = error.to_string();
+                assert!(
+                    rendered.ends_with("minutes between releases"),
+                    "spacing refusal reads: {rendered}"
+                );
+                assert!(rendered.contains("at least 90 minutes"), "{rendered}");
             }
             other => panic!("expected a spacing refusal, got {other:?}"),
         }

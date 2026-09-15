@@ -26,12 +26,12 @@ use reccursive_protocol::{
     PackageChangesView, PackageView, PlanView, PolicyChangeView, ProtocolValidationError,
     PublicationView, PullRequestView, QueueAuditView, QueueExportView, QueueRecoveryIssueView,
     QueueSummaryView, QueuedUnitState, QueuedUnitView, ReadyTaskView, ReadyWorkGroup, ReasonCode,
-    ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy,
-    RepositoryQueueView, RepositoryView, RequestEnvelope, RequestId, ResponseData,
-    ResponseEnvelope, Revision, ScheduleChangeView, SchedulePolicyView, ScheduleRecalculationView,
-    ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest, StateReason, SubmissionView,
-    TargetRef, TaskCancellationView, TaskProgressView, TaskStatus, TransportError,
-    WorkspacePrerequisiteView, WorkspaceView,
+    ReleaseAttemptView, ReleasePackageRequest, ReleaseTimeRefusal, ReleaseTimeVerdict,
+    ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryQueueView, RepositoryView,
+    RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision, ScheduleChangeView,
+    SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView, ScheduleUnitRequest,
+    SetSchedulePolicyRequest, StateReason, SubmissionView, TargetRef, TaskCancellationView,
+    TaskProgressView, TaskStatus, TransportError, WorkspacePrerequisiteView, WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -590,6 +590,10 @@ fn dispatch(
         }
         Command::ChangeRepositoryPolicy(request) => change_repository_policy(request, store),
         Command::ListReadyWork => list_ready_work(store),
+        Command::ValidateReleaseTime {
+            repository_id,
+            requested_at_unix_ms,
+        } => validate_release_time(repository_id, requested_at_unix_ms, store),
         Command::ListRepositories => {
             let store = lock_store(store)?;
             let repositories = store
@@ -723,6 +727,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::InitializeRepository(_) => "repository.initialize",
         Command::ChangeRepositoryPolicy(..) => "repository.policy",
         Command::ListReadyWork => "work.ready",
+        Command::ValidateReleaseTime { .. } => "schedule.validate",
         Command::ListRepositories => "repository.list",
         Command::ListEvents { .. } => "logs",
         Command::ImportPlan { .. } => "plan.import",
@@ -3532,6 +3537,86 @@ fn change_repository_policy(
             withdrawn,
         },
     })
+}
+
+/// Answers whether an instant is a release time this repository may currently publish at.
+///
+/// Advisory, and deliberately so. It reserves nothing and holds no lock, so the answer can stop
+/// being true the moment another release is scheduled — `Scheduler::schedule_at` checks again when
+/// the slot is persisted, and that check is the authoritative one. This exists only so somebody
+/// choosing a time hears about a refusal at the prompt rather than after reviewing a batch.
+///
+/// The evaluation is the same call the scheduler makes, against the same effective policy and the
+/// same live slots, so an answer here and a refusal there cannot disagree about the rules.
+fn validate_release_time(
+    repository_id: RepositoryId,
+    requested_at_unix_ms: i64,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    use reccursive_core::SchedulePolicyError as PolicyError;
+
+    let now = current_unix_ms()?;
+    let store = lock_store(store)?;
+    let undecidable = |message: String| {
+        Ok(ResponseData::ReleaseTimeValidated {
+            verdict: ReleaseTimeVerdict::Refused {
+                reason: ReleaseTimeRefusal::Undecidable,
+                message,
+            },
+        })
+    };
+
+    let Some(policy) = store
+        .schedule_policy(repository_id)
+        .map_err(store_api_error)?
+    else {
+        return undecidable(format!(
+            "repository {repository_id} has no active schedule policy"
+        ));
+    };
+    let effective = match store
+        .schedule_override(repository_id)
+        .map_err(store_api_error)?
+    {
+        Some(override_policy) => match policy.policy.with_override(&override_policy) {
+            Ok(effective) => effective,
+            Err(error) => return undecidable(error.to_string()),
+        },
+        None => policy.policy.clone(),
+    };
+    let existing: Vec<i64> = store
+        .schedule_slots(repository_id)
+        .map_err(store_api_error)?
+        .into_iter()
+        .map(|slot| slot.selected_at_unix_ms)
+        .collect();
+
+    let verdict = match effective.validate_requested_slot(requested_at_unix_ms, now, &existing) {
+        Ok(_) => ReleaseTimeVerdict::Allowed,
+        Err(error) => {
+            let reason = match &error {
+                PolicyError::RequestedTimeInPast { .. } => ReleaseTimeRefusal::InPast,
+                PolicyError::RequestedDayNotAllowed { .. } => ReleaseTimeRefusal::DayNotAllowed,
+                PolicyError::RequestedTimeOutsideWindows { .. } => {
+                    ReleaseTimeRefusal::OutsideWindows
+                }
+                PolicyError::RequestedTimeTooClose { .. } => ReleaseTimeRefusal::TooClose,
+                PolicyError::RequestedDayIsFull { .. } => ReleaseTimeRefusal::DayFull,
+                _ => ReleaseTimeRefusal::Undecidable,
+            };
+            ReleaseTimeVerdict::Refused {
+                reason,
+                // The same sentence the scheduler would have refused with, so the answer a person
+                // gets early is the answer they would have got late.
+                message: crate::scheduler::describe_refusal(
+                    &error,
+                    &effective,
+                    requested_at_unix_ms,
+                ),
+            }
+        }
+    };
+    Ok(ResponseData::ReleaseTimeValidated { verdict })
 }
 
 /// Reports work that has been captured, has passed its checks, and is waiting to be scheduled.

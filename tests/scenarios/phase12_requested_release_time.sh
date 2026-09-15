@@ -178,6 +178,29 @@ again="$(cli schedule unit "$unit_one" --package-id "$package_one" --revision 1 
 [[ "$(json_number selected_at_unix_ms <<<"$again")" == "$selected" ]] || \
   fail "repeating an identical scheduling request drew a different time"
 
+# --- The advisory check the wizard uses agrees with the scheduler that decides. ---
+#
+# Two implementations of the same rules would eventually disagree, and a person told "yes" at the
+# prompt and "no" at the review screen would have no way to know which was right.
+allowed="$(cli schedule check "$repository_id" --at "2026-09-18 11:30" --zone America/New_York)"
+grep -q '"verdict":"allowed"' <<<"$allowed" || \
+  fail "a time the scheduler accepts was not reported as allowed: $allowed"
+
+weekend_check="$(cli schedule check "$repository_id" --at "2026-09-19 10:30" --zone America/New_York)"
+grep -q '"reason":"day_not_allowed"' <<<"$weekend_check" || \
+  fail "a refused weekday did not report a structured reason: $weekend_check"
+
+late_check="$(cli schedule check "$repository_id" --at "2026-09-18 22:30" --zone America/New_York)"
+grep -q '"reason":"outside_windows"' <<<"$late_check" || \
+  fail "a time outside the window did not report a structured reason: $late_check"
+
+close_check="$(cli schedule check "$repository_id" --at "2026-09-18 10:45" --zone America/New_York)"
+grep -q '"reason":"too_close"' <<<"$close_check" || \
+  fail "a crowded time did not report a structured reason: $close_check"
+# The message used to end on a bare number: "this repository requires 30".
+grep -q "minutes between releases" <<<"$close_check" || \
+  fail "the spacing refusal still ends without its unit: $close_check"
+
 # --- Spacing is still enforced against what is already scheduled. ---
 printf 'second\n' >"$workspace_path/second.txt"
 package_two="$(cli package capture "$feature_id" --revision 1 --task "$task_two" | json_field package_id)"

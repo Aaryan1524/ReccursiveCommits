@@ -1,9 +1,9 @@
-//! Selecting what to ship.
+//! Choosing what to ship.
 
-use inquire::{Confirm, MultiSelect, Select};
-use reccursive_protocol::{ReadyWorkGroup, TaskId};
+use inquire::{Confirm, Select};
+use reccursive_protocol::{ReadyPackageView, ReadyWorkGroup};
 
-use crate::{CliFailure, EXIT_ACTION_REQUIRED};
+use crate::{CliFailure, EXIT_ACTION_REQUIRED, EXIT_SUCCESS};
 
 /// Turns an interrupted prompt into an ordinary "nothing happened", not a failure.
 ///
@@ -22,18 +22,15 @@ fn answered<T>(outcome: Result<T, inquire::InquireError>) -> Result<Option<T>, C
     }
 }
 
+/// Cancelling is a decision, not a fault, so it leaves with a success code.
 fn cancelled() -> CliFailure {
-    CliFailure::new(EXIT_SUCCESS_CODE, "cancelled", "Nothing was scheduled.")
+    CliFailure::new(EXIT_SUCCESS, "cancelled", "Nothing was scheduled.")
 }
-
-// Cancelling is not a failure, but the flow still has to stop. Zero keeps scripts honest.
-const EXIT_SUCCESS_CODE: u8 = crate::EXIT_SUCCESS;
 
 /// Chooses which feature revision to ship from.
 ///
-/// A release unit belongs to exactly one feature revision, so this choice is made before tasks
-/// rather than filtered afterwards. Offering one flat list would invite a selection that cannot
-/// become a single atomic release.
+/// A release unit belongs to exactly one feature revision, so this choice comes before the work
+/// rather than being filtered afterwards.
 pub fn group(groups: &[ReadyWorkGroup]) -> Result<&ReadyWorkGroup, CliFailure> {
     if let [only] = groups {
         return Ok(only);
@@ -44,7 +41,7 @@ pub fn group(groups: &[ReadyWorkGroup]) -> Result<&ReadyWorkGroup, CliFailure> {
             format!(
                 "{}  ({})",
                 group.feature_goal,
-                super::change_count(group.tasks.len())
+                super::change_count(group.packages.iter().map(|p| p.task_ids.len()).sum())
             )
         })
         .collect();
@@ -57,50 +54,37 @@ pub fn group(groups: &[ReadyWorkGroup]) -> Result<&ReadyWorkGroup, CliFailure> {
     Ok(&groups[index])
 }
 
-/// Multi-selects the work to ship together.
-pub fn tasks(group: &ReadyWorkGroup) -> Result<Vec<TaskId>, CliFailure> {
-    let labels: Vec<String> = group.tasks.iter().map(|task| task.name.clone()).collect();
+/// Chooses which captured work to ship.
+///
+/// One package, not a selection of tasks. What ships together was decided when the work was
+/// captured: a release unit's tasks must equal a package's exactly, so a pick-your-own-tasks
+/// prompt would offer combinations that cannot be scheduled — and would only say so after the
+/// person had reviewed and confirmed them.
+pub fn package(group: &ReadyWorkGroup) -> Result<&ReadyPackageView, CliFailure> {
+    if let [only] = group.packages.as_slice() {
+        return Ok(only);
+    }
+    let labels: Vec<String> = group.packages.iter().map(describe).collect();
     let chosen = answered(
-        MultiSelect::new("Which changes should ship together?", labels.clone())
-            .with_help_message("space to select, enter to continue")
+        Select::new("Which change should ship?", labels.clone())
+            .with_help_message("each entry was captured together and ships together")
             .prompt(),
     )?
     .ok_or_else(cancelled)?;
-    Ok(chosen
+    let index = labels
         .iter()
-        .filter_map(|label| {
-            labels
-                .iter()
-                .position(|candidate| candidate == label)
-                .map(|index| group.tasks[index].task_id)
-        })
-        .collect())
+        .position(|label| *label == chosen)
+        .expect("the chosen label came from this list");
+    Ok(&group.packages[index])
 }
 
-/// Adds the tasks the plan couples to the chosen ones.
-///
-/// `create_release_unit` applies this expansion regardless, so resolving it here is what makes the
-/// review screen true rather than optimistic. Order follows the group so the review reads in plan
-/// order rather than selection order.
-pub fn with_coupled(group: &ReadyWorkGroup, chosen: &[TaskId]) -> Vec<TaskId> {
-    let mut included: Vec<TaskId> = Vec::new();
-    let mut frontier: Vec<TaskId> = chosen.to_vec();
-    while let Some(task_id) = frontier.pop() {
-        if included.contains(&task_id) {
-            continue;
-        }
-        included.push(task_id);
-        if let Some(task) = group.tasks.iter().find(|task| task.task_id == task_id) {
-            // Coupling can chain: a task required by a selection may itself require another.
-            frontier.extend(task.couples_with.iter().copied());
-        }
+/// Names a package by the work in it, never by its identifier.
+pub fn describe(package: &ReadyPackageView) -> String {
+    match package.task_names.as_slice() {
+        [] => "(no named work)".to_owned(),
+        [only] => only.clone(),
+        names => format!("{} (+{} more)", names[0], names.len() - 1),
     }
-    group
-        .tasks
-        .iter()
-        .map(|task| task.task_id)
-        .filter(|task_id| included.contains(task_id))
-        .collect()
 }
 
 pub fn confirm(question: &str) -> Result<bool, CliFailure> {

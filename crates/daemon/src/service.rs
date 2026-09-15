@@ -25,13 +25,13 @@ use reccursive_protocol::{
     IdempotencyKey, InitializeRepositoryRequest, IntegrationHealthView, MissedWindowView,
     PackageChangesView, PackageView, PlanView, PolicyChangeView, ProtocolValidationError,
     PublicationView, PullRequestView, QueueAuditView, QueueExportView, QueueRecoveryIssueView,
-    QueueSummaryView, QueuedUnitState, QueuedUnitView, ReasonCode, ReleaseAttemptView,
-    ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy, RepositoryQueueView,
-    RepositoryView, RequestEnvelope, RequestId, ResponseData, ResponseEnvelope, Revision,
-    ScheduleChangeView, SchedulePolicyView, ScheduleRecalculationView, ScheduleSlotView,
-    ScheduleUnitRequest, SetSchedulePolicyRequest, StateReason, SubmissionView, TargetRef,
-    TaskCancellationView, TaskProgressView, TaskStatus, TransportError, WorkspacePrerequisiteView,
-    WorkspaceView,
+    QueueSummaryView, QueuedUnitState, QueuedUnitView, ReadyTaskView, ReadyWorkGroup, ReasonCode,
+    ReleaseAttemptView, ReleasePackageRequest, ReleaseUnitView, RepositoryId, RepositoryPolicy,
+    RepositoryQueueView, RepositoryView, RequestEnvelope, RequestId, ResponseData,
+    ResponseEnvelope, Revision, ScheduleChangeView, SchedulePolicyView, ScheduleRecalculationView,
+    ScheduleSlotView, ScheduleUnitRequest, SetSchedulePolicyRequest, StateReason, SubmissionView,
+    TargetRef, TaskCancellationView, TaskProgressView, TaskStatus, TransportError,
+    WorkspacePrerequisiteView, WorkspaceView,
     transport::{read_message, write_message},
 };
 use reccursive_store::{
@@ -589,6 +589,7 @@ fn dispatch(
             })
         }
         Command::ChangeRepositoryPolicy(request) => change_repository_policy(request, store),
+        Command::ListReadyWork => list_ready_work(store),
         Command::ListRepositories => {
             let store = lock_store(store)?;
             let repositories = store
@@ -721,6 +722,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::EnrollRepository(_) => "repository.add",
         Command::InitializeRepository(_) => "repository.initialize",
         Command::ChangeRepositoryPolicy(..) => "repository.policy",
+        Command::ListReadyWork => "work.ready",
         Command::ListRepositories => "repository.list",
         Command::ListEvents { .. } => "logs",
         Command::ImportPlan { .. } => "plan.import",
@@ -2109,6 +2111,7 @@ fn summarize_queue(
         summaries.push(RepositoryQueueView {
             repository_id: id,
             target: repository.active_policy.target.clone(),
+            target_integration: repository.active_policy.target_integration,
             paused: store
                 .repository_pause(id)
                 .map_err(store_api_error)?
@@ -2700,12 +2703,13 @@ fn schedule_unit(
 ) -> Result<ResponseData, ApiError> {
     let now = current_unix_ms()?;
     let mut store = lock_store(store)?;
-    let slot = Scheduler::schedule(
+    let slot = Scheduler::schedule_at(
         &mut store,
         request.release_unit_id,
         request.package_id,
         request.package_revision,
         request.seed,
+        request.requested_at_unix_ms,
         now,
     )
     .map_err(scheduler_api_error)?;
@@ -3007,6 +3011,9 @@ fn scheduler_api_error(error: SchedulerError) -> ApiError {
         SchedulerError::Store(error) => store_api_error(error),
         SchedulerError::Policy(error) => {
             ApiError::new(ApiErrorCode::InvalidRequest, error.to_string(), false)
+        }
+        SchedulerError::RequestedTimeRefused { detail } => {
+            ApiError::new(ApiErrorCode::InvalidRequest, detail, false)
         }
         SchedulerError::MissingReleaseUnit(id) => ApiError::new(
             ApiErrorCode::NotFound,
@@ -3525,6 +3532,82 @@ fn change_repository_policy(
             withdrawn,
         },
     })
+}
+
+/// Reports work that has been captured, has passed its checks, and is waiting to be scheduled.
+///
+/// `TaskStatus::Queued` is the authoritative test, and it is not an approximation: `capture_package`
+/// runs the repository's trusted checks against the exact package and only advances a task to
+/// `Queued` when they pass. So everything reported here has a stored package and a passing check
+/// run behind it.
+///
+/// Grouped by feature revision because a release unit belongs to exactly one. Presenting a flat
+/// list would invite a selection that cannot become a single atomic release.
+///
+/// Tasks already belonging to a release unit are left out. A task may be in at most one unit — the
+/// schema enforces it — so offering one again could only produce a refusal or silently return the
+/// existing group. Those remain schedulable through `schedule unit`.
+fn list_ready_work(store: &Mutex<Store>) -> Result<ResponseData, ApiError> {
+    let store = lock_store(store)?;
+    let mut groups = Vec::new();
+    for repository in store.repositories().map_err(store_api_error)? {
+        let repository_id = repository.registration.id;
+        let schedule_timezone = store
+            .schedule_policy(repository_id)
+            .map_err(store_api_error)?
+            .map(|policy| policy.policy.timezone.as_str().to_owned())
+            .unwrap_or_else(|| "UTC".to_owned());
+
+        for (feature_id, plan_revision, goal) in store
+            .sealed_features_for_repository(repository_id)
+            .map_err(store_api_error)?
+        {
+            let coupling = store
+                .coupling_for_plan(feature_id, plan_revision)
+                .map_err(store_api_error)?;
+            let mut tasks = Vec::new();
+            for task in store
+                .plan_tasks(feature_id, plan_revision)
+                .map_err(store_api_error)?
+            {
+                if task.state.status() != TaskStatus::Queued {
+                    continue;
+                }
+                if store
+                    .release_unit_for_task(feature_id, plan_revision, task.task_id)
+                    .map_err(store_api_error)?
+                    .is_some()
+                {
+                    continue;
+                }
+                tasks.push(ReadyTaskView {
+                    task_id: task.task_id,
+                    name: task.name,
+                    couples_with: coupling
+                        .get(&task.task_id)
+                        .map(|coupled| coupled.iter().copied().collect())
+                        .unwrap_or_default(),
+                });
+            }
+            if tasks.is_empty() {
+                continue;
+            }
+            groups.push(ReadyWorkGroup {
+                repository_id,
+                repository_path: repository.registration.checkout_path.clone(),
+                feature_id,
+                feature_goal: goal,
+                plan_revision,
+                target: repository.active_policy.target.clone(),
+                development_target: repository.active_policy.development_target.clone(),
+                publication_mode: repository.active_policy.publication_mode,
+                target_integration: repository.active_policy.target_integration,
+                timezone: schedule_timezone.clone(),
+                tasks,
+            });
+        }
+    }
+    Ok(ResponseData::ReadyWork { groups })
 }
 
 fn repository_view(stored: StoredRepository) -> RepositoryView {

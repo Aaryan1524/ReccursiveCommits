@@ -26,6 +26,7 @@ use serde_json::json;
 
 mod authoring;
 mod install;
+mod interactive;
 mod setup;
 
 pub const EXIT_SUCCESS: u8 = 0;
@@ -68,6 +69,10 @@ enum TopLevelCommand {
         #[command(subcommand)]
         command: RepositoryCommand,
     },
+    /// Show work that has been captured and is waiting to be scheduled.
+    ///
+    /// The same list `schedule` offers interactively, for reading and for automation.
+    Ready,
     /// Manage the GitHub token the pull-request strategy uses.
     Github {
         #[command(subcommand)]
@@ -105,8 +110,9 @@ enum TopLevelCommand {
     },
     /// Configure repository release timing and select durable release times.
     Schedule {
+        /// Omit a subcommand to schedule work interactively.
         #[command(subcommand)]
-        command: ScheduleCommand,
+        command: Option<ScheduleCommand>,
     },
     /// Inspect package recovery state or create a portable queue backup.
     Queue {
@@ -312,6 +318,13 @@ enum ScheduleCommand {
         /// Deterministic selection seed; a random one is used when omitted.
         #[arg(long)]
         seed: Option<u64>,
+        /// Publish at this exact local time, such as "2026-09-18 10:30", instead of letting the
+        /// policy choose. Refused if it is not a time this repository may publish at.
+        #[arg(long, value_name = "WHEN")]
+        at: Option<String>,
+        /// Time zone the --at value is written in; this machine's zone when omitted.
+        #[arg(long, value_name = "IANA")]
+        zone: Option<String>,
     },
     /// Show the durable slot previously selected for a release unit.
     Show { release_unit_id: ReleaseUnitId },
@@ -991,7 +1004,34 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 output_data(data, cli.json, stdout)
             }
         },
-        TopLevelCommand::Schedule { command } => match command {
+        // No subcommand means the human wizard. Every existing subcommand still reaches exactly
+        // the code it always did, so automation and agents are unaffected.
+        TopLevelCommand::Schedule { command: None } => {
+            if cli.json {
+                // A machine asking for JSON is never asking to be prompted. Refusing is the only
+                // honest answer: a prompt here would hang a script forever.
+                return Err(CliFailure::new(
+                    EXIT_USAGE,
+                    "not_interactive",
+                    "`schedule` without a subcommand is interactive and cannot produce JSON. \
+                     Use `schedule unit` for automation.",
+                ));
+            }
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                // The same convention `setup` established: refuse rather than guess at answers
+                // nobody is present to give.
+                return Err(CliFailure::new(
+                    EXIT_ACTION_REQUIRED,
+                    "not_a_terminal",
+                    "`schedule` without a subcommand needs a terminal to ask questions in. \
+                     Use `schedule unit` with explicit arguments instead.",
+                ));
+            }
+            interactive::schedule(&session, stdout)
+        }
+        TopLevelCommand::Schedule {
+            command: Some(command),
+        } => match command {
             ScheduleCommand::SetPolicy {
                 repository_id,
                 file,
@@ -1015,11 +1055,18 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 package_id,
                 revision,
                 seed,
+                at,
+                zone,
             } => {
+                let requested_at_unix_ms = at
+                    .as_deref()
+                    .map(|value| requested_instant(value, zone.as_deref()))
+                    .transpose()?;
                 let seed = seed.unwrap_or_else(random_seed);
                 let data = send(
                     &session,
                     Command::ScheduleUnit(ScheduleUnitRequest {
+                        requested_at_unix_ms,
                         release_unit_id,
                         package_id,
                         package_revision: revision,
@@ -1141,6 +1188,10 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                 output_data(data, cli.json, stdout)
             }
         },
+        TopLevelCommand::Ready => {
+            let data = send(&session, Command::ListReadyWork)?;
+            output_data(data, cli.json, stdout)
+        }
         TopLevelCommand::Github { command } => run_github(command, &session.state_dir, stdout),
         TopLevelCommand::Repository { command } => match command {
             RepositoryCommand::SetPolicy {
@@ -2328,8 +2379,12 @@ fn output_queue_summary(
     for repository in &summary.repositories {
         writeln!(
             out,
-            "{} → {}{}",
+            "{} · {} → {}{}",
             repository.repository_id,
+            match repository.target_integration {
+                TargetIntegration::DirectPush => "direct push",
+                TargetIntegration::PullRequest => "pull request",
+            },
             repository.target.as_str(),
             match &repository.paused {
                 Some(reason) => format!("  [paused: {reason}]"),
@@ -2568,6 +2623,7 @@ fn output_data(
                 "repositories"
             }
         ),
+        ResponseData::ReadyWork { groups } => output_ready_work(out, &groups),
         ResponseData::RepositoryPolicyChanged { change } => {
             writeln!(
                 out,
@@ -3048,6 +3104,48 @@ fn output_release_attempts(
             })
             .collect(),
     )
+}
+
+/// Lists work waiting to be scheduled, for the non-interactive reader.
+/// Reads a `YYYY-MM-DD HH:MM` local time into the instant it denotes.
+///
+/// Shares its parsing with the interactive wizard, so `--at "2026-09-18 10:30"` and answering the
+/// prompts produce the same instant rather than two implementations that drift.
+fn requested_instant(value: &str, zone: Option<&str>) -> Result<i64, CliFailure> {
+    let zone = match zone {
+        Some(zone) => zone.to_owned(),
+        // This machine's zone, because somebody typing a clock time at a terminal means the clock
+        // on the wall in front of them.
+        None => jiff::tz::TimeZone::system()
+            .iana_name()
+            .unwrap_or("UTC")
+            .to_owned(),
+    };
+    let (date, time) = value.trim().split_once([' ', 'T']).ok_or_else(|| {
+        CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "invalid_time",
+            format!("{value:?} is not a date and time. Use \"2026-09-18 10:30\"."),
+        )
+    })?;
+    interactive::to_instant(date, time, &zone)
+}
+
+fn output_ready_work(
+    out: &mut impl Write,
+    groups: &[reccursive_protocol::ReadyWorkGroup],
+) -> io::Result<()> {
+    if groups.is_empty() {
+        return writeln!(out, "Nothing is ready to schedule.");
+    }
+    for group in groups {
+        writeln!(out, "{}", group.feature_goal)?;
+        for task in &group.tasks {
+            writeln!(out, "  {}", task.name)?;
+        }
+        writeln!(out)?;
+    }
+    Ok(())
 }
 
 fn output_queue_audit(out: &mut impl Write, audit: &QueueAuditView) -> io::Result<()> {
@@ -3729,6 +3827,60 @@ mod tests {
             error["error"]["message"],
             "Invalid command or arguments. Run `reccursive --help` for usage."
         );
+    }
+
+    #[test]
+    fn schedule_without_a_subcommand_refuses_json_rather_than_prompting() {
+        // A script asking for JSON is never asking to be prompted, and a prompt would hang it.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            ["reccursive", "--json", "schedule"],
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, EXIT_USAGE);
+        let rendered = String::from_utf8(stderr).unwrap();
+        assert!(rendered.contains("not_interactive"), "{rendered}");
+        assert!(rendered.contains("schedule unit"), "{rendered}");
+    }
+
+    #[test]
+    fn schedule_without_a_subcommand_refuses_when_there_is_no_terminal() {
+        // The convention `setup` established: refuse rather than proceed with invented answers.
+        // Tests do not run on a terminal, which is exactly the situation being asserted.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(["reccursive", "schedule"], &mut stdout, &mut stderr);
+        assert_eq!(code, EXIT_ACTION_REQUIRED);
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("not_a_terminal"),
+            "a non-terminal invocation must refuse rather than prompt"
+        );
+    }
+
+    #[test]
+    fn schedule_subcommands_still_parse_exactly_as_before() {
+        // Making the subcommand optional must not make any existing one ambiguous. These reach
+        // the service and fail there, which is proof they parsed.
+        const REPOSITORY: &str = "repo_00000000-0000-4000-8000-000000000001";
+        const UNIT: &str = "unit_00000000-0000-4000-8000-000000000002";
+        for arguments in [
+            vec!["reccursive", "schedule", "preview", REPOSITORY],
+            vec!["reccursive", "schedule", "show", UNIT],
+            vec!["reccursive", "schedule", "release-now", UNIT],
+            vec!["reccursive", "schedule", "due"],
+        ] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = run(arguments.clone(), &mut stdout, &mut stderr);
+            assert_ne!(
+                code, EXIT_USAGE,
+                "{arguments:?} stopped parsing as a subcommand"
+            );
+        }
     }
 
     #[test]

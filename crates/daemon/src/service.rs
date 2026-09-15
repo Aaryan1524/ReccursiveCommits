@@ -4120,6 +4120,221 @@ mod tests {
         worker.join().unwrap().unwrap();
     }
 
+    /// Runs git in a directory, failing loudly rather than leaving a half-built fixture.
+    fn git(directory: &Path, arguments: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .status()
+            .expect("git is available");
+        assert!(status.success(), "git {arguments:?} failed");
+    }
+
+    #[test]
+    fn scheduling_that_fails_leaves_no_release_unit_behind() {
+        // The defect this protects against was orchestration, not persistence: the interactive
+        // scheduler created a release unit and then scheduled it, so a refused time left a unit
+        // nobody asked for. Its tasks then had a unit, which took them out of the ready list,
+        // while the unit itself still showed in the queue — neither schedulable nor visibly gone.
+        // A real trial lost a change exactly that way, which is why this is tested through the
+        // service rather than against the store.
+        let directory = tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+        git(&checkout, &["config", "user.name", "Fixture"]);
+        git(
+            &checkout,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        fs::write(checkout.join("README.md"), "# Fixture\n").unwrap();
+        git(&checkout, &["add", "README.md"]);
+        git(&checkout, &["commit", "--quiet", "-m", "Initialize"]);
+
+        let paths = ServicePaths::new(directory.path().join("state"));
+        let service = LocalService::bind(paths.clone()).unwrap();
+        let worker = thread::spawn(move || service.serve_connections(12));
+        let client = LocalClient::from_token_file(&paths.auth_token).unwrap();
+        let call = |command: Command| {
+            client
+                .send(&paths.socket, command)
+                .expect("the service answered")
+                .result
+        };
+
+        let ResponseData::RepositoryEnrolled { repository } =
+            call(Command::EnrollRepository(EnrollRepositoryRequest {
+                target_integration: reccursive_core::TargetIntegration::DirectPush,
+                checkout_path: checkout.to_string_lossy().into_owned(),
+                canonical_remote: "ssh://git@example.invalid/project.git".into(),
+                publication_mode: PublicationMode::ScheduledCreation,
+                target: TargetRef::new("refs/heads/main").unwrap(),
+                development_target: None,
+            }))
+            .expect("enrollment succeeds")
+        else {
+            panic!("expected enrollment")
+        };
+
+        // A policy has to exist, or scheduling would fail for a different reason and the test
+        // would prove nothing about the requested time.
+        let policy: reccursive_core::SchedulePolicy = serde_json::from_str(
+            r#"{"timezone":"UTC",
+                "allowed_days":["monday","tuesday","wednesday","thursday","friday","saturday","sunday"],
+                "windows":[{"start":{"hour":0,"minute":0},"end":{"hour":23,"minute":59}}],
+                "daily_releases":{"minimum":1,"maximum":20},
+                "minimum_spacing_minutes":1,
+                "missed_window_behavior":{"kind":"reschedule_forward"}}"#,
+        )
+        .unwrap();
+        call(Command::SetSchedulePolicy(
+            reccursive_protocol::SetSchedulePolicyRequest {
+                repository_id: repository.id,
+                policy,
+            },
+        ))
+        .expect("the policy is activated");
+
+        let feature_id = reccursive_protocol::FeatureId::new();
+        let task_id = reccursive_protocol::TaskId::new();
+        call(Command::ImportPlan {
+            plan: FeaturePlan {
+                schema_version: PLAN_SCHEMA_VERSION,
+                feature_id,
+                revision: Revision::FIRST,
+                repository_id: repository.id,
+                goal: "Rollback fixture".into(),
+                target: TargetRef::new("refs/heads/main").unwrap(),
+                sealed: true,
+                phases: vec![PlanPhase {
+                    id: "delivery".into(),
+                    name: "Delivery".into(),
+                    tasks: vec![PlanTask {
+                        id: task_id,
+                        name: "The work".into(),
+                        dependencies: BTreeMap::new(),
+                        acceptance_checks: vec![AcceptanceCheck {
+                            id: "ready".into(),
+                            description: "ready".into(),
+                        }],
+                    }],
+                }],
+            },
+        })
+        .expect("the plan imports");
+
+        let ResponseData::WorkspaceCreated { workspace } =
+            call(Command::CreateWorkspace(CreateWorkspaceRequest {
+                feature_id,
+                revision: Some(Revision::FIRST),
+                prerequisites: Vec::new(),
+            }))
+            .expect("the workspace is created")
+        else {
+            panic!("expected a workspace")
+        };
+        fs::write(Path::new(&workspace.path).join("change.txt"), "work\n").unwrap();
+
+        let ResponseData::PackageCaptured { package } =
+            call(Command::CapturePackage(CapturePackageRequest {
+                feature_id,
+                plan_revision: Revision::FIRST,
+                task_ids: [task_id].into_iter().collect(),
+            }))
+            .expect("the package is captured")
+        else {
+            panic!("expected a package")
+        };
+
+        let ready_before = call(Command::ListReadyWork).expect("ready work is listed");
+        let ResponseData::ReadyWork { groups } = &ready_before else {
+            panic!("expected ready work")
+        };
+        assert_eq!(groups.len(), 1, "the captured work should be ready");
+
+        // A time in the past is a legitimate refusal from the authoritative validator, reached
+        // only after the unit has already been grouped — which is the exact window the defect
+        // lived in.
+        let refusal = call(Command::ScheduleCapturedWork(
+            reccursive_protocol::ScheduleCapturedWorkRequest {
+                feature_id,
+                plan_revision: Revision::FIRST,
+                package_id: package.package_id,
+                package_revision: package.revision,
+                requested_at_unix_ms: Some(1_000_000_000_000),
+                seed: 0,
+            },
+        ));
+        assert!(refusal.is_err(), "a past release time must be refused");
+
+        // The work is still offered, which it would not be if a unit had survived.
+        let ready_after = call(Command::ListReadyWork).expect("ready work is listed");
+        assert_eq!(
+            ready_after, ready_before,
+            "a failed scheduling attempt changed what is ready"
+        );
+
+        // The other branch: a unit that already existed is not this path's to discard. Grouping
+        // it explicitly first makes the next failure a pre-existing unit rather than one this
+        // call created.
+        let ResponseData::ReleaseUnitCreated { unit } =
+            call(Command::CreateReleaseUnit(CreateReleaseUnitRequest {
+                release_unit_id: reccursive_protocol::ReleaseUnitId::new(),
+                feature_id,
+                plan_revision: Revision::FIRST,
+                task_ids: [task_id].into_iter().collect(),
+            }))
+            .expect("the work is grouped")
+        else {
+            panic!("expected a release unit")
+        };
+
+        let second_refusal = call(Command::ScheduleCapturedWork(
+            reccursive_protocol::ScheduleCapturedWorkRequest {
+                feature_id,
+                plan_revision: Revision::FIRST,
+                package_id: package.package_id,
+                package_revision: package.revision,
+                requested_at_unix_ms: Some(1_000_000_000_000),
+                seed: 0,
+            },
+        ));
+        assert!(
+            second_refusal.is_err(),
+            "a past release time must be refused"
+        );
+
+        let ResponseData::ReleaseUnit { unit: survivor } = call(Command::GetReleaseUnit {
+            release_unit_id: unit.unit_id,
+        })
+        .expect("the pre-existing unit is still there") else {
+            panic!("expected a release unit")
+        };
+        assert_eq!(
+            survivor.unit_id, unit.unit_id,
+            "a unit that already existed was discarded by a failure it did not cause"
+        );
+
+        // And the work still schedules, which proves nothing is left holding it.
+        assert!(
+            call(Command::ScheduleCapturedWork(
+                reccursive_protocol::ScheduleCapturedWorkRequest {
+                    feature_id,
+                    plan_revision: Revision::FIRST,
+                    package_id: package.package_id,
+                    package_revision: package.revision,
+                    requested_at_unix_ms: None,
+                    seed: 7,
+                },
+            ))
+            .is_ok(),
+            "the work could not be scheduled after two failed attempts"
+        );
+
+        worker.join().unwrap().unwrap();
+    }
+
     #[test]
     fn unauthorized_requests_receive_a_stable_error() {
         let directory = tempdir().unwrap();

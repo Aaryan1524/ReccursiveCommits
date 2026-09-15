@@ -322,7 +322,9 @@ plan, revision, package or identifier involved. It reads your checkout and never
 writes to it: the snapshot is taken into the daemon's own storage, so editing
 afterwards cannot change what was scheduled, and nothing is ever reset, stashed,
 staged or committed on your behalf. Ignored files are excluded, because git
-excludes them. Renames are refused for now rather than captured wrongly.
+excludes them. A file you deleted is captured as a deletion and published as one,
+rather than being resurrected from the last commit. Renames are refused for now
+rather than captured wrongly.
 
 If prepared work exists as well, it asks which you mean. The two are never
 combined into one release: a release unit's tasks must match a captured

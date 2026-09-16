@@ -27,7 +27,16 @@ const MAX_ATTEMPTS: usize = 12;
 /// learn them — a second implementation of the policy would eventually disagree with the one that
 /// actually decides.
 pub fn choose(session: &Session, group: &ReadyWorkGroup) -> Result<Chosen, CliFailure> {
-    let zone = group.timezone.clone();
+    choose_for(session, group.repository_id, &group.timezone)
+}
+
+/// The same conversation, for work that has no ready-work group behind it.
+pub fn choose_for(
+    session: &Session,
+    repository_id: reccursive_protocol::RepositoryId,
+    timezone: &str,
+) -> Result<Chosen, CliFailure> {
+    let zone = timezone.to_owned();
     let mut date: Option<String> = None;
 
     for _ in 0..MAX_ATTEMPTS {
@@ -52,7 +61,7 @@ pub fn choose(session: &Session, group: &ReadyWorkGroup) -> Result<Chosen, CliFa
             }
         };
 
-        match validate(session, group, instant_unix_ms)? {
+        match validate(session, repository_id, instant_unix_ms)? {
             ReleaseTimeVerdict::Allowed => return Ok(Chosen { instant_unix_ms }),
             ReleaseTimeVerdict::Refused { reason, message } => {
                 println!("\n{message}\n");
@@ -75,13 +84,13 @@ pub fn choose(session: &Session, group: &ReadyWorkGroup) -> Result<Chosen, CliFa
 /// answer about a queue that changed, not a contradiction.
 fn validate(
     session: &Session,
-    group: &ReadyWorkGroup,
+    repository_id: reccursive_protocol::RepositoryId,
     requested_at_unix_ms: i64,
 ) -> Result<ReleaseTimeVerdict, CliFailure> {
     match send(
         session,
         Command::ValidateReleaseTime {
-            repository_id: group.repository_id,
+            repository_id,
             requested_at_unix_ms,
         },
     )? {

@@ -483,6 +483,61 @@ impl Store {
         Ok(blocked)
     }
 
+    /// Removes a release unit that never got a release time, and nothing else.
+    ///
+    /// Narrow on purpose. This exists so an interactive attempt that groups work and then fails to
+    /// schedule it can leave nothing behind — a unit nobody asked for takes its tasks out of the
+    /// ready list while still showing in the queue, which is how a change becomes invisible
+    /// without becoming gone.
+    ///
+    /// Refuses a unit that holds a live slot or a publication attempt: those are units the queue
+    /// is acting on, and discarding one is not a tidy-up, it is losing scheduled work.
+    pub fn discard_unscheduled_release_unit(
+        &mut self,
+        unit_id: ReleaseUnitId,
+    ) -> Result<bool, StoreError> {
+        let Some(unit) = self.release_unit(unit_id)? else {
+            return Ok(false);
+        };
+        if self.schedule_slot(unit_id)?.is_some() {
+            return Err(StoreError::Conflict(format!(
+                "release unit {unit_id} holds a release time and cannot be discarded"
+            )));
+        }
+        // Any slot at all, live or withdrawn, means this unit has been scheduled before and its
+        // history is evidence rather than clutter.
+        if !self.schedule_slot_history(unit_id)?.is_empty() {
+            return Err(StoreError::Conflict(format!(
+                "release unit {unit_id} has been scheduled before and cannot be discarded"
+            )));
+        }
+        for task_id in &unit.task_ids {
+            let Some(task) = self.task(unit.feature_id, unit.plan_revision, *task_id)? else {
+                continue;
+            };
+            // The question is whether the queue is acting on this work, not how far along it is.
+            // Anything at or past `Scheduled` has been handed to the release machinery, and
+            // anything off the ordinary path is blocked or terminal — both are outcomes, not
+            // leftovers. Work that has not reached `Scheduled` is exactly what a failed grouping
+            // leaves behind.
+            if task.state.status().is_at_or_past(TaskStatus::Scheduled) != Some(false) {
+                return Err(StoreError::Conflict(format!(
+                    "task {task_id} is {:?}; the unit holding it cannot be discarded",
+                    task.state.status()
+                )));
+            }
+        }
+        // `release_unit_tasks` cascades on the unit's own deletion.
+        let removed = self
+            .connection
+            .execute(
+                "DELETE FROM release_units WHERE unit_id = ?1",
+                [unit_id.to_string()],
+            )
+            .map_err(map_unit_write_error)?;
+        Ok(removed == 1)
+    }
+
     /// Marks evidence for every package carrying a task as no longer standing.
     fn invalidate_task_evidence(
         &mut self,
@@ -947,6 +1002,68 @@ mod tests {
                 .state
                 .status(),
             TaskStatus::Planned
+        );
+    }
+
+    #[test]
+    fn an_unscheduled_unit_can_be_discarded_so_a_failed_attempt_strands_nothing() {
+        // A wizard that groups work and then cannot schedule it must leave nothing behind. A unit
+        // nobody asked for takes its tasks out of the ready list while still showing in the queue,
+        // which is how a change becomes invisible without becoming gone.
+        let mut fixture = fixture();
+        let unit_id = ReleaseUnitId::new();
+        fixture
+            .store
+            .create_release_unit(
+                unit_id,
+                fixture.feature_id,
+                Revision::FIRST,
+                BTreeSet::from([fixture.interface]),
+                10,
+            )
+            .unwrap();
+        assert!(fixture.store.release_unit(unit_id).unwrap().is_some());
+        // Queued is the state the real flow discards from: capture put it there, and scheduling
+        // then refused.
+        fixture
+            .store
+            .advance_task_to(
+                fixture.feature_id,
+                Revision::FIRST,
+                fixture.interface,
+                TaskStatus::Queued,
+                11,
+            )
+            .unwrap();
+
+        assert!(
+            fixture
+                .store
+                .discard_unscheduled_release_unit(unit_id)
+                .unwrap()
+        );
+        assert!(fixture.store.release_unit(unit_id).unwrap().is_none());
+        // The work returns to being ungrouped, which is what makes it offerable again.
+        assert!(
+            fixture
+                .store
+                .release_unit_for_task(fixture.feature_id, Revision::FIRST, fixture.interface)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn discarding_a_unit_that_was_never_grouped_is_not_an_error() {
+        // The caller discards on a failure path and cannot always know whether it created the
+        // unit; reporting "already gone" as a fault would replace a useful error with a useless
+        // one.
+        let mut fixture = fixture();
+        assert!(
+            !fixture
+                .store
+                .discard_unscheduled_release_unit(ReleaseUnitId::new())
+                .unwrap()
         );
     }
 

@@ -266,7 +266,8 @@ pub fn confirmation(
 ) -> Result<(), CliFailure> {
     writeln!(
         stdout,
-        "\n✓ Scheduled\n\n{name}\n{}\n\n{} · {delivery}\n\nReccursive will handle it automatically.",
+        "\n{}\n\n{name}\n{}\n\n{} · {delivery}\n\nReccursive will handle it automatically.",
+        crate::paint(crate::ansi::GREEN, "✓ Scheduled"),
         human_time(selected_at_unix_ms),
         if file_count == 1 {
             "1 file".to_owned()

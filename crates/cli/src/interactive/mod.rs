@@ -334,7 +334,8 @@ fn confirmation(
 ) -> Result<(), CliFailure> {
     writeln!(
         stdout,
-        "\n✓ Scheduled\n\n{}\n{}\n\n{} · {}\n\nReccursive will handle it automatically.",
+        "\n{}\n\n{}\n{}\n\n{} · {}\n\nReccursive will handle it automatically.",
+        crate::paint(crate::ansi::GREEN, "✓ Scheduled"),
         group.feature_goal,
         human_time(slot.selected_at_unix_ms),
         change_count(package.task_names.len()),

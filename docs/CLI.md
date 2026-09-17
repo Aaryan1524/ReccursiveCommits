@@ -276,6 +276,13 @@ produce would be a lie in the interface. Anything blocked, and any release time
 that was withdrawn, is called out beneath the table with its reason, because
 those are the only lines that ask for an action.
 
+When standard output is a real terminal, each state in that table is prefixed
+with a small icon and colored — green for `published`, yellow for anything
+about to happen or waiting on you, red for `blocked`, dim for `ready` and
+`cancelled`. This is presentation only: it disappears the moment output is
+piped, redirected, or `NO_COLOR` is set (<https://no-color.org>), and it never
+changes the underlying label a script or `--json` caller sees.
+
 `queue watch` redraws that view on an interval. It is a *display*: it holds no
 lease, claims no work, and tells the daemon nothing — it asks the same question
 `queue status` asks, repeatedly. Stopping it therefore cannot affect what is

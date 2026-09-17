@@ -2382,6 +2382,89 @@ fn export_diagnostics(
     .map_err(output_error)
 }
 
+/// Whether this run should emit color and symbols at all.
+///
+/// Three things all have to hold: a real terminal is attached (never decorate a pipe, a file
+/// redirect, or a scenario's `$(...)` capture — all of those report `is_terminal() == false`,
+/// which is what keeps every existing plain-text assertion working unchanged); `--json` was not
+/// requested (though in practice that path never reaches these renderers at all, since
+/// `output_data` returns before this point); and the `NO_COLOR` convention
+/// (<https://no-color.org>) has not been asked for.
+pub(crate) fn use_color() -> bool {
+    io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// ANSI SGR codes. Hand-rolled rather than a crate: this is the only place in the CLI that wants
+/// color, and four constants plus a reset do not justify a dependency.
+pub(crate) mod ansi {
+    pub const RESET: &str = "\x1b[0m";
+    pub const GREEN: &str = "\x1b[32m";
+    pub const YELLOW: &str = "\x1b[33m";
+    pub const RED: &str = "\x1b[31m";
+    pub const CYAN: &str = "\x1b[36m";
+    pub const DIM: &str = "\x1b[2m";
+}
+
+/// Wraps text in a color, or leaves it exactly alone when color is off.
+///
+/// Always returning the same *content* either way — only ever adding invisible bytes around it —
+/// is what lets every plain-text scenario assertion (`grep -q "awaiting your merge"`, etc.) keep
+/// matching whether or not this happens to run attached to a terminal.
+pub(crate) fn paint(color: &str, text: &str) -> String {
+    if use_color() {
+        format!("{color}{text}{}", ansi::RESET)
+    } else {
+        text.to_owned()
+    }
+}
+
+/// The number of *printed* columns a string occupies, ignoring ANSI escape sequences.
+///
+/// `output_table` aligns columns by character count. Once a cell can contain color codes, character
+/// count and printed width stop being the same number — an ANSI-decorated "published" is 19 `char`s
+/// for 9 printed columns — and aligning on the wrong one visibly breaks every table that has a
+/// colored cell next to a plain one.
+fn visible_width(text: &str) -> usize {
+    let mut width = 0;
+    let mut chars = text.chars();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' && chars.as_str().starts_with('[') {
+            // Consume through the SGR sequence's terminating byte (`m` for color codes) rather
+            // than assuming a fixed length, so this stays correct if the palette above changes.
+            for next in chars.by_ref() {
+                if next == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        width += 1;
+    }
+    width
+}
+
+/// A state's icon, colored label, and the plain label for width accounting — one place deciding
+/// what a state looks like, so `queue status` and `queue watch` cannot show it two different ways.
+fn decorated_state(state: QueuedUnitState) -> String {
+    let label = queued_state_label(state);
+    let (icon, color) = match state {
+        QueuedUnitState::Ready => ("○", ansi::DIM),
+        QueuedUnitState::Scheduled => ("◔", ansi::CYAN),
+        QueuedUnitState::Due => ("⏳", ansi::YELLOW),
+        QueuedUnitState::Publishing => ("⟳", ansi::YELLOW),
+        QueuedUnitState::Blocked => ("⚠", ansi::RED),
+        QueuedUnitState::Cancelled => ("✕", ansi::DIM),
+        QueuedUnitState::AvailableEarly => ("◐", ansi::CYAN),
+        QueuedUnitState::AwaitingMerge => ("◔", ansi::YELLOW),
+        QueuedUnitState::Published => ("✓", ansi::GREEN),
+    };
+    if use_color() {
+        paint(color, &format!("{icon} {label}"))
+    } else {
+        label.to_owned()
+    }
+}
+
 fn queued_state_label(state: QueuedUnitState) -> &'static str {
     match state {
         QueuedUnitState::Ready => "ready",
@@ -2432,7 +2515,7 @@ fn output_queue_summary(
                 .map(|unit| {
                     vec![
                         unit.release_unit_id.to_string(),
-                        queued_state_label(unit.state).to_owned(),
+                        decorated_state(unit.state),
                         unit.selected_at_unix_ms
                             .map_or_else(|| "—".to_owned(), human_time),
                         unit.task_names.join(", "),
@@ -3274,7 +3357,7 @@ fn output_table(out: &mut impl Write, headings: &[&str], rows: Vec<Vec<String>>)
         .enumerate()
         .map(|(index, heading)| {
             rows.iter()
-                .map(|row| row[index].chars().count())
+                .map(|row| visible_width(&row[index]))
                 .max()
                 .unwrap_or_default()
                 .max(heading.chars().count())
@@ -3302,7 +3385,11 @@ fn output_table_row<'a>(
         if index > 0 {
             write!(out, " | ")?;
         }
-        write!(out, "{cell:<width$}")?;
+        // Padding has to be computed from the printed width and appended by hand:
+        // `{cell:<width$}` pads to `width` *characters*, and a colored cell's escape bytes would
+        // eat into that, under-padding it relative to a plain cell of the same visible length.
+        let padding = width.saturating_sub(visible_width(cell));
+        write!(out, "{cell}{}", " ".repeat(padding))?;
     }
     writeln!(out)
 }

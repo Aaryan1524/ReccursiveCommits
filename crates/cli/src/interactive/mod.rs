@@ -21,9 +21,12 @@ const MAX_ATTEMPTS: usize = 5;
 
 use std::io::Write;
 
-use reccursive_protocol::{Command, ReadyWorkGroup, ResponseData, TargetIntegration};
+use reccursive_protocol::{
+    Command, ReadyWorkGroup, ResponseData, ScheduleCapturedWorkRequest,
+    ScheduleCheckoutBatchesRequest, TargetIntegration,
+};
 
-use crate::{CliFailure, EXIT_ACTION_REQUIRED, Session, human_time, send};
+use crate::{CliFailure, EXIT_ACTION_REQUIRED, Session, human_time_in, send};
 
 /// Runs the wizard end to end, or explains why it cannot.
 ///
@@ -117,10 +120,16 @@ fn git_repository_here(path: &std::path::Path) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-/// Schedules what is sitting in the user's own working tree.
+/// Schedules what is sitting in the user's own working tree, split into as many independent,
+/// independently timed batches as the person wants.
 ///
-/// The snapshot is taken before any time is chosen, so what gets scheduled is what they were shown
-/// and approved — and editing afterwards cannot change it. Their checkout is only ever read.
+/// Each batch's snapshot is taken the moment it is built, so editing the checkout afterwards
+/// cannot change what that batch will publish. Nothing becomes a real release, though, until the
+/// whole plan — every batch built this session — is reviewed and confirmed together: building a
+/// batch only ever captures it, and capturing is already the operation the single-batch flow used
+/// to leave behind when somebody declined its confirmation, so a session that stops early leaves
+/// nothing worse than that same, already-supported, retryable state. Their checkout is only ever
+/// read.
 fn schedule_checkout(
     session: &Session,
     stdout: &mut impl Write,
@@ -128,82 +137,120 @@ fn schedule_checkout(
     root: &std::path::Path,
     changes: Vec<checkout::Change>,
 ) -> Result<(), CliFailure> {
-    checkout::show(stdout, &changes)?;
-    if !pick::confirm("Schedule these changes?")? {
-        writeln!(stdout, "Not scheduled. No changes were made.").map_err(crate::output_error)?;
-        return Ok(());
-    }
-    let name = checkout::ask_name()?;
-
-    let (feature_id, plan_revision, package_id) =
-        checkout::capture(session, repository, &name, &changes)?;
     let _ = root;
+    writeln!(stdout, "\n{}\n", checkout::summary_line(&changes)).map_err(crate::output_error)?;
 
     let delivery = delivery_for(repository);
     let timezone = repository_timezone(session, repository.id)?;
 
-    for _ in 0..MAX_ATTEMPTS {
-        let when = when::choose_for(session, repository.id, &timezone)?;
-        writeln!(
-            stdout,
-            "\nReview\n\n{name}\n{}\n\n{delivery}\n\n{}\n",
-            if changes.len() == 1 {
-                "1 file".to_owned()
-            } else {
-                format!("{} files", changes.len())
-            },
-            human_time(when.instant_unix_ms)
-        )
-        .map_err(crate::output_error)?;
-        if !pick::confirm("Schedule it?")? {
+    let mut remaining = changes;
+    let mut batches: Vec<checkout::Batch> = Vec::new();
+
+    while !remaining.is_empty() {
+        writeln!(stdout, "{}\n", checkout::summary_line(&remaining))
+            .map_err(crate::output_error)?;
+        let selected = checkout::select_files(&remaining)?;
+        if selected.is_empty() {
             writeln!(
                 stdout,
-                "Not scheduled. The change stays captured and ready."
+                "No files selected. Leaving the rest of your checkout alone.\n"
             )
             .map_err(crate::output_error)?;
-            return Ok(());
+            break;
         }
-        let request = reccursive_protocol::ScheduleCapturedWorkRequest {
+        let (chosen, rest) = checkout::partition(remaining, &selected);
+        let title = checkout::ask_name()?;
+
+        let pending_instants: Vec<i64> =
+            batches.iter().map(|batch| batch.instant_unix_ms).collect();
+        let when = match when::choose_for(session, repository.id, &timezone, &pending_instants) {
+            Ok(when) => when,
+            Err(failure) if failure.code == "cancelled" => {
+                // A person can back out of naming a time without losing the batches they already
+                // built; only the file selection they were mid-way through is abandoned.
+                remaining = rest;
+                break;
+            }
+            Err(failure) => return Err(failure),
+        };
+
+        let (feature_id, plan_revision, package_id) =
+            checkout::capture(session, repository, &title, &chosen)?;
+        batches.push(checkout::Batch {
+            title,
+            changes: chosen,
+            instant_unix_ms: when.instant_unix_ms,
             feature_id,
             plan_revision,
             package_id,
-            package_revision: reccursive_protocol::Revision::FIRST,
-            requested_at_unix_ms: Some(when.instant_unix_ms),
-            seed: 0,
-        };
-        match send(session, Command::ScheduleCapturedWork(request)) {
-            Ok(ResponseData::ScheduleSlot { slot }) => {
-                return checkout::confirmation(
-                    stdout,
-                    &name,
-                    changes.len(),
-                    &delivery,
-                    slot.selected_at_unix_ms,
-                );
-            }
-            Ok(_) => {
-                return Err(CliFailure::new(
-                    EXIT_ACTION_REQUIRED,
-                    "unexpected_response",
-                    "the service did not return a release time",
-                ));
-            }
-            Err(failure) if failure.code == "invalid_request" => {
-                writeln!(
-                    stdout,
-                    "\nThat time is no longer available.\n{}\n",
-                    failure.message
-                )
-                .map_err(crate::output_error)?;
-            }
+        });
+        remaining = rest;
+
+        if remaining.is_empty() {
+            break;
+        }
+        match pick::next_action(remaining.len()) {
+            Ok(pick::NextAction::AnotherBatch) => {}
+            Ok(pick::NextAction::LeaveRemaining) => break,
+            Err(failure) if failure.code == "cancelled" => break,
             Err(failure) => return Err(failure),
         }
     }
-    Err(CliFailure::new(
-        EXIT_ACTION_REQUIRED,
-        "no_valid_time",
-        "No release time could be secured. The change stays captured and ready.",
-    ))
+
+    if batches.is_empty() {
+        writeln!(stdout, "Not scheduled. No changes were made.").map_err(crate::output_error)?;
+        return Ok(());
+    }
+
+    checkout::review_plan(stdout, &batches, &remaining, &delivery, &timezone)?;
+    let question = if batches.len() == 1 {
+        "Schedule this release?".to_owned()
+    } else {
+        format!("Schedule these {} releases?", batches.len())
+    };
+    if !pick::confirm(&question)? {
+        writeln!(
+            stdout,
+            "Not scheduled. Every batch stays captured and ready — run `reccursive schedule` \
+             again to pick up where you left off."
+        )
+        .map_err(crate::output_error)?;
+        return Ok(());
+    }
+
+    let request = ScheduleCheckoutBatchesRequest {
+        batches: batches
+            .iter()
+            .map(|batch| ScheduleCapturedWorkRequest {
+                feature_id: batch.feature_id,
+                plan_revision: batch.plan_revision,
+                package_id: batch.package_id,
+                package_revision: reccursive_protocol::Revision::FIRST,
+                requested_at_unix_ms: Some(batch.instant_unix_ms),
+                seed: 0,
+            })
+            .collect(),
+    };
+    match send(session, Command::ScheduleCheckoutBatches(request)) {
+        Ok(ResponseData::CheckoutBatchesScheduled { slots }) => {
+            checkout::confirmation_multi(stdout, &batches, &slots, &delivery)
+        }
+        Ok(_) => Err(CliFailure::new(
+            EXIT_ACTION_REQUIRED,
+            "unexpected_response",
+            "the service did not return release times",
+        )),
+        Err(failure) => {
+            writeln!(
+                stdout,
+                "\nNone of these releases were scheduled.\n{}\n\nEvery batch stays captured and \
+                 ready — run `reccursive schedule` again.",
+                failure.message
+            )
+            .map_err(crate::output_error)?;
+            Err(failure)
+        }
+    }
 }
 
 /// The repository's schedule zone, which is the one a requested time is read in.
@@ -286,7 +333,14 @@ fn review(
         delivery(group)
     )
     .map_err(crate::output_error)?;
-    writeln!(stdout, "{}\n", human_time(instant_unix_ms)).map_err(crate::output_error)
+    // The group's own schedule-policy zone: the same one the time was entered and validated in,
+    // and the only source of truth for what the instant chosen a moment ago actually means.
+    writeln!(
+        stdout,
+        "{}\n",
+        human_time_in(instant_unix_ms, &group.timezone)
+    )
+    .map_err(crate::output_error)
 }
 
 fn change_count(count: usize) -> String {
@@ -332,12 +386,14 @@ fn confirmation(
     package: &reccursive_protocol::ReadyPackageView,
     slot: reccursive_protocol::ScheduleSlotView,
 ) -> Result<(), CliFailure> {
+    // The slot's own timezone, not the group's current policy zone: the zone actually in effect
+    // when this instant was persisted, so a later policy change cannot change what is shown here.
     writeln!(
         stdout,
         "\n{}\n\n{}\n{}\n\n{} · {}\n\nReccursive will handle it automatically.",
         crate::paint(crate::ansi::GREEN, "✓ Scheduled"),
         group.feature_goal,
-        human_time(slot.selected_at_unix_ms),
+        human_time_in(slot.selected_at_unix_ms, &slot.timezone),
         change_count(package.task_names.len()),
         delivery(group),
     )

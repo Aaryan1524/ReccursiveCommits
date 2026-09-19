@@ -130,6 +130,35 @@ pub fn confirm(question: &str) -> Result<bool, CliFailure> {
     Ok(answered(Confirm::new(question).with_default(true).prompt())?.unwrap_or(false))
 }
 
+/// What to do after one batch of a multi-batch checkout session has been built.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NextAction {
+    AnotherBatch,
+    LeaveRemaining,
+}
+
+/// Asks whether to keep splitting the checkout into more batches, or stop here.
+///
+/// Offered only while files remain unclaimed by any batch — a session with nothing left to
+/// assign has nothing to ask about.
+pub fn next_action(remaining: usize) -> Result<NextAction, CliFailure> {
+    const AGAIN: &str = "Create another scheduled batch";
+    const LEAVE: &str = "Leave remaining changes alone";
+    let changes = if remaining == 1 {
+        "1 change remains".to_owned()
+    } else {
+        format!("{remaining} changes remain")
+    };
+    let chosen =
+        answered(Select::new(&format!("{changes}. What next?"), vec![AGAIN, LEAVE]).prompt())?
+            .ok_or_else(cancelled)?;
+    Ok(if chosen == AGAIN {
+        NextAction::AnotherBatch
+    } else {
+        NextAction::LeaveRemaining
+    })
+}
+
 /// Where the work to schedule should come from, when both exist.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Source {

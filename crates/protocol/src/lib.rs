@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
 /// Local API protocol version. Version 16 adds package change inspection and check results.
-pub const API_VERSION: u16 = 23;
+pub const API_VERSION: u16 = 24;
 
 /// Stable service identifier shared by the daemon and by service installation.
 pub const SERVICE_NAME: &str = "reccursive-daemon";
@@ -156,6 +156,7 @@ impl RequestEnvelope {
             Command::ReleasePackage(request) => request.validate(),
             Command::CreateReleaseUnit(request) => request.validate(),
             Command::ScheduleCapturedWork(_) => Ok(()),
+            Command::ScheduleCheckoutBatches(request) => request.validate(),
             Command::PauseRepository { reason, .. }
                 if reason.trim().is_empty() || reason.len() > 256 =>
             {
@@ -240,6 +241,16 @@ pub enum Command {
     /// the work inside it stops being offered as ready — it has a unit — while still showing in
     /// the queue. That is how a trial lost a change: it was neither schedulable nor visibly gone.
     ScheduleCapturedWork(ScheduleCapturedWorkRequest),
+    /// Group and schedule several already-captured packages as one all-or-nothing plan.
+    ///
+    /// Exists for a multi-batch checkout session: several packages are captured individually
+    /// while the person is still choosing what goes where, but none of them may become a real
+    /// release until every batch in the plan has a release time the repository accepts. Batches
+    /// are scheduled in the given order, each becoming its own release unit and slot; if any
+    /// batch is refused, every batch already scheduled by this call is withdrawn and discarded
+    /// before the error is returned, so a failure here leaves none of them scheduled rather than
+    /// a prefix of them.
+    ScheduleCheckoutBatches(ScheduleCheckoutBatchesRequest),
     /// Ask whether an instant is a release time a repository is currently allowed to publish at.
     ///
     /// Read-only and advisory. It reserves nothing, and the answer can stop being true the moment
@@ -249,6 +260,14 @@ pub enum Command {
     ValidateReleaseTime {
         repository_id: RepositoryId,
         requested_at_unix_ms: i64,
+        /// Other instants already chosen in this session but not yet persisted.
+        ///
+        /// A multi-batch session holds several release times in memory before any of them is
+        /// scheduled, so a spacing or daily-maximum rule checked only against durable slots would
+        /// wave through a second batch that collides with the first. Checked exactly like a
+        /// persisted slot, and never persisted itself.
+        #[serde(default)]
+        pending_at_unix_ms: Vec<i64>,
     },
     ListEvents {
         limit: usize,
@@ -414,6 +433,7 @@ impl Command {
             | Self::ReleasePackage(_)
             | Self::CreateReleaseUnit(_)
             | Self::ScheduleCapturedWork(_)
+            | Self::ScheduleCheckoutBatches(_)
             | Self::SetSchedulePolicy(_)
             | Self::ScheduleUnit(_)
             | Self::WithdrawScheduleSlot { .. }
@@ -472,6 +492,7 @@ impl Command {
             | Self::ValidateReleaseTime { .. }
             | Self::ListEvents { .. }
             | Self::ScheduleCapturedWork(_)
+            | Self::ScheduleCheckoutBatches(_)
             | Self::ImportPlan { .. }
             | Self::SealPlan { .. }
             | Self::GetPlan { .. }
@@ -1228,6 +1249,24 @@ pub struct ScheduleCapturedWorkRequest {
     pub seed: u64,
 }
 
+/// Several already-captured packages to group and schedule as one all-or-nothing plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleCheckoutBatchesRequest {
+    /// One per batch, in the order they should be scheduled. Each is exactly what a single
+    /// `ScheduleCapturedWork` request would carry, since the difference is not the shape of one
+    /// batch but that several are committed together or not at all.
+    pub batches: Vec<ScheduleCapturedWorkRequest>,
+}
+
+impl ScheduleCheckoutBatchesRequest {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.batches.is_empty() || self.batches.len() > 64 {
+            return Err(ProtocolValidationError::InvalidBatchCount);
+        }
+        Ok(())
+    }
+}
+
 /// Whether a requested release time is currently allowed, and if not, which rule refused it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "verdict", rename_all = "snake_case")]
@@ -1706,6 +1745,10 @@ pub enum ResponseData {
     ScheduleSlot {
         slot: ScheduleSlotView,
     },
+    /// One slot per batch, in the order the batches were requested; all of them, or none.
+    CheckoutBatchesScheduled {
+        slots: Vec<ScheduleSlotView>,
+    },
     ScheduleRecalculated {
         recalculation: ScheduleRecalculationView,
     },
@@ -1836,6 +1879,8 @@ pub enum ProtocolValidationError {
     InvalidRequiredCheck,
     #[error("queue export destination must contain 1-4096 bytes")]
     InvalidExportDestination,
+    #[error("a checkout batch plan must name between 1 and 64 batches")]
+    InvalidBatchCount,
 }
 
 #[cfg(test)]

@@ -23,9 +23,9 @@ jobs:
       matrix:
         include:
           - name: darwin-x86_64
-            runner: macos-13
+            runner: macos-15-intel
           - name: darwin-aarch64
-            runner: macos-14
+            runner: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -33,6 +33,10 @@ jobs:
           components: clippy,rustfmt
       - name: Verify the release revision
         run: |
+          version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          test -n "$version"
+          test "$GITHUB_REF_NAME" = "v$version"
+          test "$(uname -m)" = "${{ matrix.name == 'darwin-x86_64' && 'x86_64' || 'arm64' }}"
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features -- -D warnings
           cargo test --workspace --all-targets --locked
@@ -81,7 +85,9 @@ jobs:
           stage="$RUNNER_TEMP/reccursive-${version}-${{ matrix.name }}"
           mkdir -p "$stage"
           cp target/release/reccursive target/release/reccursive-daemon LICENSE "$stage/"
-          ditto -c -k --keepParent "$stage" "$archive"
+          ditto -c -k "$stage" "$archive"
+          unzip -Z -1 "$archive" | grep -Fx 'reccursive'
+          unzip -Z -1 "$archive" | grep -Fx 'reccursive-daemon'
           key="$RUNNER_TEMP/AuthKey_${KEY_ID}.p8"
           printf '%s' "$PRIVATE_KEY" > "$key"
           chmod 600 "$key"
@@ -104,6 +110,7 @@ jobs:
       - name: Create checksums and release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           cd artifacts
           sha256sum reccursive-*.zip > SHA256SUMS

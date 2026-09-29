@@ -13,6 +13,13 @@ version="$1"
 x86_64_sha="$2"
 aarch64_sha="$3"
 
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+   [[ ! "$x86_64_sha" =~ ^[[:xdigit:]]{64}$ ]] ||
+   [[ ! "$aarch64_sha" =~ ^[[:xdigit:]]{64}$ ]]; then
+  printf 'version must be X.Y.Z and both SHA-256 values must be 64 hexadecimal characters\n' >&2
+  exit 64
+fi
+
 cat <<FORMULA
 class Reccursive < Formula
   desc "Queue verified Git changes for scheduled local publication"

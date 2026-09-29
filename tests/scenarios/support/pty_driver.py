@@ -73,10 +73,13 @@ def run(steps, command):
 
     # Drain whatever the process still has to say before it exits.
     deadline = time.time() + TIMEOUT_SECONDS
+    child_status = None
     while time.time() < deadline:
         ready, _, _ = select.select([fd], [], [], 0.5)
         if not ready:
-            if os.waitpid(pid, os.WNOHANG) != (0, 0):
+            finished, status = os.waitpid(pid, os.WNOHANG)
+            if finished:
+                child_status = status
                 break
             continue
         try:
@@ -87,7 +90,7 @@ def run(steps, command):
             break
         transcript.append(chunk)
 
-    _, status = os.waitpid(pid, 0)
+    status = child_status if child_status is not None else os.waitpid(pid, 0)[1]
     exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
     full_transcript = "".join(transcript)
     print(full_transcript)

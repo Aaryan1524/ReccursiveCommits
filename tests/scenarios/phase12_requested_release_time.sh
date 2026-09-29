@@ -99,6 +99,24 @@ cat >"$fixture_root/policy.json" <<'JSON'
 JSON
 cli schedule set-policy "$repository_id" "$fixture_root/policy.json" >/dev/null
 
+# Pick a Friday safely in the future so this scenario keeps proving policy behavior after the
+# calendar date on which it was first written. Compute the expected UTC instant from the named
+# policy zone too, so a daylight-saving change cannot make the assertion stale.
+read -r friday saturday first_unix_ms second_unix_ms first_utc_clock < <(python3 - <<'PY'
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+zone = ZoneInfo("America/New_York")
+today = datetime.now(zone).date()
+friday = today + timedelta(days=(4 - today.weekday()) % 7 + 7)
+saturday = friday + timedelta(days=1)
+first = datetime(friday.year, friday.month, friday.day, 10, 30, tzinfo=zone)
+second = first + timedelta(hours=1)
+print(friday.isoformat(), saturday.isoformat(), int(first.timestamp() * 1000),
+      int(second.timestamp() * 1000), first.astimezone(timezone.utc).strftime("%H:%M"))
+PY
+)
+
 feature_id="feature_00000000-0000-4000-8000-000000001501"
 task_one="task_00000000-0000-4000-8000-000000001502"
 task_two="task_00000000-0000-4000-8000-000000001503"
@@ -145,9 +163,8 @@ grep -q "First change" <<<"$(plain ready)" && \
   fail "work already grouped into a release unit was offered again as ungrouped"
 
 # --- A time outside the window is refused, and says what is allowed. ---
-# 2026-09-18 is a Friday; the window is 09:00-12:00.
 if refused="$(cli schedule unit "$unit_one" --package-id "$package_one" --revision 1 \
-  --at "2026-09-18 22:30" --zone America/New_York 2>&1)"; then
+  --at "$friday 22:30" --zone America/New_York 2>&1)"; then
   fail "a release was scheduled outside this repository's publishing hours"
 fi
 grep -q "outside" <<<"$refused" || \
@@ -156,9 +173,8 @@ grep -q "09:00-12:00" <<<"$refused" || \
   fail "the refusal does not say which hours are open: $refused"
 
 # --- A day the repository does not publish on is refused. ---
-# 2026-09-19 is a Saturday.
 if weekend="$(cli schedule unit "$unit_one" --package-id "$package_one" --revision 1 \
-  --at "2026-09-19 10:30" --zone America/New_York 2>&1)"; then
+  --at "$saturday 10:30" --zone America/New_York 2>&1)"; then
   fail "a release was scheduled on a day this repository does not publish on"
 fi
 grep -qi "saturday" <<<"$weekend" || \
@@ -166,15 +182,14 @@ grep -qi "saturday" <<<"$weekend" || \
 
 # --- A time inside the window is honoured exactly. ---
 scheduled="$(cli schedule unit "$unit_one" --package-id "$package_one" --revision 1 \
-  --at "2026-09-18 10:30" --zone America/New_York)"
+  --at "$friday 10:30" --zone America/New_York)"
 selected="$(json_number selected_at_unix_ms <<<"$scheduled")"
-# 2026-09-18 10:30 America/New_York is 14:30 UTC, which is 1789741800000.
-[[ "$selected" == "1789741800000" ]] || \
+[[ "$selected" == "$first_unix_ms" ]] || \
   fail "the requested instant was not stored exactly: got $selected"
 
 # Asking again returns the same slot rather than drawing a new one.
 again="$(cli schedule unit "$unit_one" --package-id "$package_one" --revision 1 \
-  --at "2026-09-18 10:30" --zone America/New_York)"
+  --at "$friday 10:30" --zone America/New_York)"
 [[ "$(json_number selected_at_unix_ms <<<"$again")" == "$selected" ]] || \
   fail "repeating an identical scheduling request drew a different time"
 
@@ -182,19 +197,19 @@ again="$(cli schedule unit "$unit_one" --package-id "$package_one" --revision 1 
 #
 # Two implementations of the same rules would eventually disagree, and a person told "yes" at the
 # prompt and "no" at the review screen would have no way to know which was right.
-allowed="$(cli schedule check "$repository_id" --at "2026-09-18 11:30" --zone America/New_York)"
+allowed="$(cli schedule check "$repository_id" --at "$friday 11:30" --zone America/New_York)"
 grep -q '"verdict":"allowed"' <<<"$allowed" || \
   fail "a time the scheduler accepts was not reported as allowed: $allowed"
 
-weekend_check="$(cli schedule check "$repository_id" --at "2026-09-19 10:30" --zone America/New_York)"
+weekend_check="$(cli schedule check "$repository_id" --at "$saturday 10:30" --zone America/New_York)"
 grep -q '"reason":"day_not_allowed"' <<<"$weekend_check" || \
   fail "a refused weekday did not report a structured reason: $weekend_check"
 
-late_check="$(cli schedule check "$repository_id" --at "2026-09-18 22:30" --zone America/New_York)"
+late_check="$(cli schedule check "$repository_id" --at "$friday 22:30" --zone America/New_York)"
 grep -q '"reason":"outside_windows"' <<<"$late_check" || \
   fail "a time outside the window did not report a structured reason: $late_check"
 
-close_check="$(cli schedule check "$repository_id" --at "2026-09-18 10:45" --zone America/New_York)"
+close_check="$(cli schedule check "$repository_id" --at "$friday 10:45" --zone America/New_York)"
 grep -q '"reason":"too_close"' <<<"$close_check" || \
   fail "a crowded time did not report a structured reason: $close_check"
 # The message used to end on a bare number: "this repository requires 30".
@@ -206,7 +221,7 @@ printf 'second\n' >"$workspace_path/second.txt"
 package_two="$(cli package capture "$feature_id" --revision 1 --task "$task_two" | json_field package_id)"
 unit_two="$(cli release create-unit "$feature_id" --revision 1 --task "$task_two" | json_field unit_id)"
 if crowded="$(cli schedule unit "$unit_two" --package-id "$package_two" --revision 1 \
-  --at "2026-09-18 11:00" --zone America/New_York 2>&1)"; then
+  --at "$friday 11:00" --zone America/New_York 2>&1)"; then
   fail "a release was scheduled inside this repository's minimum spacing"
 fi
 grep -qi "within" <<<"$crowded" || \
@@ -214,30 +229,30 @@ grep -qi "within" <<<"$crowded" || \
 
 # Far enough apart is accepted, so the rule is spacing rather than one-per-day.
 spaced="$(cli schedule unit "$unit_two" --package-id "$package_two" --revision 1 \
-  --at "2026-09-18 11:30" --zone America/New_York)"
-[[ "$(json_number selected_at_unix_ms <<<"$spaced")" == "1789745400000" ]] || \
+  --at "$friday 11:30" --zone America/New_York)"
+[[ "$(json_number selected_at_unix_ms <<<"$spaced")" == "$second_unix_ms" ]] || \
   fail "a correctly spaced request was not honoured exactly"
 
 # --- The human view shows a readable time and no internals. ---
 #
 # Human output renders in the machine's own zone, which is the right behaviour and makes a bare
 # "10:30" assertion a statement about the machine running the test rather than about the product.
-# CI runs in UTC and read 14:30. Pinning TZ for this one invocation keeps the assertion about the
+# CI often runs in UTC. Pinning TZ for this one invocation keeps the assertion about the
 # rendering while staying true wherever it runs.
 queue_text="$(TZ=America/New_York plain queue status)"
 grep -q "10:30" <<<"$queue_text" || \
   fail "the queue does not show the scheduled clock time: $queue_text"
-grep -q "1789741800000" <<<"$queue_text" && \
+grep -q "$first_unix_ms" <<<"$queue_text" && \
   fail "the queue printed a raw millisecond timestamp to a person"
 
 # The same instant in a different zone is the same instant, differently written. Asserting both
 # is what proves the rendering follows the reader rather than a hardcoded offset.
 utc_text="$(TZ=UTC plain queue status)"
-grep -q "14:30 UTC" <<<"$utc_text" || \
+grep -q "$first_utc_clock UTC" <<<"$utc_text" || \
   fail "the queue does not render the scheduled time in the reader's own zone: $utc_text"
 
 # --- And the machine view still carries the exact instant. ---
-grep -q '"selected_at_unix_ms":1789741800000' <<<"$(cli queue status)" || \
+grep -q "\"selected_at_unix_ms\":$first_unix_ms" <<<"$(cli queue status)" || \
   fail "the machine-readable queue lost the exact instant"
 
 # --- Scheduling without a requested time still works as it always did. ---

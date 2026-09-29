@@ -64,7 +64,7 @@ Homebrew command publicly. It contains the generated `Formula/reccursive.rb`.
    ./scripts/render-homebrew-formula.sh 0.1.0 X86_64_SHA256 AARCH64_SHA256 \
      > Formula/reccursive.rb
    brew audit --strict Formula/reccursive.rb
-   brew install --build-from-source ./Formula/reccursive.rb
+   brew install ./Formula/reccursive.rb
    ```
 
 8. On a clean macOS account, install from the release archive and from the

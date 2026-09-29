@@ -51,6 +51,39 @@ pub struct Store {
 }
 
 impl Store {
+    /// Runs a sequence of queue writes as one durable change.
+    ///
+    /// The operations used inside this closure must use savepoints for their
+    /// own local rollback, because SQLite cannot start a second transaction
+    /// while this one is open. The closure owns the store for its whole run, so
+    /// no other client can observe a partly completed sequence.
+    pub fn atomically<T, E>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T, E>,
+        storage_error: impl Fn(StoreError) -> E,
+    ) -> Result<T, E> {
+        self.connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|error| storage_error(error.into()))?;
+        match operation(self) {
+            Ok(value) => {
+                if let Err(error) = self.connection.execute_batch("COMMIT") {
+                    self.connection
+                        .execute_batch("ROLLBACK")
+                        .map_err(|rollback| storage_error(rollback.into()))?;
+                    return Err(storage_error(error.into()));
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                self.connection
+                    .execute_batch("ROLLBACK")
+                    .map_err(|rollback| storage_error(rollback.into()))?;
+                Err(error)
+            }
+        }
+    }
+
     /// Opens or creates a database and applies all committed migrations atomically.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();

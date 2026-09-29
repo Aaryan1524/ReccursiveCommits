@@ -2,7 +2,12 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -64,3 +69,4 @@ jobs:
       - run: ./tests/scenarios/phase11_security_boundaries.sh
       - run: ./tests/scenarios/phase12_requested_release_time.sh
       - run: ./tests/scenarios/phase13_checkout_scheduling.sh
+      - run: ./tests/scenarios/phase15_multi_batch_checkout.sh

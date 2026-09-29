@@ -21,7 +21,7 @@ this replaces.
 **Versioned.** Every request carries `api_version`, and the daemon refuses a
 version it does not implement rather than interpreting an unfamiliar payload. The
 CLI surfaces that as exit code 13, which an agent should treat as "upgrade", not
-"retry". The current version is 13.
+"retry". `reccursive --json doctor` reports the current API version.
 
 **Idempotent.** Any step that changes state accepts `--idempotency-key`, which
 makes a repeat of that step return the first result instead of acting again. See

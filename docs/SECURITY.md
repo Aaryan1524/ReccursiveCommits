@@ -40,10 +40,11 @@ door.
 Git credentials are **not** stored here at all. The service uses your existing
 credential helper or SSH agent, so there is nothing of yours for it to lose.
 
-Neither token crosses the local API. The GitHub token is written and read by the
-CLI directly, and `github status` reports only whether one exists. The GitHub
-adapter passes it to `curl` on standard input, never as an argument, so it does
-not appear in the process list or your shell history.
+The local API token accompanies each request over the owner-only Unix socket;
+neither token is returned in API responses. The GitHub token is written and
+read by the CLI directly, and `github status` reports only whether one exists.
+The GitHub adapter passes it to `curl` on standard input, never as an argument,
+so it does not appear in the process list or your shell history.
 
 ## What never leaves the machine
 

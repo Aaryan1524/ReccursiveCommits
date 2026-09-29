@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# The workflow only runs for a deliberately created version tag. It refuses to
+# release unsigned artifacts: configure the documented Apple signing and
+# notarization secrets before making the first tag.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Package ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: darwin-x86_64
+            runner: macos-15-intel
+          - name: darwin-aarch64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Verify the release revision
+        run: |
+          version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          test -n "$version"
+          test "$GITHUB_REF_NAME" = "v$version"
+          test "$(uname -m)" = "${{ matrix.name == 'darwin-x86_64' && 'x86_64' || 'arm64' }}"
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-targets --locked
+          cargo build --workspace --release --locked
+      - name: Require signing configuration
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          test -n "$CERTIFICATE"
+          test -n "$CERTIFICATE_PASSWORD"
+          test -n "$SIGNING_IDENTITY"
+          test -n "$KEY_ID"
+          test -n "$ISSUER_ID"
+          test -n "$PRIVATE_KEY"
+      - name: Sign the executables
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          keychain="$RUNNER_TEMP/reccursive-signing.keychain-db"
+          certificate="$RUNNER_TEMP/certificate.p12"
+          printf '%s' "$CERTIFICATE" | base64 -D > "$certificate"
+          security create-keychain -p "$GITHUB_RUN_ID" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$GITHUB_RUN_ID" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$GITHUB_RUN_ID" "$keychain"
+          security list-keychain -d user -s "$keychain"
+          codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" target/release/reccursive
+          codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" target/release/reccursive-daemon
+          codesign --verify --deep --strict --verbose=2 target/release/reccursive target/release/reccursive-daemon
+      - name: Create and notarize archive
+        env:
+          KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="reccursive-${version}-${{ matrix.name }}.zip"
+          stage="$RUNNER_TEMP/reccursive-${version}-${{ matrix.name }}"
+          mkdir -p "$stage"
+          cp target/release/reccursive target/release/reccursive-daemon LICENSE "$stage/"
+          ditto -c -k "$stage" "$archive"
+          unzip -Z -1 "$archive" | grep -Fx 'reccursive'
+          unzip -Z -1 "$archive" | grep -Fx 'reccursive-daemon'
+          key="$RUNNER_TEMP/AuthKey_${KEY_ID}.p8"
+          printf '%s' "$PRIVATE_KEY" > "$key"
+          chmod 600 "$key"
+          xcrun notarytool submit "$archive" --key "$key" --key-id "$KEY_ID" --issuer "$ISSUER_ID" --wait
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: reccursive-*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create checksums and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd artifacts
+          sha256sum reccursive-*.zip > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" reccursive-*.zip SHA256SUMS \
+            --title "ReccursiveCommits ${GITHUB_REF_NAME#v}" --generate-notes

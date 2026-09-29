@@ -3556,68 +3556,21 @@ fn change_repository_policy(
 /// being offered as ready, while the unit itself still shows in the queue. The work is neither
 /// schedulable nor visibly gone. A trial lost a change exactly that way.
 ///
-/// So a unit this call creates is discarded if the release time cannot be selected. A unit that
-/// already existed is left alone — grouping is idempotent, and an earlier unit is not this call's
-/// to throw away.
+/// The group and slot are committed in one database transaction. An earlier unit is left alone —
+/// grouping is idempotent, and an earlier unit is not this call's to throw away.
 fn schedule_captured_work(
     request: reccursive_protocol::ScheduleCapturedWorkRequest,
     store: &Mutex<Store>,
 ) -> Result<ResponseData, ApiError> {
     let now = current_unix_ms()?;
     let mut store = lock_store(store)?;
-
-    let task_ids: BTreeSet<_> = store
-        .package_task_ids(request.package_id, request.package_revision)
-        .map_err(store_api_error)?
-        .into_iter()
-        .collect();
-    if task_ids.is_empty() {
-        return Err(ApiError::new(
-            ApiErrorCode::NotFound,
-            format!("package {} carries no work", request.package_id),
-            false,
-        ));
-    }
-
-    let existing = store
-        .release_unit_for_task(
-            request.feature_id,
-            request.plan_revision,
-            *task_ids.iter().next().expect("checked above"),
-        )
-        .map_err(store_api_error)?;
-    let unit = store
-        .create_release_unit(
-            reccursive_protocol::ReleaseUnitId::new(),
-            request.feature_id,
-            request.plan_revision,
-            task_ids,
-            now,
-        )
-        .map_err(store_api_error)?;
-    let created_here = existing.is_none();
-
-    match Scheduler::schedule_at(
-        &mut store,
-        unit.unit_id,
-        request.package_id,
-        request.package_revision,
-        request.seed,
-        request.requested_at_unix_ms,
-        now,
-    ) {
-        Ok(slot) => Ok(ResponseData::ScheduleSlot {
-            slot: schedule_slot_view(slot),
-        }),
-        Err(error) => {
-            if created_here {
-                // Best effort: the scheduling failure is what the caller needs to hear, and a
-                // discard that itself fails must not replace it with a less useful message.
-                let _ = store.discard_unscheduled_release_unit(unit.unit_id);
-            }
-            Err(scheduler_api_error(error))
-        }
-    }
+    store.atomically(
+        |store| {
+            schedule_one_captured_work(&request, now, store)
+                .map(|slot| ResponseData::ScheduleSlot { slot })
+        },
+        store_api_error,
+    )
 }
 
 /// Groups and schedules several already-captured packages as one all-or-nothing plan.
@@ -3627,66 +3580,49 @@ fn schedule_captured_work(
 /// undone on failure, matching the single-batch wizard, where declining the final confirmation
 /// already leaves a captured-but-unscheduled package as retryable ready work. What this call
 /// makes atomic is the part that actually commits a release: grouping a package into a release
-/// unit and giving it a durable time. Batches are scheduled one at a time, in the given order —
-/// each becomes a real persisted slot before the next is attempted, so the ordinary spacing and
-/// daily-maximum checks inside `Scheduler::schedule_at` see every earlier batch in this call as
-/// a genuine sibling, with no separate "pending" plumbing needed here. If any batch is refused,
-/// every batch this call already scheduled is withdrawn and discarded, in reverse order, before
-/// the error is returned.
+/// unit and giving it a durable time. Batches are scheduled in order inside one database
+/// transaction. Each slot is visible to the next batch's spacing and daily-limit checks, while
+/// no other client can observe it until the entire plan commits. Any refusal rolls back every
+/// unit and slot made by this call, including after an unexpected process exit.
 fn schedule_checkout_batches(
     request: reccursive_protocol::ScheduleCheckoutBatchesRequest,
     store: &Mutex<Store>,
 ) -> Result<ResponseData, ApiError> {
     let now = current_unix_ms()?;
-    let mut scheduled: Vec<(reccursive_protocol::ReleaseUnitId, bool, ScheduleSlotView)> =
-        Vec::with_capacity(request.batches.len());
-
-    for (index, batch) in request.batches.iter().enumerate() {
-        match schedule_one_checkout_batch(batch, now, store) {
-            Ok((unit_id, created_here, slot)) => {
-                scheduled.push((unit_id, created_here, slot));
-            }
-            Err(error) => {
-                let mut store = lock_store(store)?;
-                for (unit_id, created_here, _) in scheduled.into_iter().rev() {
-                    if created_here {
-                        let _ = store.invalidate_schedule_slot(
-                            unit_id,
-                            "an earlier batch in the same scheduling session failed",
-                            now,
-                        );
-                        let _ = store.discard_unscheduled_release_unit(unit_id);
+    let mut store = lock_store(store)?;
+    store.atomically(
+        |store| {
+            let mut slots = Vec::with_capacity(request.batches.len());
+            for (index, batch) in request.batches.iter().enumerate() {
+                match schedule_one_captured_work(batch, now, store) {
+                    Ok(slot) => slots.push(slot),
+                    Err(error) => {
+                        return Err(ApiError::new(
+                            error.code,
+                            format!(
+                                "batch {} of {}: {}",
+                                index + 1,
+                                request.batches.len(),
+                                error.message
+                            ),
+                            error.retryable,
+                        ));
                     }
                 }
-                return Err(ApiError::new(
-                    error.code,
-                    format!(
-                        "batch {} of {}: {}",
-                        index + 1,
-                        request.batches.len(),
-                        error.message
-                    ),
-                    error.retryable,
-                ));
             }
-        }
-    }
-
-    Ok(ResponseData::CheckoutBatchesScheduled {
-        slots: scheduled.into_iter().map(|(_, _, slot)| slot).collect(),
-    })
+            Ok(ResponseData::CheckoutBatchesScheduled { slots })
+        },
+        store_api_error,
+    )
 }
 
-/// The single-batch half of [`schedule_checkout_batches`], sharing its release-unit and
-/// scheduling logic with [`schedule_captured_work`] exactly, so the two commands can never drift
-/// apart on what "grouped and scheduled" means.
-fn schedule_one_checkout_batch(
+/// Groups one package and selects its slot. Both the single-batch and multi-batch commands run
+/// this inside a store transaction, so the two paths share the same durable behavior.
+fn schedule_one_captured_work(
     request: &reccursive_protocol::ScheduleCapturedWorkRequest,
     now: i64,
-    store: &Mutex<Store>,
-) -> Result<(reccursive_protocol::ReleaseUnitId, bool, ScheduleSlotView), ApiError> {
-    let mut store = lock_store(store)?;
-
+    store: &mut Store,
+) -> Result<ScheduleSlotView, ApiError> {
     let task_ids: BTreeSet<_> = store
         .package_task_ids(request.package_id, request.package_revision)
         .map_err(store_api_error)?
@@ -3700,13 +3636,6 @@ fn schedule_one_checkout_batch(
         ));
     }
 
-    let existing = store
-        .release_unit_for_task(
-            request.feature_id,
-            request.plan_revision,
-            *task_ids.iter().next().expect("checked above"),
-        )
-        .map_err(store_api_error)?;
     let unit = store
         .create_release_unit(
             reccursive_protocol::ReleaseUnitId::new(),
@@ -3716,25 +3645,17 @@ fn schedule_one_checkout_batch(
             now,
         )
         .map_err(store_api_error)?;
-    let created_here = existing.is_none();
-
-    match Scheduler::schedule_at(
-        &mut store,
+    Scheduler::schedule_at(
+        store,
         unit.unit_id,
         request.package_id,
         request.package_revision,
         request.seed,
         request.requested_at_unix_ms,
         now,
-    ) {
-        Ok(slot) => Ok((unit.unit_id, created_here, schedule_slot_view(slot))),
-        Err(error) => {
-            if created_here {
-                let _ = store.discard_unscheduled_release_unit(unit.unit_id);
-            }
-            Err(scheduler_api_error(error))
-        }
-    }
+    )
+    .map(schedule_slot_view)
+    .map_err(scheduler_api_error)
 }
 
 /// Answers whether an instant is a release time this repository may currently publish at.
@@ -4673,7 +4594,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_batch_withdraws_and_discards_every_batch_this_call_already_scheduled() {
+    fn a_refused_batch_rolls_back_every_batch_this_call_already_scheduled() {
         let (_directory, paths, worker, client, repository_id) = checkout_batches_fixture(12);
         let call = |command: Command| {
             client
@@ -4693,7 +4614,8 @@ mod tests {
         };
         assert_eq!(groups.len(), 2, "both captured batches should be ready");
 
-        let far_future = current_unix_ms().unwrap() + 3 * 24 * 60 * 60 * 1000;
+        let far_future =
+            (current_unix_ms().unwrap() + 3 * 24 * 60 * 60 * 1000) / 60_000 * 60_000 + 60_000;
         let request = reccursive_protocol::ScheduleCheckoutBatchesRequest {
             batches: vec![
                 reccursive_protocol::ScheduleCapturedWorkRequest {
@@ -4717,10 +4639,14 @@ mod tests {
             ],
         };
         let outcome = call(Command::ScheduleCheckoutBatches(request));
-        assert!(outcome.is_err(), "the whole plan must be refused");
+        let error = outcome.expect_err("the whole plan must be refused");
+        assert!(
+            error.message.contains("batch 2 of 2"),
+            "the first batch must schedule before the second is refused: {error:?}"
+        );
 
-        // Nothing was scheduled: the first batch's unit was withdrawn and discarded along with
-        // the second batch's failure, so ready work is exactly what it was before the call.
+        // Nothing was scheduled: the first batch's unit and slot rolled back with the second
+        // batch's failure, so ready work is exactly what it was before the call.
         let ready_after = call(Command::ListReadyWork).expect("ready work is listed");
         assert_eq!(
             ready_after, ready_before,

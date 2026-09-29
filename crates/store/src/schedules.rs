@@ -185,7 +185,7 @@ impl Store {
             .ok_or_else(|| StoreError::InvalidData("release unit plan is not stored".into()))?;
         self.ensure_unit_is_eligible(&unit, &plan.plan.repository_id)?;
 
-        let transaction = self.connection.transaction()?;
+        let transaction = self.connection.savepoint()?;
         transaction
             .execute(
                 "INSERT INTO schedule_slots (

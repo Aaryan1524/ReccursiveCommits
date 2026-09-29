@@ -84,7 +84,7 @@ impl Store {
             return Ok(existing);
         }
 
-        let transaction = self.connection.transaction()?;
+        let transaction = self.connection.savepoint()?;
         transaction
             .execute(
                 "INSERT INTO release_units (

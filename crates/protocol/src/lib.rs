@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub use transport::{LocalClient, TransportError};
 
-/// Local API protocol version. Version 16 adds package change inspection and check results.
+/// Local API protocol version. Version 24 adds multi-batch checkout scheduling.
 pub const API_VERSION: u16 = 24;
 
 /// Stable service identifier shared by the daemon and by service installation.
@@ -246,10 +246,9 @@ pub enum Command {
     /// Exists for a multi-batch checkout session: several packages are captured individually
     /// while the person is still choosing what goes where, but none of them may become a real
     /// release until every batch in the plan has a release time the repository accepts. Batches
-    /// are scheduled in the given order, each becoming its own release unit and slot; if any
-    /// batch is refused, every batch already scheduled by this call is withdrawn and discarded
-    /// before the error is returned, so a failure here leaves none of them scheduled rather than
-    /// a prefix of them.
+    /// are scheduled in the given order, each becoming its own release unit and slot inside one
+    /// database transaction. A refusal rolls back every unit and slot made by this call, so a
+    /// failure leaves none of them scheduled rather than a prefix of them.
     ScheduleCheckoutBatches(ScheduleCheckoutBatchesRequest),
     /// Ask whether an instant is a release time a repository is currently allowed to publish at.
     ///

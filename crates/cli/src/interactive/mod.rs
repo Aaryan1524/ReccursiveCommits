@@ -76,8 +76,8 @@ pub fn schedule(session: &Session, stdout: &mut impl Write) -> Result<(), CliFai
     };
 
     if use_checkout {
-        let (repository, root) = here.expect("checkout changes require an enrolled repository");
-        return schedule_checkout(session, stdout, &repository, &root, checkout_changes);
+        let (repository, _) = here.expect("checkout changes require an enrolled repository");
+        return schedule_checkout(session, stdout, &repository, checkout_changes);
     }
 
     let group = pick::group(&prepared)?;
@@ -134,10 +134,8 @@ fn schedule_checkout(
     session: &Session,
     stdout: &mut impl Write,
     repository: &reccursive_protocol::RepositoryView,
-    root: &std::path::Path,
     changes: Vec<checkout::Change>,
 ) -> Result<(), CliFailure> {
-    let _ = root;
     writeln!(stdout, "\n{}\n", checkout::summary_line(&changes)).map_err(crate::output_error)?;
 
     let delivery = delivery_for(repository);
@@ -158,22 +156,23 @@ fn schedule_checkout(
             .map_err(crate::output_error)?;
             break;
         }
-        let (chosen, rest) = checkout::partition(remaining, &selected);
-        let title = checkout::ask_name()?;
+        let title = match checkout::ask_name() {
+            Ok(title) => title,
+            Err(failure) if failure.code == "cancelled" => break,
+            Err(failure) => return Err(failure),
+        };
 
         let pending_instants: Vec<i64> =
             batches.iter().map(|batch| batch.instant_unix_ms).collect();
         let when = match when::choose_for(session, repository.id, &timezone, &pending_instants) {
             Ok(when) => when,
-            Err(failure) if failure.code == "cancelled" => {
-                // A person can back out of naming a time without losing the batches they already
-                // built; only the file selection they were mid-way through is abandoned.
-                remaining = rest;
-                break;
-            }
+            Err(failure) if failure.code == "cancelled" => break,
             Err(failure) => return Err(failure),
         };
 
+        // Delay partitioning until both prompts have succeeded. Cancelling either prompt leaves
+        // every uncaptured file in `remaining`, including those selected for the abandoned batch.
+        let (chosen, rest) = checkout::partition(remaining, &selected);
         let (feature_id, plan_revision, package_id) =
             checkout::capture(session, repository, &title, &chosen)?;
         batches.push(checkout::Batch {

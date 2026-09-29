@@ -67,6 +67,13 @@ fi
 
 # ---- Setup ----
 command -v git >/dev/null || fail "git is not installed"
+service_label="com.reccursive.reccursive-daemon"
+service_plist="$HOME/Library/LaunchAgents/$service_label.plist"
+if [[ -e "$service_plist" ]] ||
+   launchctl print "gui/$(id -u)/$service_label" >/dev/null 2>&1; then
+  fail "an existing Reccursive service definition or running agent was found; run this test from a clean macOS account so it cannot replace your service"
+fi
+
 [[ -x "$binary_dir/reccursive" && -x "$binary_dir/reccursive-daemon" ]] || {
   printf 'Building...\n'
   (cd "$project_root" && cargo build --workspace --locked)
@@ -76,6 +83,16 @@ if [[ -e "$root" ]]; then
   fail "$root already exists; remove it first or set RECCURSIVE_SLEEP_TEST_DIR"
 fi
 mkdir -p "$root"
+
+# A failed setup must not leave a launch agent publishing in the background.
+service_install_attempted=false
+setup_complete=false
+cleanup_on_exit() {
+  if [[ "$service_install_attempted" == true && "$setup_complete" == false ]]; then
+    cli service uninstall >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_on_exit EXIT
 
 printf 'Creating a throwaway repository and remote in %s\n' "$root"
 git init --quiet --bare --initial-branch=main "$root/remote.git"
@@ -90,6 +107,7 @@ git -C "$root/repository" push --quiet -u origin main
 git -C "$root/remote.git" rev-parse refs/heads/main >"$root/head-before.txt"
 
 printf 'Installing the service...\n'
+service_install_attempted=true
 cli service install >/dev/null
 for _ in {1..100}; do
   cli_json status >/dev/null 2>&1 && break
@@ -169,6 +187,8 @@ if [[ -n "$selected_ms" ]]; then
 fi
 printf '\nCredentials and signing right now:\n'
 cli diagnose "$repository_id"
+
+setup_complete=true
 
 cat <<INSTRUCTIONS
 

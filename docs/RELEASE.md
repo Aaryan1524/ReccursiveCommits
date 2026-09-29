@@ -15,12 +15,14 @@ repository secrets before the first release:
 | `APPLE_SIGNING_CERTIFICATE_P12_BASE64` | Base64-encoded Developer ID Application `.p12` certificate. |
 | `APPLE_SIGNING_CERTIFICATE_PASSWORD` | Password protecting that `.p12`. |
 | `APPLE_SIGNING_IDENTITY` | The full Developer ID Application signing identity. |
-| `APPLE_API_KEY_ID` | App Store Connect API-key identifier for notarization. |
-| `APPLE_API_ISSUER_ID` | App Store Connect API-key issuer identifier. |
-| `APPLE_API_PRIVATE_KEY` | Contents of the matching `.p8` API-key file. |
+| `APPLE_API_KEY_ID` | App Store Connect **team** API-key identifier for notarization. |
+| `APPLE_API_ISSUER_ID` | Issuer identifier for that team key. |
+| `APPLE_API_PRIVATE_KEY` | Contents of the matching `.p8` team-key file. |
 
-The certificate must be valid for Developer ID signing and the API key must be
-authorized for notarization. Keep all six values in GitHub Actions secrets;
+The certificate must be valid for Developer ID signing. Use an App Store Connect
+**team** API key for notarization: [Apple says individual API keys cannot use
+`notarytool`](https://developer.apple.com/documentation/appstoreconnectapi/creating-api-keys-for-app-store-connect-api).
+Keep all six values in GitHub Actions secrets;
 never put them in this repository or pass them on a command line.
 
 Create a separate `Aaryan1524/homebrew-tap` repository before promising the

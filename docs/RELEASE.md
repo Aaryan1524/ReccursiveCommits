@@ -40,8 +40,9 @@ Homebrew command publicly. It contains the generated `Formula/reccursive.rb`.
    ```
 
 3. On a real Mac, run the manual launchd/sleep acceptance test described in
-   the README. Confirm `service install`, reboot/login persistence, and
-   `service uninstall` on a non-development state directory.
+   the README from a clean macOS account. The script refuses to replace an
+   existing Reccursive launch agent. Confirm `service install`, reboot/login
+   persistence, and `service uninstall` on a non-development state directory.
 4. Run a live GitHub pull-request scheduling test against a disposable
    repository, inspect the resulting pull request, and merge it manually. Use
    a revocable least-privilege token.

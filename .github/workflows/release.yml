@@ -92,7 +92,14 @@ jobs:
           key="$RUNNER_TEMP/AuthKey_${KEY_ID}.p8"
           printf '%s' "$PRIVATE_KEY" > "$key"
           chmod 600 "$key"
-          xcrun notarytool submit "$archive" --key "$key" --key-id "$KEY_ID" --issuer "$ISSUER_ID" --wait
+          notarization="$(xcrun notarytool submit "$archive" --key "$key" --key-id "$KEY_ID" --issuer "$ISSUER_ID" --wait --output-format json)"
+          printf '%s\n' "$notarization" | python3 -c '
+          import json, sys
+          result = json.load(sys.stdin)
+          status = result.get("status")
+          print("Notarization:", status, result.get("id"))
+          sys.exit(status != "Accepted")
+          '
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}

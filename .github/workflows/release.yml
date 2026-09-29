@@ -36,6 +36,8 @@ jobs:
           version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
           test -n "$version"
           test "$GITHUB_REF_NAME" = "v$version"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD FETCH_HEAD
           test "$(uname -m)" = "${{ matrix.name == 'darwin-x86_64' && 'x86_64' || 'arm64' }}"
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features -- -D warnings

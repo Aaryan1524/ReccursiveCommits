@@ -86,6 +86,8 @@ capture        →  queue         →  schedule      →  publish
 - **[docs/AGENT_HANDOFF.md](docs/AGENT_HANDOFF.md)** — the six-step protocol an
   AI agent follows to hand finished work to the queue idempotently.
 - **[docs/CODEX.md](docs/CODEX.md)** — using it from Codex.
+- **[docs/RELEASE.md](docs/RELEASE.md)** — how a signed public macOS release is
+  built, verified, and published.
 
 ## Layout
 
@@ -101,7 +103,7 @@ ReccursiveCommits/
 │   ├── daemon/        queue owner, scheduler, release worker, local service
 │   └── cli/           the `reccursive` command
 ├── tests/
-│   ├── scenarios/     22 end-to-end scripts, run in CI on macOS and Linux
+│   ├── scenarios/     23 end-to-end scripts, run in CI on macOS and Linux
 │   └── manual/        the sleep test, which needs a real sleeping machine
 └── integrations/
     └── codex/         agent skill definition
@@ -259,9 +261,10 @@ guidance does not compile.
   supported yet and the CLI is not tested on them; the scenario suite runs on
   Linux in CI, but service installation does not.
 
-- **No signed binaries yet.** You build from source. There is no Homebrew
-  formula and no notarized archive, so there is nothing to install on a machine
-  without a Rust toolchain.
+- **No public binary release has been published yet.** Tags are built as signed,
+  notarized Intel and Apple-silicon archives with checksums by the release
+  workflow. Until the first tag and Homebrew tap are published, build from
+  source as above. See [docs/RELEASE.md](docs/RELEASE.md).
 
 - **The launchd install path is not covered by CI.** Scenarios run against
   fixture state directories and deliberately never touch

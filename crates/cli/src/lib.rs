@@ -1098,6 +1098,7 @@ fn execute(cli: Cli, stdout: &mut impl Write) -> Result<(), CliFailure> {
                     Command::ValidateReleaseTime {
                         repository_id,
                         requested_at_unix_ms,
+                        pending_at_unix_ms: Vec::new(),
                     },
                 )?;
                 output_data(data, cli.json, stdout)
@@ -2642,6 +2643,20 @@ fn human_time(unix_ms: i64) -> String {
         .unwrap_or_else(|_| unix_ms.to_string())
 }
 
+/// The same rendering as [`human_time`], but in a named zone rather than this machine's own.
+///
+/// For a moment a person just chose or is about to confirm — a release time entered in a
+/// repository's schedule-policy zone, or already persisted with one — that zone is the one the
+/// review has to render in. Rendering it in whatever zone the CLI happens to be running from
+/// would show a different clock time than the one the person typed, which is the discrepancy this
+/// function exists to rule out.
+fn human_time_in(unix_ms: i64, zone: &str) -> String {
+    jiff::Timestamp::from_millisecond(unix_ms)
+        .and_then(|timestamp| timestamp.in_tz(zone))
+        .map(|zoned| zoned.strftime("%a %-d %b %Y, %H:%M %Z").to_string())
+        .unwrap_or_else(|_| human_time(unix_ms))
+}
+
 fn output_task_progress(out: &mut impl Write, task: &TaskProgressView) -> Result<(), CliFailure> {
     // The status is printed verbatim rather than collapsed into ready/not-ready, because
     // "blocked" and "cancelled" are answers a caller has to act on differently from "not yet".
@@ -2862,6 +2877,9 @@ fn output_data(
         ),
         ResponseData::SchedulePolicy { policy } => output_schedule_policy(out, &policy),
         ResponseData::ScheduleSlot { slot } => output_schedule_slot(out, &slot),
+        ResponseData::CheckoutBatchesScheduled { slots } => {
+            output_schedule_preview(out, &slots, None)
+        }
         ResponseData::ScheduleOverrideActivated {
             repository_id,
             revision,
@@ -3856,6 +3874,27 @@ fn output_error(error: io::Error) -> CliFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn human_time_in_renders_in_the_named_zone_not_this_machines_own() {
+        // 2026-09-17 04:29 UTC. Read in America/New_York (EDT, UTC-4) that is 00:29; read in
+        // Asia/Kolkata (UTC+5:30, no daylight saving) it is 09:59 the same day.
+        let instant = jiff::civil::date(2026, 9, 17)
+            .at(4, 29, 0, 0)
+            .in_tz("UTC")
+            .unwrap()
+            .timestamp()
+            .as_millisecond();
+        assert_eq!(human_time_in(instant, "UTC"), "Thu 17 Sep 2026, 04:29 UTC");
+        assert_eq!(
+            human_time_in(instant, "America/New_York"),
+            "Thu 17 Sep 2026, 00:29 EDT"
+        );
+        assert_eq!(
+            human_time_in(instant, "Asia/Kolkata"),
+            "Thu 17 Sep 2026, 09:59 IST"
+        );
+    }
 
     #[test]
     fn branch_names_are_normalized_to_full_refs() {

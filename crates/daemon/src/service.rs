@@ -591,10 +591,17 @@ fn dispatch(
         Command::ChangeRepositoryPolicy(request) => change_repository_policy(request, store),
         Command::ListReadyWork => list_ready_work(store),
         Command::ScheduleCapturedWork(request) => schedule_captured_work(request, store),
+        Command::ScheduleCheckoutBatches(request) => schedule_checkout_batches(request, store),
         Command::ValidateReleaseTime {
             repository_id,
             requested_at_unix_ms,
-        } => validate_release_time(repository_id, requested_at_unix_ms, store),
+            pending_at_unix_ms,
+        } => validate_release_time(
+            repository_id,
+            requested_at_unix_ms,
+            &pending_at_unix_ms,
+            store,
+        ),
         Command::ListRepositories => {
             let store = lock_store(store)?;
             let repositories = store
@@ -729,6 +736,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::ChangeRepositoryPolicy(..) => "repository.policy",
         Command::ListReadyWork => "work.ready",
         Command::ScheduleCapturedWork(_) => "schedule.captured",
+        Command::ScheduleCheckoutBatches(_) => "schedule.checkout_batches",
         Command::ValidateReleaseTime { .. } => "schedule.validate",
         Command::ListRepositories => "repository.list",
         Command::ListEvents { .. } => "logs",
@@ -3612,6 +3620,123 @@ fn schedule_captured_work(
     }
 }
 
+/// Groups and schedules several already-captured packages as one all-or-nothing plan.
+///
+/// Each batch's package was captured beforehand by the ordinary `ImportPlan` /
+/// `CreateWorkspace` / `CapturePackage` sequence — that part is not composed here and is not
+/// undone on failure, matching the single-batch wizard, where declining the final confirmation
+/// already leaves a captured-but-unscheduled package as retryable ready work. What this call
+/// makes atomic is the part that actually commits a release: grouping a package into a release
+/// unit and giving it a durable time. Batches are scheduled one at a time, in the given order —
+/// each becomes a real persisted slot before the next is attempted, so the ordinary spacing and
+/// daily-maximum checks inside `Scheduler::schedule_at` see every earlier batch in this call as
+/// a genuine sibling, with no separate "pending" plumbing needed here. If any batch is refused,
+/// every batch this call already scheduled is withdrawn and discarded, in reverse order, before
+/// the error is returned.
+fn schedule_checkout_batches(
+    request: reccursive_protocol::ScheduleCheckoutBatchesRequest,
+    store: &Mutex<Store>,
+) -> Result<ResponseData, ApiError> {
+    let now = current_unix_ms()?;
+    let mut scheduled: Vec<(reccursive_protocol::ReleaseUnitId, bool, ScheduleSlotView)> =
+        Vec::with_capacity(request.batches.len());
+
+    for (index, batch) in request.batches.iter().enumerate() {
+        match schedule_one_checkout_batch(batch, now, store) {
+            Ok((unit_id, created_here, slot)) => {
+                scheduled.push((unit_id, created_here, slot));
+            }
+            Err(error) => {
+                let mut store = lock_store(store)?;
+                for (unit_id, created_here, _) in scheduled.into_iter().rev() {
+                    if created_here {
+                        let _ = store.invalidate_schedule_slot(
+                            unit_id,
+                            "an earlier batch in the same scheduling session failed",
+                            now,
+                        );
+                        let _ = store.discard_unscheduled_release_unit(unit_id);
+                    }
+                }
+                return Err(ApiError::new(
+                    error.code,
+                    format!(
+                        "batch {} of {}: {}",
+                        index + 1,
+                        request.batches.len(),
+                        error.message
+                    ),
+                    error.retryable,
+                ));
+            }
+        }
+    }
+
+    Ok(ResponseData::CheckoutBatchesScheduled {
+        slots: scheduled.into_iter().map(|(_, _, slot)| slot).collect(),
+    })
+}
+
+/// The single-batch half of [`schedule_checkout_batches`], sharing its release-unit and
+/// scheduling logic with [`schedule_captured_work`] exactly, so the two commands can never drift
+/// apart on what "grouped and scheduled" means.
+fn schedule_one_checkout_batch(
+    request: &reccursive_protocol::ScheduleCapturedWorkRequest,
+    now: i64,
+    store: &Mutex<Store>,
+) -> Result<(reccursive_protocol::ReleaseUnitId, bool, ScheduleSlotView), ApiError> {
+    let mut store = lock_store(store)?;
+
+    let task_ids: BTreeSet<_> = store
+        .package_task_ids(request.package_id, request.package_revision)
+        .map_err(store_api_error)?
+        .into_iter()
+        .collect();
+    if task_ids.is_empty() {
+        return Err(ApiError::new(
+            ApiErrorCode::NotFound,
+            format!("package {} carries no work", request.package_id),
+            false,
+        ));
+    }
+
+    let existing = store
+        .release_unit_for_task(
+            request.feature_id,
+            request.plan_revision,
+            *task_ids.iter().next().expect("checked above"),
+        )
+        .map_err(store_api_error)?;
+    let unit = store
+        .create_release_unit(
+            reccursive_protocol::ReleaseUnitId::new(),
+            request.feature_id,
+            request.plan_revision,
+            task_ids,
+            now,
+        )
+        .map_err(store_api_error)?;
+    let created_here = existing.is_none();
+
+    match Scheduler::schedule_at(
+        &mut store,
+        unit.unit_id,
+        request.package_id,
+        request.package_revision,
+        request.seed,
+        request.requested_at_unix_ms,
+        now,
+    ) {
+        Ok(slot) => Ok((unit.unit_id, created_here, schedule_slot_view(slot))),
+        Err(error) => {
+            if created_here {
+                let _ = store.discard_unscheduled_release_unit(unit.unit_id);
+            }
+            Err(scheduler_api_error(error))
+        }
+    }
+}
+
 /// Answers whether an instant is a release time this repository may currently publish at.
 ///
 /// Advisory, and deliberately so. It reserves nothing and holds no lock, so the answer can stop
@@ -3624,6 +3749,7 @@ fn schedule_captured_work(
 fn validate_release_time(
     repository_id: RepositoryId,
     requested_at_unix_ms: i64,
+    pending_at_unix_ms: &[i64],
     store: &Mutex<Store>,
 ) -> Result<ResponseData, ApiError> {
     use reccursive_core::SchedulePolicyError as PolicyError;
@@ -3657,12 +3783,15 @@ fn validate_release_time(
         },
         None => policy.policy.clone(),
     };
-    let existing: Vec<i64> = store
+    let mut existing: Vec<i64> = store
         .schedule_slots(repository_id)
         .map_err(store_api_error)?
         .into_iter()
         .map(|slot| slot.selected_at_unix_ms)
         .collect();
+    // Not-yet-persisted sibling batches count exactly like real slots: a spacing or daily-maximum
+    // rule that only saw durable slots would let a second in-session batch collide with the first.
+    existing.extend_from_slice(pending_at_unix_ms);
 
     let verdict = match effective.validate_requested_slot(requested_at_unix_ms, now, &existing) {
         Ok(_) => ReleaseTimeVerdict::Allowed,
@@ -4330,6 +4459,421 @@ mod tests {
             ))
             .is_ok(),
             "the work could not be scheduled after two failed attempts"
+        );
+
+        worker.join().unwrap().unwrap();
+    }
+
+    /// Enrolls a fixture repository with a permissive policy, then captures one single-task
+    /// package from its own workspace with the given file written into it. Returns the feature,
+    /// task and package identity `ScheduleCheckoutBatches` needs, so each batch in a multi-batch
+    /// test is a real, independently captured package rather than a shortcut.
+    fn capture_batch_fixture(
+        call: &impl Fn(Command) -> Result<ResponseData, ApiError>,
+        repository_id: RepositoryId,
+        goal: &str,
+        file_name: &str,
+    ) -> (
+        reccursive_protocol::FeatureId,
+        reccursive_protocol::TaskId,
+        reccursive_protocol::PackageId,
+        Revision,
+    ) {
+        let feature_id = reccursive_protocol::FeatureId::new();
+        let task_id = reccursive_protocol::TaskId::new();
+        call(Command::ImportPlan {
+            plan: FeaturePlan {
+                schema_version: PLAN_SCHEMA_VERSION,
+                feature_id,
+                revision: Revision::FIRST,
+                repository_id,
+                goal: goal.to_owned(),
+                target: TargetRef::new("refs/heads/main").unwrap(),
+                sealed: true,
+                phases: vec![PlanPhase {
+                    id: "delivery".into(),
+                    name: "Delivery".into(),
+                    tasks: vec![PlanTask {
+                        id: task_id,
+                        name: goal.to_owned(),
+                        dependencies: BTreeMap::new(),
+                        acceptance_checks: vec![AcceptanceCheck {
+                            id: "captured".into(),
+                            description: "captured".into(),
+                        }],
+                    }],
+                }],
+            },
+        })
+        .expect("the plan imports");
+
+        let ResponseData::WorkspaceCreated { workspace } =
+            call(Command::CreateWorkspace(CreateWorkspaceRequest {
+                feature_id,
+                revision: Some(Revision::FIRST),
+                prerequisites: Vec::new(),
+            }))
+            .expect("the workspace is created")
+        else {
+            panic!("expected a workspace")
+        };
+        fs::write(Path::new(&workspace.path).join(file_name), "work\n").unwrap();
+
+        let ResponseData::PackageCaptured { package } =
+            call(Command::CapturePackage(CapturePackageRequest {
+                feature_id,
+                plan_revision: Revision::FIRST,
+                task_ids: [task_id].into_iter().collect(),
+            }))
+            .expect("the package is captured")
+        else {
+            panic!("expected a package")
+        };
+        (feature_id, task_id, package.package_id, package.revision)
+    }
+
+    /// Repeats the fixture setup common to every checkout-batches test: a repository with a
+    /// permissive schedule policy, ready to capture and schedule batches against.
+    fn checkout_batches_fixture(
+        total_connections: usize,
+    ) -> (
+        tempfile::TempDir,
+        ServicePaths,
+        thread::JoinHandle<Result<(), ServiceError>>,
+        LocalClient,
+        RepositoryId,
+    ) {
+        let directory = tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+        git(&checkout, &["config", "user.name", "Fixture"]);
+        git(
+            &checkout,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        fs::write(checkout.join("README.md"), "# Fixture\n").unwrap();
+        git(&checkout, &["add", "README.md"]);
+        git(&checkout, &["commit", "--quiet", "-m", "Initialize"]);
+
+        let paths = ServicePaths::new(directory.path().join("state"));
+        let service = LocalService::bind(paths.clone()).unwrap();
+        let worker = thread::spawn(move || service.serve_connections(total_connections));
+        let client = LocalClient::from_token_file(&paths.auth_token).unwrap();
+        let call = |command: Command| {
+            client
+                .send(&paths.socket, command)
+                .expect("the service answered")
+                .result
+        };
+
+        let ResponseData::RepositoryEnrolled { repository } =
+            call(Command::EnrollRepository(EnrollRepositoryRequest {
+                target_integration: reccursive_core::TargetIntegration::DirectPush,
+                checkout_path: checkout.to_string_lossy().into_owned(),
+                canonical_remote: "ssh://git@example.invalid/project.git".into(),
+                publication_mode: PublicationMode::ScheduledCreation,
+                target: TargetRef::new("refs/heads/main").unwrap(),
+                development_target: None,
+            }))
+            .expect("enrollment succeeds")
+        else {
+            panic!("expected enrollment")
+        };
+        let policy: reccursive_core::SchedulePolicy = serde_json::from_str(
+            r#"{"timezone":"UTC",
+                "allowed_days":["monday","tuesday","wednesday","thursday","friday","saturday","sunday"],
+                "windows":[{"start":{"hour":0,"minute":0},"end":{"hour":23,"minute":59}}],
+                "daily_releases":{"minimum":1,"maximum":20},
+                "minimum_spacing_minutes":1,
+                "missed_window_behavior":{"kind":"reschedule_forward"}}"#,
+        )
+        .unwrap();
+        call(Command::SetSchedulePolicy(
+            reccursive_protocol::SetSchedulePolicyRequest {
+                repository_id: repository.id,
+                policy,
+            },
+        ))
+        .expect("the policy is activated");
+        // Two connections spent already: enrollment and the initial policy activation. The
+        // caller's own budget must cover everything it sends after this returns.
+        (directory, paths, worker, client, repository.id)
+    }
+
+    #[test]
+    fn checkout_batches_schedule_together_as_independent_units() {
+        let (_directory, paths, worker, client, repository_id) = checkout_batches_fixture(11);
+        let call = |command: Command| {
+            client
+                .send(&paths.socket, command)
+                .expect("the service answered")
+                .result
+        };
+
+        let (feature_a, task_a, package_a, revision_a) =
+            capture_batch_fixture(&call, repository_id, "Feed ranking", "feed.rs");
+        let (feature_b, task_b, package_b, revision_b) =
+            capture_batch_fixture(&call, repository_id, "Auth cleanup", "auth.rs");
+
+        // Rounded to a clean minute, since the policy generates candidates on minute
+        // boundaries and an arbitrary millisecond offset from "now" would not land on one.
+        let far_future =
+            (current_unix_ms().unwrap() + 3 * 24 * 60 * 60 * 1000) / 60_000 * 60_000 + 60_000;
+        let request = reccursive_protocol::ScheduleCheckoutBatchesRequest {
+            batches: vec![
+                reccursive_protocol::ScheduleCapturedWorkRequest {
+                    feature_id: feature_a,
+                    plan_revision: Revision::FIRST,
+                    package_id: package_a,
+                    package_revision: revision_a,
+                    requested_at_unix_ms: Some(far_future),
+                    seed: 0,
+                },
+                reccursive_protocol::ScheduleCapturedWorkRequest {
+                    feature_id: feature_b,
+                    plan_revision: Revision::FIRST,
+                    package_id: package_b,
+                    package_revision: revision_b,
+                    requested_at_unix_ms: Some(far_future + 60_000),
+                    seed: 0,
+                },
+            ],
+        };
+        let ResponseData::CheckoutBatchesScheduled { slots } =
+            call(Command::ScheduleCheckoutBatches(request)).expect("both batches schedule")
+        else {
+            panic!("expected checkout batches scheduled")
+        };
+        assert_eq!(slots.len(), 2, "one slot per batch");
+        assert_ne!(
+            slots[0].release_unit_id, slots[1].release_unit_id,
+            "each batch must become its own release unit"
+        );
+        assert_eq!(slots[0].package_id, package_a);
+        assert_eq!(slots[1].package_id, package_b);
+
+        // Each unit carries exactly its own task, never the other batch's.
+        let ResponseData::ReleaseUnit { unit: unit_a } = call(Command::GetReleaseUnit {
+            release_unit_id: slots[0].release_unit_id,
+        })
+        .unwrap() else {
+            panic!("expected a release unit")
+        };
+        let ResponseData::ReleaseUnit { unit: unit_b } = call(Command::GetReleaseUnit {
+            release_unit_id: slots[1].release_unit_id,
+        })
+        .unwrap() else {
+            panic!("expected a release unit")
+        };
+        assert_eq!(unit_a.task_ids, [task_a].into_iter().collect());
+        assert_eq!(unit_b.task_ids, [task_b].into_iter().collect());
+
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_refused_batch_withdraws_and_discards_every_batch_this_call_already_scheduled() {
+        let (_directory, paths, worker, client, repository_id) = checkout_batches_fixture(12);
+        let call = |command: Command| {
+            client
+                .send(&paths.socket, command)
+                .expect("the service answered")
+                .result
+        };
+
+        let (feature_a, task_a, package_a, revision_a) =
+            capture_batch_fixture(&call, repository_id, "Feed ranking", "feed.rs");
+        let (feature_b, _task_b, package_b, revision_b) =
+            capture_batch_fixture(&call, repository_id, "Auth cleanup", "auth.rs");
+
+        let ready_before = call(Command::ListReadyWork).expect("ready work is listed");
+        let ResponseData::ReadyWork { groups } = &ready_before else {
+            panic!("expected ready work")
+        };
+        assert_eq!(groups.len(), 2, "both captured batches should be ready");
+
+        let far_future = current_unix_ms().unwrap() + 3 * 24 * 60 * 60 * 1000;
+        let request = reccursive_protocol::ScheduleCheckoutBatchesRequest {
+            batches: vec![
+                reccursive_protocol::ScheduleCapturedWorkRequest {
+                    feature_id: feature_a,
+                    plan_revision: Revision::FIRST,
+                    package_id: package_a,
+                    package_revision: revision_a,
+                    requested_at_unix_ms: Some(far_future),
+                    seed: 0,
+                },
+                // A past instant is a guaranteed, authoritative refusal, reached only after the
+                // first batch has already become a real persisted slot.
+                reccursive_protocol::ScheduleCapturedWorkRequest {
+                    feature_id: feature_b,
+                    plan_revision: Revision::FIRST,
+                    package_id: package_b,
+                    package_revision: revision_b,
+                    requested_at_unix_ms: Some(1_000_000_000_000),
+                    seed: 0,
+                },
+            ],
+        };
+        let outcome = call(Command::ScheduleCheckoutBatches(request));
+        assert!(outcome.is_err(), "the whole plan must be refused");
+
+        // Nothing was scheduled: the first batch's unit was withdrawn and discarded along with
+        // the second batch's failure, so ready work is exactly what it was before the call.
+        let ready_after = call(Command::ListReadyWork).expect("ready work is listed");
+        assert_eq!(
+            ready_after, ready_before,
+            "a failed multi-batch plan changed what is ready, leaving a batch neither \
+             schedulable nor visibly gone"
+        );
+
+        // The captured package for batch one is still there and still schedulable on its own —
+        // the session is retryable, not lost.
+        assert!(
+            call(Command::ScheduleCapturedWork(
+                reccursive_protocol::ScheduleCapturedWorkRequest {
+                    feature_id: feature_a,
+                    plan_revision: Revision::FIRST,
+                    package_id: package_a,
+                    package_revision: revision_a,
+                    requested_at_unix_ms: None,
+                    seed: 3,
+                },
+            ))
+            .is_ok(),
+            "batch one must still be schedulable after the session-wide rollback"
+        );
+        let _ = task_a;
+
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn pending_sibling_times_are_validated_like_real_slots() {
+        // The property a multi-batch session needs: a second batch's time is checked against the
+        // first batch's time even though the first has not been persisted yet. Without this, two
+        // batches ten minutes apart with a repository that requires thirty would both validate
+        // individually and only collide when the whole plan was finally scheduled — after the
+        // person had already reviewed and confirmed it.
+        let (_directory, paths, worker, client, repository_id) = checkout_batches_fixture(5);
+        let call = |command: Command| {
+            client
+                .send(&paths.socket, command)
+                .expect("the service answered")
+                .result
+        };
+        // Replace the permissive fixture policy with one that requires real spacing.
+        let mut spaced_policy: reccursive_core::SchedulePolicy = serde_json::from_str(
+            r#"{"timezone":"UTC",
+                "allowed_days":["monday","tuesday","wednesday","thursday","friday","saturday","sunday"],
+                "windows":[{"start":{"hour":0,"minute":0},"end":{"hour":23,"minute":59}}],
+                "daily_releases":{"minimum":1,"maximum":20},
+                "minimum_spacing_minutes":30,
+                "missed_window_behavior":{"kind":"reschedule_forward"}}"#,
+        )
+        .unwrap();
+        spaced_policy.minimum_spacing_minutes = 30;
+        call(Command::SetSchedulePolicy(
+            reccursive_protocol::SetSchedulePolicyRequest {
+                repository_id,
+                policy: spaced_policy,
+            },
+        ))
+        .expect("the tighter policy activates");
+
+        let first =
+            (current_unix_ms().unwrap() + 3 * 24 * 60 * 60 * 1000) / 60_000 * 60_000 + 60_000;
+        let too_close = first + 10 * 60_000;
+        let far_enough = first + 45 * 60_000;
+
+        let ResponseData::ReleaseTimeValidated { verdict } = call(Command::ValidateReleaseTime {
+            repository_id,
+            requested_at_unix_ms: too_close,
+            pending_at_unix_ms: vec![first],
+        })
+        .expect("validation answers") else {
+            panic!("expected a verdict")
+        };
+        assert!(
+            matches!(
+                verdict,
+                reccursive_protocol::ReleaseTimeVerdict::Refused {
+                    reason: reccursive_protocol::ReleaseTimeRefusal::TooClose,
+                    ..
+                }
+            ),
+            "a time too close to a pending sibling must be refused: {verdict:?}"
+        );
+
+        let ResponseData::ReleaseTimeValidated { verdict } = call(Command::ValidateReleaseTime {
+            repository_id,
+            requested_at_unix_ms: far_enough,
+            pending_at_unix_ms: vec![first],
+        })
+        .expect("validation answers") else {
+            panic!("expected a verdict")
+        };
+        assert_eq!(verdict, reccursive_protocol::ReleaseTimeVerdict::Allowed);
+
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn pending_sibling_spacing_is_enforced_in_a_non_utc_policy_zone() {
+        // The exact example from the multi-batch spec: batch one at 10:00 America/New_York,
+        // batch two at 10:10, with a repository that requires thirty minutes between releases.
+        // Both instants are computed the way the CLI's own `to_instant` would — a wall-clock
+        // reading resolved against the *repository's* zone — so this proves the daemon's
+        // pending-time check compares two real, zone-correct instants rather than, say, one local
+        // reading and one that was silently reinterpreted as UTC. 2027-09-20 is deliberately deep
+        // inside EDT (US daylight saving), nowhere near a transition.
+        const TEN_AM_EDT_UNIX_MS: i64 = 1_821_448_800_000; // 2027-09-20 10:00 America/New_York
+        const TEN_TEN_AM_EDT_UNIX_MS: i64 = 1_821_449_400_000; // 2027-09-20 10:10 America/New_York
+
+        let (_directory, paths, worker, client, repository_id) = checkout_batches_fixture(4);
+        let call = |command: Command| {
+            client
+                .send(&paths.socket, command)
+                .expect("the service answered")
+                .result
+        };
+        let mut spaced_policy: reccursive_core::SchedulePolicy = serde_json::from_str(
+            r#"{"timezone":"America/New_York",
+                "allowed_days":["monday","tuesday","wednesday","thursday","friday","saturday","sunday"],
+                "windows":[{"start":{"hour":0,"minute":0},"end":{"hour":23,"minute":59}}],
+                "daily_releases":{"minimum":1,"maximum":20},
+                "minimum_spacing_minutes":30,
+                "missed_window_behavior":{"kind":"reschedule_forward"}}"#,
+        )
+        .unwrap();
+        spaced_policy.minimum_spacing_minutes = 30;
+        call(Command::SetSchedulePolicy(
+            reccursive_protocol::SetSchedulePolicyRequest {
+                repository_id,
+                policy: spaced_policy,
+            },
+        ))
+        .expect("the America/New_York policy activates");
+
+        let ResponseData::ReleaseTimeValidated { verdict } = call(Command::ValidateReleaseTime {
+            repository_id,
+            requested_at_unix_ms: TEN_TEN_AM_EDT_UNIX_MS,
+            pending_at_unix_ms: vec![TEN_AM_EDT_UNIX_MS],
+        })
+        .expect("validation answers") else {
+            panic!("expected a verdict")
+        };
+        assert!(
+            matches!(
+                verdict,
+                reccursive_protocol::ReleaseTimeVerdict::Refused {
+                    reason: reccursive_protocol::ReleaseTimeRefusal::TooClose,
+                    ..
+                }
+            ),
+            "10:00 and 10:10 America/New_York, ten minutes apart, must be refused under a \
+             thirty-minute policy: {verdict:?}"
         );
 
         worker.join().unwrap().unwrap();

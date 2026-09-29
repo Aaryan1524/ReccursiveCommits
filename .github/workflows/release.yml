@@ -28,6 +28,8 @@ jobs:
             runner: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
@@ -36,6 +38,8 @@ jobs:
           version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
           test -n "$version"
           test "$GITHUB_REF_NAME" = "v$version"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD FETCH_HEAD
           test "$(uname -m)" = "${{ matrix.name == 'darwin-x86_64' && 'x86_64' || 'arm64' }}"
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -85,13 +89,21 @@ jobs:
           stage="$RUNNER_TEMP/reccursive-${version}-${{ matrix.name }}"
           mkdir -p "$stage"
           cp target/release/reccursive target/release/reccursive-daemon LICENSE "$stage/"
-          ditto -c -k "$stage" "$archive"
-          unzip -Z -1 "$archive" | grep -Fx 'reccursive'
-          unzip -Z -1 "$archive" | grep -Fx 'reccursive-daemon'
+          ditto --norsrc --noextattr -c -k "$stage" "$archive"
+          diff -u \
+            <(printf 'LICENSE\nreccursive\nreccursive-daemon\n') \
+            <(unzip -Z -1 "$archive" | LC_ALL=C sort)
           key="$RUNNER_TEMP/AuthKey_${KEY_ID}.p8"
           printf '%s' "$PRIVATE_KEY" > "$key"
           chmod 600 "$key"
-          xcrun notarytool submit "$archive" --key "$key" --key-id "$KEY_ID" --issuer "$ISSUER_ID" --wait
+          notarization="$(xcrun notarytool submit "$archive" --key "$key" --key-id "$KEY_ID" --issuer "$ISSUER_ID" --wait --output-format json)"
+          printf '%s\n' "$notarization" | python3 -c '
+          import json, sys
+          result = json.load(sys.stdin)
+          status = result.get("status")
+          print("Notarization:", status, result.get("id"))
+          sys.exit(status != "Accepted")
+          '
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}

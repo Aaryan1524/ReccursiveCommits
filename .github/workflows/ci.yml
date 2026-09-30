@@ -27,6 +27,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo build --workspace --locked
+      - run: ./tests/scenarios/release_artifact_checks.sh
 
   test:
     name: Test on ${{ matrix.os }}

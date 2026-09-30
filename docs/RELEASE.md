@@ -39,6 +39,7 @@ Homebrew command publicly. It contains the generated `Formula/reccursive.rb`.
    cargo test --workspace --all-targets --locked
    cargo build --workspace --release --locked
    ./tests/scenarios/phase15_multi_batch_checkout.sh
+   ./tests/scenarios/release_artifact_checks.sh
    ```
 
 3. On a real Mac, run the manual launchd/sleep acceptance test described in
@@ -57,22 +58,34 @@ Homebrew command publicly. It contains the generated `Formula/reccursive.rb`.
    ```
 
 6. Wait for the **Release** workflow. It tests, signs, notarizes, publishes
-   both archives, and attaches `SHA256SUMS` to the GitHub Release. Download an
-   archive and verify both its checksum and Gatekeeper assessment before
-   announcing it.
-7. Generate and review the Homebrew formula using the two hashes in
-   `SHA256SUMS`, then commit it to the tap repository:
+   both archives, and attaches `SHA256SUMS` to the GitHub Release. On a Mac,
+   download all three assets and run `scripts/verify-macos-release.sh` against
+   them, passing your Apple Team ID from the Apple Developer account as the
+   third argument. This checks the archive hashes and exact contents, both
+   binaries' architecture and Developer ID signatures, the expected signing
+   team, secure timestamps, and Gatekeeper acceptance. A passing workflow
+   alone is not the final release check.
+7. Clone the tap beside this repository. Generate the Homebrew formula from
+   the **published** release with the checked download helper, then review it
+   and open a PR against the tap. The helper verifies both archives as in step
+   6 and never accepts hand-copied hashes. Stage the candidate separately so
+   a failed check cannot truncate an existing tap formula. From this
+   repository's root:
 
    ```sh
-   ./scripts/render-homebrew-formula.sh 0.1.0 X86_64_SHA256 AARCH64_SHA256 \
-     > Formula/reccursive.rb
-   brew audit --strict Formula/reccursive.rb
-   brew install ./Formula/reccursive.rb
+   candidate_dir="$(mktemp -d)"
+   ./scripts/prepare-homebrew-formula.sh 0.1.0 YOURTEAMID \
+     > "$candidate_dir/reccursive.rb" &&
+     brew audit --strict "$candidate_dir/reccursive.rb" &&
+     brew install "$candidate_dir/reccursive.rb" &&
+     mkdir -p ../homebrew-tap/Formula &&
+     cp "$candidate_dir/reccursive.rb" ../homebrew-tap/Formula/reccursive.rb
    ```
 
-8. On a clean macOS account, install from the release archive and from the
-   tap. Run `reccursive doctor`, enroll a throwaway repository, install the
-   service, then publish one harmless scheduled change.
+8. After the formula PR is merged, on a clean macOS account install from the
+   release archive and from the tap. Run `reccursive doctor`, enroll a
+   throwaway repository, install the service, then publish one harmless
+   scheduled change. Record the results before announcing public availability.
 
 Only after step 8 should the project advertise `brew install
 Aaryan1524/tap/reccursive` as a supported installation path.

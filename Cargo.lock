@@ -694,9 +694,9 @@ version = "0.1.0"
 dependencies = [
  "reccursive-capture",
  "reccursive-core",
+ "rustix",
  "tempfile",
  "thiserror",
- "wait-timeout",
 ]
 
 [[package]]

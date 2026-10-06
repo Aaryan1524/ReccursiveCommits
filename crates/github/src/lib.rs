@@ -757,10 +757,34 @@ mod endpoint_tests {
         const MARKER: &str = "RECCURSIVE_TEST_CURL_HOME";
         if let Some(directory) = std::env::var_os(MARKER) {
             let Some(fake) = start() else { return };
+            let trace = std::path::Path::new(&directory).join("trace.txt");
+            // Prove this fixture's curl really loads the tracing default without --disable.
+            let arguments = vec![
+                "--silent".into(),
+                "--unix-socket".into(),
+                fake.socket.to_string_lossy().into_owned(),
+                "--config".into(),
+                "-".into(),
+                "http://localhost/repos/owner/project/pulls/4242".into(),
+            ];
+            assert!(
+                transport::run_curl(
+                    &arguments,
+                    b"header = \"Authorization: Bearer test-token\"\n",
+                    Duration::from_secs(5),
+                )
+                .is_ok()
+            );
+            assert!(
+                std::fs::read_to_string(&trace)
+                    .unwrap()
+                    .contains("test-token")
+            );
+            std::fs::remove_file(&trace).unwrap();
             client(&fake, "test-token")
                 .create_pull_request(&slug(), "trace-test", "main", "title", "body")
                 .unwrap();
-            assert!(!std::path::Path::new(&directory).join("trace.txt").exists());
+            assert!(!trace.exists());
             return;
         }
         let directory = tempfile::tempdir().unwrap();

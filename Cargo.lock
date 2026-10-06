@@ -703,11 +703,11 @@ dependencies = [
 name = "reccursive-github"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
- "wait-timeout",
 ]
 
 [[package]]

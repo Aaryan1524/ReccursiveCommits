@@ -14,6 +14,7 @@ import os
 import socketserver
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -121,6 +122,21 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(404, {"message": "Not Found"})
         if not self.authorized():
             return
+        if parsed.path == "/repos/owner/project/pulls/9002":
+            time.sleep(2)
+            return self.respond(200, {"number": 9002})
+        if parsed.path in (
+            "/repos/owner/project/pulls/9001",
+            "/repos/owner/project/pulls/9003",
+        ):
+            size = 256 * 1024 if parsed.path.endswith("9001") else 4 * 1024 * 1024
+            return self.respond(200, {
+                "number": 9001,
+                "html_url": "https://github.com/owner/project/pull/9001",
+                "state": "open",
+                "merged": False,
+                "body": "x" * size,
+            })
         parts = parsed.path.strip("/").split("/")
         # /repos/{owner}/{repo}/pulls[/{number}]
         if len(parts) == 5 and parts[3] == "pulls":

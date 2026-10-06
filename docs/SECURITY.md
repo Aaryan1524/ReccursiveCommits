@@ -77,6 +77,12 @@ deadline, and continuous output cannot prevent timeout or cancellation checks.
 On failure the runner closes its pipes and kills and reaps its direct child;
 this is not a sandbox for Git hooks or credential helpers.
 
+The GitHub adapter likewise writes curl's credential configuration and drains
+both output pipes under one deadline. It rejects responses above 4 MiB and
+stderr above 64 KiB instead of parsing truncated output. The user's `.curlrc`
+is disabled so it cannot silently enable tracing, redirects, or other settings
+on an authenticated request; the explicit stdin configuration still applies.
+
 Acceptance checks run as commands, and **they cannot be defined over the local
 API**. One check is registered at enrollment (`git diff --check`) and there is
 no request that adds another. A malicious plan therefore cannot cause a command
@@ -114,6 +120,10 @@ contents of whatever it pointed to.
   could then hang on inherited pipes. Process exit and nonblocking output
   collection now share the deadline, with timeout, cancellation, and noisy-output
   regressions.
+- **Large GitHub responses could fill curl's pipe.** The adapter waited for
+  process exit before reading, so a valid response could time out. All three
+  pipes now use bounded nonblocking I/O, with real-curl tests for a large valid
+  response, response overflow, and a stalled endpoint.
 
 ### Considered and not changed
 

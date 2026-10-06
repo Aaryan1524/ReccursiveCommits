@@ -29,6 +29,10 @@ open the socket is already running as you. It exists so that a state directory
 copied, restored, or placed somewhere more permissive does not become an open
 door.
 
+Each connection carries one size-limited, newline-delimited JSON request and
+reply. A complete frame is read without waiting for the peer to close its
+socket; EOF-terminated messages remain compatible with earlier clients.
+
 ## Where secrets live
 
 | Secret | Location | Mode |
@@ -66,6 +70,13 @@ shell, with an explicit timeout, terminal prompts disabled, and `askpass`
 pointed at a program that always fails — so a missing credential fails in
 seconds instead of waiting forever for an answer nobody is there to give.
 
+Git's deadline covers both process exit and output collection. Output pipes are
+nonblocking and drained fairly, with at most 64 KiB retained per stream. A helper
+that inherits a pipe cannot keep the daemon waiting beyond the invocation's
+deadline, and continuous output cannot prevent timeout or cancellation checks.
+On failure the runner closes its pipes and kills and reaps its direct child;
+this is not a sandbox for Git hooks or credential helpers.
+
 Acceptance checks run as commands, and **they cannot be defined over the local
 API**. One check is registered at enrollment (`git diff --check`) and there is
 no request that adds another. A malicious plan therefore cannot cause a command
@@ -96,6 +107,13 @@ contents of whatever it pointed to.
   produce `/repos/../x/pulls`, which normalises to a different endpoint. Owner
   and repository names are now validated before they reach a URL.
 - **Token comparison returned early.** Now constant-time.
+- **Local replies waited for socket EOF after their complete frame arrived.**
+  Reads now stop at the newline, with regressions for an open peer and the
+  message-size boundary.
+- **Git deadlines stopped at child exit.** Joining blocking output collectors
+  could then hang on inherited pipes. Process exit and nonblocking output
+  collection now share the deadline, with timeout, cancellation, and noisy-output
+  regressions.
 
 ### Considered and not changed
 

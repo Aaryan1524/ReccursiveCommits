@@ -2,7 +2,8 @@
 
 use std::{
     ffi::OsString,
-    io::Read,
+    io::{self, Read},
+    os::fd::AsFd,
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
@@ -14,7 +15,6 @@ use std::{
 };
 
 use thiserror::Error;
-use wait_timeout::ChildExt;
 
 use reccursive_capture::{SnapshotError, SnapshotPackage};
 
@@ -113,37 +113,48 @@ impl GitRunner {
         let mut child = command.spawn()?;
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
-        let out_reader = thread::spawn(move || read_bounded(stdout));
-        let err_reader = thread::spawn(move || read_bounded(stderr));
-        let deadline = Instant::now() + invocation.timeout;
-        let status = loop {
-            if cancellation.cancelled() {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(GitError::Cancelled);
+        // Keep process exit and pipe draining under the same deadline. A Git helper can
+        // inherit these pipes and outlive Git, so blocking reader-thread joins are unbounded.
+        // Polling try_wait also avoids installing a process-global SIGCHLD handler.
+        let result = (|| {
+            let mut stdout = OutputCollector::new(stdout)?;
+            let mut stderr = OutputCollector::new(stderr)?;
+            let deadline = Instant::now() + invocation.timeout;
+            let mut status = None;
+            loop {
+                if cancellation.cancelled() {
+                    return Err(GitError::Cancelled);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(GitError::TimedOut(invocation.timeout));
+                }
+                let progressed = stdout.drain()? | stderr.drain()?;
+                if status.is_none() {
+                    status = child.try_wait()?;
+                }
+                if let Some(status) = status
+                    && stdout.eof
+                    && stderr.eof
+                {
+                    return Ok((status, stdout, stderr));
+                }
+                if !progressed {
+                    thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(GitError::TimedOut(invocation.timeout));
-            }
-            if let Some(status) = child.wait_timeout(remaining.min(Duration::from_millis(50)))? {
-                break status;
-            }
-        };
-        let (stdout, out_truncated) = out_reader.join().map_err(|_| GitError::Failed {
-            status: None,
-            message: "stdout collector panicked".into(),
-        })?;
-        let (stderr, err_truncated) = err_reader.join().map_err(|_| GitError::Failed {
-            status: None,
-            message: "stderr collector panicked".into(),
-        })?;
+        })();
+        // The collectors (and their pipe handles) are dropped on failure, without leaving
+        // detached reader threads behind. Always reap the child we own before returning.
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let (status, stdout, stderr) = result?;
         let output = GitOutput {
-            stdout,
-            stderr,
-            truncated: out_truncated || err_truncated,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+            truncated: stdout.truncated || stderr.truncated,
         };
         if status.success() {
             Ok(output)
@@ -1012,23 +1023,48 @@ fn git_text(
         .map_err(|_| GitError::NonUtf8Output)
 }
 
-fn read_bounded(mut reader: impl Read) -> (Vec<u8>, bool) {
-    let mut bytes = Vec::new();
-    let mut chunk = [0; 8192];
-    let mut truncated = false;
-    while let Ok(count) = reader.read(&mut chunk) {
-        if count == 0 {
-            break;
-        }
-        let room = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(bytes.len());
-        if room < count {
-            bytes.extend_from_slice(&chunk[..room]);
-            truncated = true;
-        } else {
-            bytes.extend_from_slice(&chunk[..count]);
-        }
+struct OutputCollector<R> {
+    reader: R,
+    bytes: Vec<u8>,
+    truncated: bool,
+    eof: bool,
+}
+
+impl<R: Read + AsFd> OutputCollector<R> {
+    fn new(reader: R) -> io::Result<Self> {
+        let flags = rustix::fs::fcntl_getfl(&reader)?;
+        rustix::fs::fcntl_setfl(&reader, flags | rustix::fs::OFlags::NONBLOCK)?;
+        Ok(Self {
+            reader,
+            bytes: Vec::new(),
+            truncated: false,
+            eof: false,
+        })
     }
-    (bytes, truncated)
+
+    fn drain(&mut self) -> io::Result<bool> {
+        let mut progressed = false;
+        let mut chunk = [0; 8192];
+        // A noisy pipe must not starve cancellation, the deadline, or the other pipe.
+        for _ in 0..8 {
+            if self.eof {
+                break;
+            }
+            match self.reader.read(&mut chunk) {
+                Ok(0) => self.eof = true,
+                Ok(count) => {
+                    progressed = true;
+                    let room = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(self.bytes.len());
+                    self.bytes.extend_from_slice(&chunk[..count.min(room)]);
+                    self.truncated |= room < count;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(progressed)
+    }
 }
 
 #[cfg(test)]
@@ -1071,6 +1107,84 @@ mod tests {
             GitRunner::run(&invocation, &token),
             Err(GitError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn deadline_includes_pipes_inherited_by_a_descendant() {
+        let dir = tempdir().unwrap();
+        // The alias exits immediately; its background child keeps both output pipes open.
+        let invocation = GitInvocation::new(
+            dir.path(),
+            ["-c", "alias.held-pipe=!sleep 2 &", "held-pipe"],
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let result = GitRunner::run(&invocation, &CancellationToken::default());
+        assert!(matches!(result, Err(GitError::TimedOut(_))), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_running_command() {
+        let dir = tempdir().unwrap();
+        let token = CancellationToken::default();
+        let cancel = token.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel.cancel();
+        });
+        let invocation = GitInvocation::new(
+            dir.path(),
+            ["-c", "alias.slow=!sleep 2", "slow"],
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let result = GitRunner::run(&invocation, &token);
+        canceller.join().unwrap();
+        assert!(matches!(result, Err(GitError::Cancelled)), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn noisy_output_is_drained_without_exceeding_capture_limits() {
+        let dir = tempdir().unwrap();
+        let invocation = GitInvocation::new(
+            dir.path(),
+            [
+                "-c",
+                "alias.noisy=!i=0; while [ \"$i\" -lt 20000 ]; do printf '0123456789\\n'; printf 'abcdefghij\\n' >&2; i=$((i + 1)); done",
+                "noisy",
+            ],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let output = GitRunner::run(&invocation, &CancellationToken::default()).unwrap();
+        assert_eq!(output.stdout.len(), MAX_CAPTURED_OUTPUT_BYTES);
+        assert_eq!(output.stderr.len(), MAX_CAPTURED_OUTPUT_BYTES);
+        assert!(output.stdout.starts_with(b"0123456789\n"));
+        assert!(output.stderr.starts_with(b"abcdefghij\n"));
+        assert!(output.truncated);
+    }
+
+    #[test]
+    fn continuous_output_cannot_starve_the_deadline() {
+        let dir = tempdir().unwrap();
+        let invocation = GitInvocation::new(
+            dir.path(),
+            [
+                "-c",
+                "alias.endless=!while :; do printf 'output\\n'; done",
+                "endless",
+            ],
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let result = GitRunner::run(&invocation, &CancellationToken::default());
+        assert!(matches!(result, Err(GitError::TimedOut(_))), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
     #[test]
     fn managed_mirror_fetches_and_release_workspace_is_detached() {

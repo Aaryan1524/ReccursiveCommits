@@ -4049,6 +4049,26 @@ mod tests {
     }
 
     #[test]
+    fn a_framed_request_is_served_without_client_half_close() {
+        let directory = tempdir().unwrap();
+        let paths = ServicePaths::new(directory.path());
+        let service = LocalService::bind(paths.clone()).unwrap();
+        let worker = thread::spawn(move || service.serve_connections(1));
+        let token = AuthToken::new(fs::read_to_string(&paths.auth_token).unwrap()).unwrap();
+        let request = RequestEnvelope::new(token, Command::Ping);
+        let mut stream = UnixStream::connect(&paths.socket).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        write_message(&mut stream, &request).unwrap();
+        // Do not shut down the client's write side: the frame itself must be sufficient.
+        let response: ResponseEnvelope = read_message(&mut stream).unwrap();
+        assert_eq!(response.request_id, request.request_id);
+        assert!(matches!(response.result, Ok(ResponseData::Pong { .. })));
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn attempt_inspection_is_available_over_the_authenticated_local_api() {
         let directory = tempdir().unwrap();
         let paths = ServicePaths::new(directory.path());

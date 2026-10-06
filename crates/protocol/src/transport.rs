@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::Shutdown,
     os::unix::net::UnixStream,
     path::Path,
@@ -82,9 +82,11 @@ pub fn read_message<T: serde::de::DeserializeOwned>(
     reader: &mut impl Read,
 ) -> Result<T, TransportError> {
     let mut encoded = Vec::new();
-    reader
+    // Each connection carries one newline-delimited frame. Waiting for EOF here can
+    // hang a completed request while the peer still owns its socket.
+    BufReader::new(reader)
         .take((MAX_MESSAGE_BYTES + 2) as u64)
-        .read_to_end(&mut encoded)?;
+        .read_until(b'\n', &mut encoded)?;
     if encoded.len() > MAX_MESSAGE_BYTES + 1 {
         return Err(TransportError::MessageTooLarge {
             maximum: MAX_MESSAGE_BYTES,
@@ -121,6 +123,20 @@ mod tests {
     use crate::{Command, RequestEnvelope};
 
     #[test]
+    fn a_complete_message_does_not_wait_for_the_peer_to_close() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        let request = RequestEnvelope::new(AuthToken::new("a".repeat(32)).unwrap(), Command::Ping);
+        write_message(&mut writer, &request).unwrap();
+        // Keep the writer alive: its newline, rather than closing the connection, ends the frame.
+        let decoded: RequestEnvelope = read_message(&mut reader).unwrap();
+        assert_eq!(decoded, request);
+        drop(writer);
+    }
+
+    #[test]
     fn request_round_trips_through_bounded_wire_format() {
         let request = RequestEnvelope::new(AuthToken::new("a".repeat(32)).unwrap(), Command::Ping);
         let mut bytes = Vec::new();
@@ -137,5 +153,28 @@ mod tests {
             result,
             Err(TransportError::MessageTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn payload_at_the_limit_accepts_its_newline() {
+        let payload = "a".repeat(MAX_MESSAGE_BYTES - 2);
+        let bytes = format!("\"{payload}\"\n");
+        let decoded: String = read_message(&mut bytes.as_bytes()).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn payload_over_the_limit_is_rejected_even_with_a_newline() {
+        let bytes = format!("\"{}\"\n", "a".repeat(MAX_MESSAGE_BYTES - 1));
+        assert!(matches!(
+            read_message::<String>(&mut bytes.as_bytes()),
+            Err(TransportError::MessageTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_eof_terminated_messages_remain_readable() {
+        let decoded: String = read_message(&mut b"\"legacy\"".as_slice()).unwrap();
+        assert_eq!(decoded, "legacy");
     }
 }

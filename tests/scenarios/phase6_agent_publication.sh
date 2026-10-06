@@ -70,7 +70,7 @@ start_daemon() {
     >"$fixture_root/daemon.log" 2>&1 &
   daemon_pid=$!
   for _ in {1..80}; do
-    if "$binary_dir/reccursive" --state-dir "$fixture_root/state" --json status >/dev/null 2>&1; then
+    if cli status >/dev/null 2>&1; then
       return 0
     fi
     kill -0 "$daemon_pid" 2>/dev/null || fail "daemon exited during startup"
@@ -85,7 +85,8 @@ json_field() {
 }
 
 cli() {
-  "$binary_dir/reccursive" --state-dir "$fixture_root/state" --json "$@"
+  ruby "$project_root/tests/scenarios/bounded_cli.rb" 120 "$daemon_pid" \
+    "$binary_dir/reccursive" --state-dir "$fixture_root/state" --json "$@"
 }
 
 # Pick a five-minute future window in a timezone that will not cross local midnight. That gives
@@ -191,6 +192,7 @@ grep -q '"created":true' <<<"$third_submission" || fail "the third agent unit wa
 # The agent has finished. There is deliberately no release command, no release-now command, and
 # no schedule mutation below: only the daemon's maintenance pass may publish these three units.
 published=''
+printf 'phase6: waiting for three autonomous publications\n' >&2
 for _ in {1..210}; do
   attempts="$(cli release attempts --limit 10)"
   if [[ "$(grep -o '"status":"published"' <<<"$attempts" | wc -l | tr -d ' ')" == "3" ]]; then

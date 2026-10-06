@@ -41,7 +41,7 @@ start_daemon() {
     >"$fixture_root/daemon.log" 2>&1 &
   daemon_pid=$!
   for _ in {1..80}; do
-    if "$binary_dir/reccursive" --state-dir "$fixture_root/state" --json status >/dev/null 2>&1; then
+    if cli status >/dev/null 2>&1; then
       return 0
     fi
     kill -0 "$daemon_pid" 2>/dev/null || fail "daemon exited during startup"
@@ -55,9 +55,11 @@ json_field() {
   sed -E "s/.*\\\"$field\\\":\\\"([^\\\"]+)\\\".*/\\1/"
 }
 
-cli() {
-  "$binary_dir/reccursive" --state-dir "$fixture_root/state" --json "$@"
+cli_text() {
+  ruby "$project_root/tests/scenarios/bounded_cli.rb" 120 "$daemon_pid" \
+    "$binary_dir/reccursive" --state-dir "$fixture_root/state" "$@"
 }
+cli() { cli_text --json "$@"; }
 
 remote_ref() {
   git -C "$fixture_root/remote.git" rev-parse --verify --quiet "$1" || true
@@ -161,6 +163,7 @@ for pair in "$dependent_dev_unit:$dependent_dev_package" "$dependent_target_unit
 done
 
 # --- The foundation publishes to the development branch, on the daemon's own pass. ---
+printf 'phase10: publishing the foundation to development\n' >&2
 cli schedule unit "$foundation_unit" --package-id "$foundation_package" --revision 1 >/dev/null
 cli schedule release-now "$foundation_unit" >/dev/null
 
@@ -215,7 +218,7 @@ cli schedule withdraw "$foundation_unit" --reason "scenario integrates deliberat
 withdrawn_queue="$(cli queue status)"
 grep -q '"state":"available_early"' <<<"$withdrawn_queue" || \
   fail "a unit on a development branch with no integration scheduled is not reported as available early: $withdrawn_queue"
-withdrawn_text="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" queue status)"
+withdrawn_text="$(cli_text queue status)"
 grep -q "available early" <<<"$withdrawn_text" || \
   fail "the human-readable queue does not report early availability: $withdrawn_text"
 
@@ -236,11 +239,11 @@ grep -q "\"commit\":\"$development_head\"" <<<"$queue_json" || \
 grep -q '"is_target":false' <<<"$queue_json" || \
   fail "the queue does not distinguish a development branch from the target: $queue_json"
 
-queue_text="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" queue status)"
+queue_text="$(cli_text queue status)"
 grep -q "is available early on refs/heads/development" <<<"$queue_text" || \
   fail "the human-readable queue does not name the development branch: $queue_text"
 
-status_text="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" feature status "$feature_id" --revision 1)"
+status_text="$(cli_text feature status "$feature_id" --revision 1)"
 grep -q "available: refs/heads/development" <<<"$status_text" || \
   fail "feature status does not report where the work is available: $status_text"
 grep -q "on target:" <<<"$status_text" && \
@@ -260,6 +263,7 @@ grep -q "waits for prerequisite" <<<"$still_waiting" || \
   fail "the target-milestone refusal did not name the unmet prerequisite: $still_waiting"
 
 # --- A second package stacks on the development branch rather than restarting from the target. ---
+printf 'phase10: publishing the follow-up to development\n' >&2
 follow_up_package="$(capture_unit "$follow_up" follow-up.txt "a later change")"
 follow_up_unit="$(cli release create-unit "$feature_id" --revision 1 --task "$follow_up" | json_field unit_id)"
 cli schedule unit "$follow_up_unit" --package-id "$follow_up_package" --revision 1 >/dev/null
@@ -281,6 +285,7 @@ parent="$(git -C "$fixture_root/remote.git" rev-parse "$follow_up_head^")"
   fail "the second unit did not build on the development branch: parent $parent, expected $development_head"
 
 # --- Integration: the same work reaches the target, and only then is the task published. ---
+printf 'phase10: integrating development work onto the target\n' >&2
 integration_package="$foundation_package"
 cli schedule unit "$foundation_unit" --package-id "$integration_package" --revision 1 >/dev/null
 cli schedule release-now "$foundation_unit" >/dev/null
@@ -304,7 +309,7 @@ git clone --quiet --branch main "$fixture_root/remote.git" "$fixture_root/integr
   fail "the target does not contain the integrated change"
 
 # The task is published only now — reaching a development branch was never enough.
-status_after="$("$binary_dir/reccursive" --state-dir "$fixture_root/state" feature status "$feature_id" --revision 1)"
+status_after="$(cli_text feature status "$feature_id" --revision 1)"
 grep -q "on target: refs/heads/main" <<<"$status_after" || \
   fail "feature status does not report the work as being on the target: $status_after"
 

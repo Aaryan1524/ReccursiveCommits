@@ -16,16 +16,12 @@
 //! branch, and the product does not take that.
 
 pub mod storage;
+mod transport;
 
-use std::{
-    io::Write,
-    process::{Command, Stdio},
-    time::Duration,
-};
+use std::time::Duration;
 
 use serde::Deserialize;
 use thiserror::Error;
-use wait_timeout::ChildExt;
 
 /// Where the API lives and how to reach it.
 ///
@@ -259,6 +255,8 @@ impl GitHubClient {
         // The status is asked for separately from the body so a non-2xx answer can be classified
         // without parsing a payload that may not be JSON at all.
         let mut arguments: Vec<String> = vec![
+            // Explicit configuration comes from stdin below, never the user's .curlrc.
+            "--disable".into(),
             "--silent".into(),
             "--show-error".into(),
             "--config".into(),
@@ -278,49 +276,27 @@ impl GitHubClient {
         }
         arguments.push(format!("{}{path}", self.endpoint.base_url));
 
-        let mut child = Command::new("curl")
-            .args(&arguments)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| GitHubError::Transport(error.to_string()))?;
-
         // The token goes here and nowhere else: not in `argv`, where any process could read it
         // from `ps`, and not in a file, which would have to be created, chmodded and removed.
-        {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| GitHubError::Transport("curl refused stdin".to_owned()))?;
-            let config = format!(
-                "header = \"Authorization: Bearer {}\"\n\
-                 header = \"Accept: application/vnd.github+json\"\n\
-                 header = \"X-GitHub-Api-Version: 2022-11-28\"\n\
-                 header = \"Content-Type: application/json\"\n\
-                 header = \"User-Agent: reccursive\"\n",
-                self.token.0
-            );
-            stdin
-                .write_all(config.as_bytes())
-                .map_err(|error| GitHubError::Transport(error.to_string()))?;
-        }
-
-        let status = match child
-            .wait_timeout(self.timeout)
-            .map_err(|error| GitHubError::Transport(error.to_string()))?
-        {
-            Some(status) => status,
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(GitHubError::TimedOut(self.timeout));
-            }
-        };
-        let output = child
-            .wait_with_output()
-            .map_err(|error| GitHubError::Transport(error.to_string()))?;
-        if !status.success() {
+        let config = format!(
+            "header = \"Authorization: Bearer {}\"\n\
+             header = \"Accept: application/vnd.github+json\"\n\
+             header = \"X-GitHub-Api-Version: 2022-11-28\"\n\
+             header = \"Content-Type: application/json\"\n\
+             header = \"User-Agent: reccursive\"\n",
+            self.token.0
+        );
+        let output =
+            transport::run_curl(&arguments, config.as_bytes(), self.timeout).map_err(|error| {
+                match error {
+                    transport::Error::Io(error) => GitHubError::Transport(error.to_string()),
+                    transport::Error::TimedOut => GitHubError::TimedOut(self.timeout),
+                    transport::Error::OutputTooLarge => GitHubError::Malformed(
+                        "GitHub response exceeded the local output limit".into(),
+                    ),
+                }
+            })?;
+        if !output.status.success() {
             return Err(GitHubError::Transport(
                 String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             ));
@@ -555,7 +531,11 @@ mod tests {
 #[cfg(test)]
 mod endpoint_tests {
     use super::*;
-    use std::{io::Read, process::Child, time::Instant};
+    use std::{
+        io::Read,
+        process::{Child, Command, Stdio},
+        time::Instant,
+    };
 
     struct Fake {
         child: Child,
@@ -737,5 +717,69 @@ mod endpoint_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_large_valid_response_does_not_block_curl_exit() {
+        let Some(fake) = start() else { return };
+        let mut client = client(&fake, "test-token");
+        client.timeout = Duration::from_secs(1);
+        let pull = client.pull_request(&slug(), 9001).unwrap();
+        assert_eq!(pull.number, 9001);
+        assert_eq!(pull.state, "open");
+    }
+
+    #[test]
+    fn an_oversized_response_is_rejected_instead_of_truncated() {
+        let Some(fake) = start() else { return };
+        assert!(matches!(
+            client(&fake, "test-token").pull_request(&slug(), 9003),
+            Err(GitHubError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_stalled_endpoint_still_obeys_the_request_deadline() {
+        let Some(fake) = start() else { return };
+        let mut client = client(&fake, "test-token");
+        client.timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        assert!(matches!(
+            client.pull_request(&slug(), 9002),
+            Err(GitHubError::TimedOut(_))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn curl_defaults_cannot_enable_credential_tracing() {
+        // Isolate CURL_HOME in a subprocess instead of mutating the test runner's environment.
+        const MARKER: &str = "RECCURSIVE_TEST_CURL_HOME";
+        if let Some(directory) = std::env::var_os(MARKER) {
+            let Some(fake) = start() else { return };
+            client(&fake, "test-token")
+                .create_pull_request(&slug(), "trace-test", "main", "title", "body")
+                .unwrap();
+            assert!(!std::path::Path::new(&directory).join("trace.txt").exists());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let trace = directory.path().join("trace.txt");
+        std::fs::write(
+            directory.path().join(".curlrc"),
+            format!("trace-ascii = \"{}\"\n", trace.display()),
+        )
+        .unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "endpoint_tests::curl_defaults_cannot_enable_credential_tracing",
+            ])
+            .env("CURL_HOME", directory.path())
+            .env(MARKER, directory.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!trace.exists());
     }
 }
